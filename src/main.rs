@@ -4,7 +4,7 @@ use rustix::fs::{
 };
 use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -476,6 +476,13 @@ struct ReloadEvidence {
 struct LedgerRecord {
     destination: String,
     applied_artifact_target: String,
+    // Retirement has to prove the destination sits beneath a managed root, and
+    // by the time an entry is retired the declaration that named that root is
+    // gone. The record is the only place left to read it from.
+    managed_root: String,
+    // Which branch published the target above: new, update, or repair. A record
+    // that cannot say how it was decided is not evidence of a decision.
+    applied_by: String,
     applied_generation: Option<String>,
     last_successful_reload: ReloadEvidence,
     reload_action_identity: Option<String>,
@@ -529,10 +536,12 @@ impl RunIdentity {
         }
     }
 
-    fn record(&self, entry: &Entry) -> LedgerRecord {
+    fn record(&self, entry: &Entry, applied_by: &str) -> LedgerRecord {
         LedgerRecord {
             destination: entry.filesystem_identity.destination.clone(),
             applied_artifact_target: entry.retained_artifact_target.clone(),
+            managed_root: entry.managed_root.clone(),
+            applied_by: applied_by.to_owned(),
             applied_generation: self.system_generation.clone(),
             last_successful_reload: ReloadEvidence {
                 invocation_id: self.invocation_id.clone(),
@@ -575,6 +584,29 @@ impl LedgerState {
                 "chmod-state-directory",
                 &error,
             ));
+        }
+        // Asserted rather than assumed. A mode that is 0755 because it was chosen
+        // is a decision; a mode that is 0755 because of this host's umask is an
+        // accident that will silently be something else on the next host.
+        match fs::metadata(directory) {
+            Ok(metadata) => {
+                let mode = metadata.permissions().mode() & 0o7777;
+                if mode != 0o755 {
+                    return Err(Failure::new(
+                        CodeKey::LedgerUnreadable,
+                        &label,
+                        format!("state directory mode is {mode:04o}; expected 0755"),
+                    ));
+                }
+            }
+            Err(error) => {
+                return Err(Failure::io(
+                    CodeKey::LedgerUnreadable,
+                    &label,
+                    "stat-state-directory",
+                    &error,
+                ));
+            }
         }
         let path = directory.join(LEDGER_FILE_NAME);
         let document = match fs::read(&path) {
@@ -625,6 +657,19 @@ impl LedgerState {
         self.document.records.get(canonical)
     }
 
+    fn recorded(&self) -> Vec<(String, LedgerRecord)> {
+        self.document
+            .records
+            .iter()
+            .map(|(canonical, record)| (canonical.clone(), record.clone()))
+            .collect()
+    }
+
+    fn retire(&mut self, canonical: &str) -> Result<()> {
+        self.document.records.remove(canonical);
+        self.write()
+    }
+
     fn commit(&mut self, canonical: &str, record: LedgerRecord) -> Result<()> {
         self.document.records.insert(canonical.to_owned(), record);
         self.write()
@@ -660,6 +705,41 @@ impl LedgerState {
                     &error,
                 )
             })?;
+        // OpenOptions::mode is masked by the ambient umask, so the mode above is
+        // a request, not a guarantee. Set it explicitly and assert it: the record
+        // has to be readable by the unprivileged verifier on every host, not only
+        // on hosts whose umask happens to be 022.
+        if let Err(error) = fs::set_permissions(&stage, fs::Permissions::from_mode(0o644)) {
+            let _ = fs::remove_file(&stage);
+            return Err(Failure::io(
+                CodeKey::LedgerWriteFailed,
+                &label,
+                "chmod-applied-state-stage",
+                &error,
+            ));
+        }
+        match fs::metadata(&stage) {
+            Ok(metadata) => {
+                let mode = metadata.permissions().mode() & 0o7777;
+                if mode != 0o644 {
+                    let _ = fs::remove_file(&stage);
+                    return Err(Failure::new(
+                        CodeKey::LedgerWriteFailed,
+                        &label,
+                        format!("applied state mode is {mode:04o}; expected 0644"),
+                    ));
+                }
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&stage);
+                return Err(Failure::io(
+                    CodeKey::LedgerWriteFailed,
+                    &label,
+                    "stat-applied-state-stage",
+                    &error,
+                ));
+            }
+        }
         if let Err(error) = file.write_all(&encoded) {
             let _ = fs::remove_file(&stage);
             return Err(Failure::io(
@@ -807,10 +887,11 @@ fn publish_new(
     Ok(())
 }
 
-// Repair is only reachable with a LedgerRecord in hand. The recorded target is a
-// parameter rather than something re-read here so that the thing being exchanged
-// away has to have been proven, not assumed, by the caller.
-fn publish_repair(
+// Both owned branches land here, and neither is reachable without a LedgerRecord
+// in hand. The recorded target is a parameter rather than something re-read here
+// so that the thing being exchanged away has to have been proven, not assumed, by
+// the caller.
+fn publish_exchange(
     parent: &OwnedFd,
     name: &OsStr,
     stage: &OsStr,
@@ -859,10 +940,51 @@ fn publish_repair(
         ));
     }
 
-    // The displaced link pointed at a target that no longer exists, so removing
-    // it destroys nothing that could be recovered from it.
+    // Only the displaced symlink is unlinked. Under repair it pointed at a target
+    // that was already reaped; under update it points at one that is still live
+    // and still referenced by the generation that declared it. Unlinking a
+    // symlink never touches its pointee, so neither case destroys anything.
     remove_stage(parent, stage);
     Ok(())
+}
+
+// Retirement is the destructive direction, so it runs on exactly the same five
+// ownership conditions as the two publishing branches, plus one more: no desired
+// entry claims this destination any more. Anything that is not a link furnish
+// can still prove it published is left exactly where it is.
+fn retire_record(record: &LedgerRecord) -> Result<()> {
+    let destination = &record.destination;
+    let (parent, name) = open_parent(destination, &record.managed_root)?;
+    let observed = symlink_target(&parent, &name).map_err(|errno| {
+        Failure::syscall(
+            CodeKey::ConflictingDestination,
+            destination,
+            "fstatat-retire",
+            errno,
+        )
+    })?;
+    let recorded = OsStr::new(&record.applied_artifact_target);
+    match observed {
+        // Already gone. There is nothing to unlink, and the record is the only
+        // thing left to remove.
+        None => Ok(()),
+        Some(actual) if !actual.is_empty() && actual == recorded => {
+            unlinkat(&parent, name.as_os_str(), AtFlags::empty()).map_err(|errno| {
+                Failure::syscall(
+                    CodeKey::ExecutorFailed,
+                    destination,
+                    "unlinkat-retire",
+                    errno,
+                )
+            })?;
+            Ok(())
+        }
+        Some(_) => Err(Failure::new(
+            CodeKey::ConflictingDestination,
+            destination,
+            "refusing to retire a destination that is no longer the link recorded as furnish-owned",
+        )),
+    }
 }
 
 fn reconcile_entry(
@@ -891,7 +1013,7 @@ fn reconcile_entry(
             let stage = stage_name(index);
             stage_symlink(setpriv, &parent, &stage, entry, expected)?;
             publish_new(&parent, &name, &stage, destination, expected)?;
-            ledger.commit(canonical, identity.record(entry))?;
+            ledger.commit(canonical, identity.record(entry, "new"))?;
             Ok(())
         }
         Some(actual) if actual == expected => {
@@ -899,8 +1021,13 @@ fn reconcile_entry(
             // furnish never published is indistinguishable from one it did. A
             // host whose link predates the ledger stays unrecorded here and
             // acquires from absence instead.
-            if ledger.record(canonical).is_some() {
-                ledger.commit(canonical, identity.record(entry))?;
+            // Nothing was published, so the branch that produced this target is
+            // carried forward rather than restated as a decision this run made.
+            if let Some(applied_by) = ledger
+                .record(canonical)
+                .map(|prior| prior.applied_by.clone())
+            {
+                ledger.commit(canonical, identity.record(entry, &applied_by))?;
             }
             Ok(())
         }
@@ -935,20 +1062,23 @@ fn reconcile_entry(
                 ));
             }
 
+            // Conditions 1 through 5 hold, so the destination is provably ours
+            // and the only question left is which owned branch this is. Both
+            // publish to desired through the same exchange; they differ in what
+            // they mean. A resolving recorded target says the declaration moved,
+            // which is a fact about the config. A reaped one says the store
+            // object furnish published is gone, which is a fact about the world.
+            //
             // Resolution is only ever tested against a target furnish published
             // itself, which is always a store path on an already-mounted
             // filesystem. Applied to a foreign target this test would be a race:
             // a link into a late-mounting filesystem reads unresolvable at boot
             // and resolvable at switch, and the coordinator runs at both.
-            match statat(&parent, &name, AtFlags::empty()) {
-                Ok(_) => {
-                    return Err(Failure::new(
-                        CodeKey::ConflictingDestination,
-                        destination,
-                        "recorded target still resolves; there is nothing to repair",
-                    ));
-                }
-                Err(Errno::NOENT) => {}
+            let applied_by = match statat(&parent, &name, AtFlags::empty()) {
+                // What we published is still live.
+                Ok(_) => "update",
+                // What we published was reaped.
+                Err(Errno::NOENT) => "repair",
                 Err(errno) => {
                     return Err(Failure::syscall(
                         CodeKey::ConflictingDestination,
@@ -957,7 +1087,7 @@ fn reconcile_entry(
                         errno,
                     ));
                 }
-            }
+            };
 
             // Republishing toward a target that is not there would manufacture
             // the exact breakage being repaired.
@@ -972,8 +1102,8 @@ fn reconcile_entry(
 
             let stage = stage_name(index);
             stage_symlink(setpriv, &parent, &stage, entry, expected)?;
-            publish_repair(&parent, &name, &stage, destination, expected, recorded)?;
-            ledger.commit(canonical, identity.record(entry))?;
+            publish_exchange(&parent, &name, &stage, destination, expected, recorded)?;
+            ledger.commit(canonical, identity.record(entry, applied_by))?;
             Ok(())
         }
     }
@@ -1100,6 +1230,27 @@ fn reconcile(
                 &failure,
                 Some(&entry.provenance),
             );
+            return ExitCode::FAILURE;
+        }
+    }
+
+    // A manifest with no entries is a real desired set, not a no-op. This is the
+    // only place a record is ever removed.
+    let desired: BTreeSet<&str> = manifest
+        .entries
+        .iter()
+        .map(|entry| entry.filesystem_identity.canonical.as_str())
+        .collect();
+    for (canonical, record) in ledger.recorded() {
+        if desired.contains(canonical.as_str()) {
+            continue;
+        }
+        if let Err(failure) = retire_record(&record) {
+            emit_failure(&manifest.diagnostic_contract.codes, &failure, None);
+            return ExitCode::FAILURE;
+        }
+        if let Err(failure) = ledger.retire(&canonical) {
+            emit_failure(&manifest.diagnostic_contract.codes, &failure, None);
             return ExitCode::FAILURE;
         }
     }
@@ -1321,7 +1472,7 @@ mod tests {
 
     fn record_ownership(ledger: &mut LedgerState, entry: &Entry, target: &str) {
         let identity = RunIdentity::observe();
-        let mut record = identity.record(entry);
+        let mut record = identity.record(entry, "new");
         record.applied_artifact_target = target.to_owned();
         ledger
             .commit(&entry.filesystem_identity.canonical, record)
@@ -1478,6 +1629,8 @@ mod tests {
             .expect("record survives a reload");
         assert_eq!(record.applied_artifact_target, "/desired/target");
         assert_eq!(record.destination, "/managed/value");
+        assert_eq!(record.applied_by, "new");
+        assert_eq!(record.managed_root, "/managed");
         assert!(record.reload_action_identity.is_none());
     }
 
@@ -1540,7 +1693,45 @@ mod tests {
     }
 
     #[test]
-    fn recorded_target_that_still_resolves_is_not_repaired() {
+    fn recorded_target_that_still_resolves_takes_the_owned_update_branch() {
+        // Staging cannot run inside the test process, so the branch is proven by
+        // how far it gets: reaching the executor at all means the predicate
+        // admitted it instead of refusing. Authority is switched to user scope so
+        // the launch fails on the nonexistent setpriv rather than re-executing the
+        // test binary.
+        let dir = TestDir::new();
+        let recorded = dir.path().join("recorded-target");
+        fs::write(&recorded, b"live").expect("create live recorded target");
+        let desired = dir.path().join("desired-target");
+        fs::write(&desired, b"desired").expect("create live desired target");
+        let destination = dir.path().join("value");
+        symlink(&recorded, &destination).expect("plant link to live recorded target");
+        let mut entry = sample_entry(
+            dir.path().to_str().unwrap(),
+            destination.to_str().unwrap(),
+            desired.to_str().unwrap(),
+        );
+        entry.authority.scope = "user".to_owned();
+        let mut ledger = test_ledger(&dir);
+        record_ownership(&mut ledger, &entry, recorded.to_str().unwrap());
+        let identity = RunIdentity::observe();
+        let failure = reconcile_entry(
+            &entry,
+            Path::new("/nonexistent/setpriv"),
+            0,
+            &mut ledger,
+            &identity,
+        )
+        .expect_err("staging cannot run inside the test process");
+        assert!(matches!(failure.key, CodeKey::ExecutorFailed));
+        assert_eq!(fs::read_link(&destination).unwrap(), recorded);
+    }
+
+    #[test]
+    fn owned_update_refuses_an_unresolvable_desired_target() {
+        // Desired resolution is checked before anything is staged. Republishing
+        // toward a target that is not there would manufacture exactly the
+        // breakage the repair branch exists to undo.
         let dir = TestDir::new();
         let recorded = dir.path().join("recorded-target");
         fs::write(&recorded, b"live").expect("create live recorded target");
@@ -1549,7 +1740,7 @@ mod tests {
         let entry = sample_entry(
             dir.path().to_str().unwrap(),
             destination.to_str().unwrap(),
-            "/desired/target",
+            "/nonexistent/desired",
         );
         let mut ledger = test_ledger(&dir);
         record_ownership(&mut ledger, &entry, recorded.to_str().unwrap());
@@ -1561,9 +1752,71 @@ mod tests {
             &mut ledger,
             &identity,
         )
-        .expect_err("a resolving recorded target is not a repair case");
-        assert!(matches!(failure.key, CodeKey::ConflictingDestination));
+        .expect_err("desired target must resolve");
+        assert!(matches!(failure.key, CodeKey::UnresolvableDesiredTarget));
         assert_eq!(fs::read_link(&destination).unwrap(), recorded);
+    }
+
+    #[test]
+    fn applied_state_is_written_with_an_explicitly_chosen_mode() {
+        let dir = TestDir::new();
+        let entry = sample_entry("/managed", "/managed/value", "/desired/target");
+        let mut ledger = test_ledger(&dir);
+        record_ownership(&mut ledger, &entry, "/desired/target");
+        let state = dir.path().join("state");
+        assert_eq!(
+            fs::metadata(&state).unwrap().permissions().mode() & 0o7777,
+            0o755
+        );
+        assert_eq!(
+            fs::metadata(state.join(LEDGER_FILE_NAME))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o644
+        );
+    }
+
+    #[test]
+    fn undeclared_owned_destination_is_retired() {
+        let dir = TestDir::new();
+        let target = dir.path().join("target");
+        fs::write(&target, b"live").expect("create live target");
+        let destination = dir.path().join("value");
+        symlink(&target, &destination).expect("plant owned symlink");
+        let entry = sample_entry(
+            dir.path().to_str().unwrap(),
+            destination.to_str().unwrap(),
+            target.to_str().unwrap(),
+        );
+        let identity = RunIdentity::observe();
+        let record = identity.record(&entry, "new");
+        retire_record(&record).expect("retire owned link");
+        assert!(fs::symlink_metadata(&destination).is_err());
+        // Retirement removes what furnish published, never what it pointed at.
+        assert!(target.is_file());
+    }
+
+    #[test]
+    fn retirement_refuses_a_destination_that_stopped_matching_its_record() {
+        let dir = TestDir::new();
+        let destination = dir.path().join("value");
+        symlink("/somewhere/else", &destination).expect("plant replaced symlink");
+        let entry = sample_entry(
+            dir.path().to_str().unwrap(),
+            destination.to_str().unwrap(),
+            "/desired/target",
+        );
+        let identity = RunIdentity::observe();
+        let record = identity.record(&entry, "new");
+        let failure = retire_record(&record)
+            .expect_err("refuse to retire a destination that is no longer ours");
+        assert!(matches!(failure.key, CodeKey::ConflictingDestination));
+        assert_eq!(
+            fs::read_link(&destination).unwrap(),
+            PathBuf::from("/somewhere/else")
+        );
     }
 
     #[test]
