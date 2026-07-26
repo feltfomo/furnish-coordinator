@@ -7,3 +7,8 @@ edition = "2024"
 rustix = { version = "1.1.4", features = ["fs", "process"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+
+# Off by default so the crash points are absent from the shipped binary at
+# compile time rather than merely unreachable at runtime.
+[features]
+fault-injection = []

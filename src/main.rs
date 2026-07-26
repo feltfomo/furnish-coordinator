@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -20,11 +20,169 @@ const DIAGNOSTIC_SCHEMA_VERSION: u64 = 1;
 const NATIVE_EXECUTOR_IDENTITY: &str = "furnish/native-symlink";
 const NATIVE_EXECUTOR_PROTOCOL: u64 = 1;
 const NATIVE_REPRESENTATION: &str = "symlink";
+const NATIVE_WRITABLE_IDENTITY: &str = "furnish/native-writable";
+const NATIVE_WRITABLE_PROTOCOL: u64 = 1;
+const WRITABLE_REPRESENTATION: &str = "writable";
 const SYMLINK_MODE: u32 = 0o120000;
+const REGULAR_MODE: u32 = 0o100000;
 const FILE_TYPE_MASK: u32 = 0o170000;
-const LEDGER_SCHEMA_VERSION: u64 = 1;
+// One mode for both authority scopes. A mode that varies by scope is the
+// deferred permissions feature arriving early under another name.
+const WRITABLE_FILE_MODE: u32 = 0o644;
+const LEDGER_SCHEMA_VERSION: u64 = 2;
 const LEDGER_FILE_NAME: &str = "applied-state.json";
+const LEDGER_ROLLBACK_FILE_NAME: &str = "applied-state.v1.json";
+const STATE_PENDING: &str = "pending";
+const STATE_OWNED: &str = "owned";
+
+// Qualification is a table lookup, not a chain of name comparisons. Nothing in
+// the protocol asks whether an executor is the native one; it asks whether the
+// tuple it presents appears here.
+struct ExecutorProfile {
+    identity: &'static str,
+    protocol_version: u64,
+    representation: &'static str,
+    lifecycle_strategy: &'static str,
+    worker_subcommand: &'static str,
+    worker_value_flag: &'static str,
+}
+
+const EXECUTOR_PROFILES: [ExecutorProfile; 2] = [
+    ExecutorProfile {
+        identity: NATIVE_EXECUTOR_IDENTITY,
+        protocol_version: NATIVE_EXECUTOR_PROTOCOL,
+        representation: NATIVE_REPRESENTATION,
+        lifecycle_strategy: "exact-symlink-target",
+        worker_subcommand: "stage-native-symlink",
+        worker_value_flag: "--target",
+    },
+    ExecutorProfile {
+        identity: NATIVE_WRITABLE_IDENTITY,
+        protocol_version: NATIVE_WRITABLE_PROTOCOL,
+        representation: WRITABLE_REPRESENTATION,
+        lifecycle_strategy: "exact-source-content",
+        worker_subcommand: "stage-native-writable",
+        worker_value_flag: "--source",
+    },
+];
+
+// Transfer is generic over representation pairs; the gate is the set of pairs
+// that actually exist today.
+const TRANSITION_PAIRS: [(&str, &str); 2] = [
+    (NATIVE_REPRESENTATION, WRITABLE_REPRESENTATION),
+    (WRITABLE_REPRESENTATION, NATIVE_REPRESENTATION),
+];
+
+fn profile_for(
+    identity: &str,
+    protocol_version: u64,
+    representation: &str,
+) -> Option<&'static ExecutorProfile> {
+    EXECUTOR_PROFILES.iter().find(|profile| {
+        profile.identity == identity
+            && profile.protocol_version == protocol_version
+            && profile.representation == representation
+    })
+}
+
+fn transition_is_gated(from: &str, to: &str) -> bool {
+    TRANSITION_PAIRS
+        .iter()
+        .any(|(source, target)| *source == from && *target == to)
+}
 const LEDGER_STAGE_PREFIX: &str = ".applied-state";
+
+// Hand-rolled because a crate would mean regenerating and committing the lock,
+// and that wasn't worth it for a digest over small config files.
+const SHA256_K: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut state: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    let mut padded = bytes.to_vec();
+    let bit_length = (bytes.len() as u64).wrapping_mul(8);
+    padded.push(0x80);
+    while padded.len() % 64 != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&bit_length.to_be_bytes());
+    for chunk in padded.chunks_exact(64) {
+        let mut w = [0u32; 64];
+        for (index, word) in chunk.chunks_exact(4).enumerate() {
+            w[index] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        }
+        for index in 16..64 {
+            let s0 = w[index - 15].rotate_right(7)
+                ^ w[index - 15].rotate_right(18)
+                ^ (w[index - 15] >> 3);
+            let s1 = w[index - 2].rotate_right(17)
+                ^ w[index - 2].rotate_right(19)
+                ^ (w[index - 2] >> 10);
+            w[index] = w[index - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[index - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = state;
+        for index in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = h
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(SHA256_K[index])
+                .wrapping_add(w[index]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+        for (slot, value) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
+            *slot = slot.wrapping_add(value);
+        }
+    }
+    state.iter().map(|word| format!("{word:08x}")).collect()
+}
+
+// A real process death, not a simulated error return, so recovery is exercised
+// against the same state a power loss would leave. Compiled out entirely unless
+// the feature is on, which is why the shipped binary cannot reach it.
+#[cfg(feature = "fault-injection")]
+fn fault_point(name: &str) {
+    if env::var("FURNISH_FAULT_POINT").ok().as_deref() == Some(name) {
+        std::process::abort();
+    }
+}
+
+#[cfg(not(feature = "fault-injection"))]
+#[inline(always)]
+fn fault_point(_name: &str) {}
+
+fn default_state() -> String {
+    STATE_OWNED.to_owned()
+}
+
+fn default_representation() -> String {
+    NATIVE_REPRESENTATION.to_owned()
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -58,6 +216,10 @@ struct DiagnosticCodes {
     ledger_write_failed: String,
     repair_verification: String,
     unresolvable_desired_target: String,
+    content_verification: String,
+    transition_refused: String,
+    unresolved_retirement: String,
+    pending_recovery: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -105,7 +267,7 @@ struct Provenance {
 #[serde(rename_all = "camelCase")]
 struct Diagnostic<'a> {
     schema_version: u64,
-    severity: &'static str,
+    severity: &'a str,
     code: &'a str,
     message: &'a str,
     primary: Primary<'a>,
@@ -140,6 +302,10 @@ enum CodeKey {
     LedgerWriteFailed,
     RepairVerification,
     UnresolvableDesiredTarget,
+    ContentVerification,
+    TransitionRefused,
+    UnresolvedRetirement,
+    PendingRecovery,
 }
 
 #[derive(Debug)]
@@ -211,6 +377,10 @@ fn code<'a>(codes: &'a DiagnosticCodes, key: CodeKey) -> &'a str {
         CodeKey::LedgerWriteFailed => &codes.ledger_write_failed,
         CodeKey::RepairVerification => &codes.repair_verification,
         CodeKey::UnresolvableDesiredTarget => &codes.unresolvable_desired_target,
+        CodeKey::ContentVerification => &codes.content_verification,
+        CodeKey::TransitionRefused => &codes.transition_refused,
+        CodeKey::UnresolvedRetirement => &codes.unresolved_retirement,
+        CodeKey::PendingRecovery => &codes.pending_recovery,
     }
 }
 
@@ -219,9 +389,18 @@ fn serialize_failure(
     failure: &Failure,
     provenance: Option<&Provenance>,
 ) -> serde_json::Result<String> {
+    serialize_diagnostic(codes, failure, provenance, "error")
+}
+
+fn serialize_diagnostic(
+    codes: &DiagnosticCodes,
+    failure: &Failure,
+    provenance: Option<&Provenance>,
+    severity: &str,
+) -> serde_json::Result<String> {
     serde_json::to_string(&Diagnostic {
         schema_version: DIAGNOSTIC_SCHEMA_VERSION,
-        severity: "error",
+        severity,
         code: code(codes, failure.key),
         message: &failure.message,
         primary: Primary {
@@ -237,6 +416,16 @@ fn serialize_failure(
 
 fn emit_failure(codes: &DiagnosticCodes, failure: &Failure, provenance: Option<&Provenance>) {
     match serialize_failure(codes, failure, provenance) {
+        Ok(line) => eprintln!("{line}"),
+        Err(_) => eprintln!("furnish: failed to serialize runtime diagnostic"),
+    }
+}
+
+// Loud but not fatal. What an unresolved retirement blocks is the retirement,
+// not the activation around it, so this path reports and continues rather than
+// returning a Failure.
+fn emit_warning(codes: &DiagnosticCodes, failure: &Failure, provenance: Option<&Provenance>) {
+    match serialize_diagnostic(codes, failure, provenance, "warning") {
         Ok(line) => eprintln!("{line}"),
         Err(_) => eprintln!("furnish: failed to serialize runtime diagnostic"),
     }
@@ -271,10 +460,11 @@ fn validate_manifest(manifest: &Manifest) -> Result<()> {
                 "entry schema does not match the manifest schema",
             ));
         }
-        if entry.executor.identity != NATIVE_EXECUTOR_IDENTITY
-            || entry.executor.protocol_version != NATIVE_EXECUTOR_PROTOCOL
-            || entry.representation != NATIVE_REPRESENTATION
-        {
+        let Some(profile) = profile_for(
+            &entry.executor.identity,
+            entry.executor.protocol_version,
+            &entry.representation,
+        ) else {
             return Err(Failure::new(
                 CodeKey::UnsupportedExecutor,
                 &entry.filesystem_identity.canonical,
@@ -283,14 +473,17 @@ fn validate_manifest(manifest: &Manifest) -> Result<()> {
                     entry.executor.identity, entry.executor.protocol_version, entry.representation
                 ),
             ));
-        }
-        if entry.cleanup_strategy != "exact-symlink-target"
-            || entry.self_heal_strategy != "exact-symlink-target"
+        };
+        if entry.cleanup_strategy != profile.lifecycle_strategy
+            || entry.self_heal_strategy != profile.lifecycle_strategy
         {
             return Err(Failure::new(
                 CodeKey::InvalidManifest,
                 &entry.filesystem_identity.canonical,
-                "native symlink reconciliation requires exact-symlink-target lifecycle strategies",
+                format!(
+                    "{} reconciliation requires {} lifecycle strategies",
+                    entry.representation, profile.lifecycle_strategy
+                ),
             ));
         }
         if entry.authority.scope != "user" && entry.authority.scope != "system" {
@@ -416,6 +609,7 @@ fn run_executor(
     stage: &OsStr,
     target: &str,
     authority: &Authority,
+    profile: &ExecutorProfile,
 ) -> Result<()> {
     let executable = env::current_exe().map_err(|error| {
         Failure::new(
@@ -439,12 +633,12 @@ fn run_executor(
         Command::new(&executable)
     };
     let status = command
-        .arg("stage-native-symlink")
+        .arg(profile.worker_subcommand)
         .arg("--parent-fd")
         .arg(parent.as_raw_fd().to_string())
         .arg("--name")
         .arg(stage)
-        .arg("--target")
+        .arg(profile.worker_value_flag)
         .arg(target)
         .status()
         .map_err(|error| {
@@ -487,6 +681,44 @@ struct LedgerRecord {
     last_successful_reload: ReloadEvidence,
     reload_action_identity: Option<String>,
     boot_id: Option<String>,
+    // Everything below is v2. The defaults describe what a v1 record could only
+    // have been: writable did not exist and pending state was never written, so
+    // every v1 record is an owned symlink as a matter of what the code could
+    // produce, not as an assumption about the data.
+    #[serde(default = "default_state")]
+    state: String,
+    #[serde(default = "default_representation")]
+    representation: String,
+    // Only a representation that keeps bytes at the destination can drift under
+    // the user, so a symlink record carries no baseline. A path that writes one
+    // for a symlink is writing a claim it cannot check.
+    #[serde(default)]
+    baseline_hash: Option<String>,
+    // What this record intended to put at the destination. Its meaning is fixed
+    // by `representation` and by nothing else: on a writable record it hashes
+    // the file's CONTENT, on a symlink record it hashes the target PATH STRING
+    // the link must point at. The two readings are never interchangeable, so
+    // neither is ever derived from the other. Only the writable reading is read
+    // back to prove authorship; symlink authorship compares the target string
+    // itself, so on a symlink record this field is written and never consulted.
+    #[serde(default)]
+    intended_witness_hash: Option<String>,
+    #[serde(default)]
+    applied_operation_generation: u64,
+    // Recovery has to find the displaced object by name, and a writable file
+    // displaced by a transition may hold edited bytes.
+    #[serde(default)]
+    stage_name: Option<String>,
+    #[serde(default)]
+    unresolved_retirement: Option<UnresolvedRetirement>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UnresolvedRetirement {
+    reason: String,
+    observed_hash: Option<String>,
+    baseline_hash: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -542,6 +774,13 @@ impl RunIdentity {
             applied_artifact_target: entry.retained_artifact_target.clone(),
             managed_root: entry.managed_root.clone(),
             applied_by: applied_by.to_owned(),
+            state: STATE_OWNED.to_owned(),
+            representation: entry.representation.clone(),
+            baseline_hash: None,
+            intended_witness_hash: None,
+            applied_operation_generation: 0,
+            stage_name: None,
+            unresolved_retirement: None,
             applied_generation: self.system_generation.clone(),
             last_successful_reload: ReloadEvidence {
                 invocation_id: self.invocation_id.clone(),
@@ -556,6 +795,7 @@ impl RunIdentity {
     }
 }
 
+#[derive(Debug)]
 struct LedgerState {
     directory: PathBuf,
     path: PathBuf,
@@ -565,6 +805,48 @@ struct LedgerState {
 impl LedgerState {
     fn load(directory: &Path) -> Result<Self> {
         let label = directory.to_string_lossy().into_owned();
+        let path = directory.join(LEDGER_FILE_NAME);
+        let existing = match fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(Failure::io(
+                    CodeKey::LedgerUnreadable,
+                    path.to_string_lossy(),
+                    "read-applied-state",
+                    &error,
+                ));
+            }
+        };
+        let on_disk_version = match existing.as_deref() {
+            Some(bytes) => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct Version {
+                    schema_version: u64,
+                }
+                let version: Version = serde_json::from_slice(bytes).map_err(|error| {
+                    Failure::new(
+                        CodeKey::LedgerInvalid,
+                        path.to_string_lossy(),
+                        format!("cannot decode applied state: {error}"),
+                    )
+                })?;
+                Some(version.schema_version)
+            }
+            None => None,
+        };
+        if let Some(version) = on_disk_version
+            && version > LEDGER_SCHEMA_VERSION
+        {
+            return Err(Failure::new(
+                CodeKey::LedgerInvalid,
+                path.to_string_lossy(),
+                format!(
+                    "applied-state schema {version} is newer than this coordinator supports ({LEDGER_SCHEMA_VERSION}); refusing before any mutation"
+                ),
+            ));
+        }
         if let Err(error) = fs::create_dir_all(directory) {
             return Err(Failure::io(
                 CodeKey::LedgerUnreadable,
@@ -608,9 +890,18 @@ impl LedgerState {
                 ));
             }
         }
-        let path = directory.join(LEDGER_FILE_NAME);
-        let document = match fs::read(&path) {
-            Ok(bytes) => {
+        let (document, migrated) = match (existing, on_disk_version) {
+            // An absent ledger is a cold start, not a clean bill of health: it
+            // proves nothing was recorded, so nothing is owned, so nothing is
+            // repairable until acquisition-from-absence records something.
+            (None, _) => (
+                Ledger {
+                    schema_version: LEDGER_SCHEMA_VERSION,
+                    records: BTreeMap::new(),
+                },
+                false,
+            ),
+            (Some(bytes), Some(version)) if version == LEDGER_SCHEMA_VERSION => {
                 let parsed: Ledger = serde_json::from_slice(&bytes).map_err(|error| {
                     Failure::new(
                         CodeKey::LedgerInvalid,
@@ -618,39 +909,63 @@ impl LedgerState {
                         format!("cannot decode applied state: {error}"),
                     )
                 })?;
-                if parsed.schema_version != LEDGER_SCHEMA_VERSION {
-                    return Err(Failure::new(
-                        CodeKey::LedgerInvalid,
-                        path.to_string_lossy(),
-                        format!(
-                            "applied-state schema {} is unsupported; expected {}",
-                            parsed.schema_version, LEDGER_SCHEMA_VERSION
-                        ),
+                (parsed, false)
+            }
+            (Some(bytes), Some(1)) => {
+                // The copy is the rollback evidence, and it is written before the
+                // first v2 write so a downgrade always has the exact input the
+                // migration consumed.
+                let rollback = directory.join(LEDGER_ROLLBACK_FILE_NAME);
+                if let Err(error) = fs::write(&rollback, &bytes) {
+                    return Err(Failure::io(
+                        CodeKey::LedgerWriteFailed,
+                        rollback.to_string_lossy(),
+                        "write-applied-state-rollback",
+                        &error,
                     ));
                 }
-                parsed
+                let mut parsed: Ledger = serde_json::from_slice(&bytes).map_err(|error| {
+                    Failure::new(
+                        CodeKey::LedgerInvalid,
+                        path.to_string_lossy(),
+                        format!("cannot decode applied state: {error}"),
+                    )
+                })?;
+                for record in parsed.records.values_mut() {
+                    record.state = STATE_OWNED.to_owned();
+                    record.representation = NATIVE_REPRESENTATION.to_owned();
+                    record.stage_name = None;
+                    record.unresolved_retirement = None;
+                }
+                parsed.schema_version = LEDGER_SCHEMA_VERSION;
+                (parsed, true)
             }
-            // An absent ledger is a cold start, not a clean bill of health: it
-            // proves nothing was recorded, so nothing is owned, so nothing is
-            // repairable until acquisition-from-absence records something.
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ledger {
-                schema_version: LEDGER_SCHEMA_VERSION,
-                records: BTreeMap::new(),
-            },
-            Err(error) => {
-                return Err(Failure::io(
-                    CodeKey::LedgerUnreadable,
+            (Some(_), Some(version)) => {
+                return Err(Failure::new(
+                    CodeKey::LedgerInvalid,
                     path.to_string_lossy(),
-                    "read-applied-state",
-                    &error,
+                    format!(
+                        "applied-state schema {version} is unsupported; expected {LEDGER_SCHEMA_VERSION}"
+                    ),
+                ));
+            }
+            (Some(_), None) => {
+                return Err(Failure::new(
+                    CodeKey::LedgerInvalid,
+                    path.to_string_lossy(),
+                    "applied state has no schema version",
                 ));
             }
         };
-        Ok(Self {
+        let state = Self {
             directory: directory.to_path_buf(),
             path,
             document,
-        })
+        };
+        if migrated {
+            state.write()?;
+        }
+        Ok(state)
     }
 
     fn record(&self, canonical: &str) -> Option<&LedgerRecord> {
@@ -807,12 +1122,25 @@ fn stage_symlink(
 ) -> Result<()> {
     let destination = &entry.filesystem_identity.destination;
     remove_stage(parent, stage);
+    let profile = profile_for(
+        &entry.executor.identity,
+        entry.executor.protocol_version,
+        &entry.representation,
+    )
+    .ok_or_else(|| {
+        Failure::new(
+            CodeKey::UnsupportedExecutor,
+            destination,
+            "no qualified executor for this entry",
+        )
+    })?;
     run_executor(
         setpriv,
         parent,
         stage,
         &entry.retained_artifact_target,
         &entry.authority,
+        profile,
     )?;
     let staged = symlink_target(parent, stage).map_err(|errno| {
         Failure::syscall(
@@ -948,13 +1276,62 @@ fn publish_exchange(
     Ok(())
 }
 
-// Retirement is the destructive direction, so it runs on exactly the same five
+// Retirement is the destructive direction, so it runs on exactly the same
 // ownership conditions as the two publishing branches, plus one more: no desired
 // entry claims this destination any more. Anything that is not a link furnish
 // can still prove it published is left exactly where it is.
-fn retire_record(record: &LedgerRecord) -> Result<()> {
+#[derive(Debug)]
+enum RetireOutcome {
+    Removed,
+    // Edited data is never deleted to satisfy cleanup, so the file stays,
+    // ownership stays to explain it, and what is blocked is the retirement.
+    Unresolved(UnresolvedRetirement),
+}
+
+fn retire_record(record: &LedgerRecord) -> Result<RetireOutcome> {
     let destination = &record.destination;
     let (parent, name) = open_parent(destination, &record.managed_root)?;
+
+    if record.representation == WRITABLE_REPRESENTATION {
+        let observed = observe_kind(&parent, &name, destination)?;
+        return match observed {
+            None => Ok(RetireOutcome::Removed),
+            Some(kind) if kind == REGULAR_MODE => {
+                let observed_hash = hash_regular(
+                    &parent,
+                    &name,
+                    destination,
+                    CodeKey::UnresolvedRetirement,
+                    "read-retire-writable",
+                )?;
+                if record.baseline_hash.as_deref() == Some(observed_hash.as_str()) {
+                    // Pristine: the destination is exactly what furnish put
+                    // there, so removing it destroys nothing.
+                    unlinkat(&parent, name.as_os_str(), AtFlags::empty()).map_err(|errno| {
+                        Failure::syscall(
+                            CodeKey::ExecutorFailed,
+                            destination,
+                            "unlinkat-retire",
+                            errno,
+                        )
+                    })?;
+                    Ok(RetireOutcome::Removed)
+                } else {
+                    Ok(RetireOutcome::Unresolved(UnresolvedRetirement {
+                        reason: "writable destination no longer matches its baseline".to_owned(),
+                        observed_hash: Some(observed_hash),
+                        baseline_hash: record.baseline_hash.clone(),
+                    }))
+                }
+            }
+            Some(_) => Err(Failure::new(
+                CodeKey::ConflictingDestination,
+                destination,
+                "refusing to retire a destination that is no longer the regular file recorded as furnish-owned",
+            )),
+        };
+    }
+
     let observed = symlink_target(&parent, &name).map_err(|errno| {
         Failure::syscall(
             CodeKey::ConflictingDestination,
@@ -967,7 +1344,7 @@ fn retire_record(record: &LedgerRecord) -> Result<()> {
     match observed {
         // Already gone. There is nothing to unlink, and the record is the only
         // thing left to remove.
-        None => Ok(()),
+        None => Ok(RetireOutcome::Removed),
         Some(actual) if !actual.is_empty() && actual == recorded => {
             unlinkat(&parent, name.as_os_str(), AtFlags::empty()).map_err(|errno| {
                 Failure::syscall(
@@ -977,13 +1354,802 @@ fn retire_record(record: &LedgerRecord) -> Result<()> {
                     errno,
                 )
             })?;
-            Ok(())
+            Ok(RetireOutcome::Removed)
         }
         Some(_) => Err(Failure::new(
             CodeKey::ConflictingDestination,
             destination,
             "refusing to retire a destination that is no longer the link recorded as furnish-owned",
         )),
+    }
+}
+
+// Observation is by file type, not by a link read, because writable has to tell
+// a regular file from a directory or a device before it will touch anything.
+fn observe_kind(parent: &OwnedFd, name: &OsStr, destination: &str) -> Result<Option<u32>> {
+    match statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => Ok(Some(stat.st_mode as u32 & FILE_TYPE_MASK)),
+        Err(Errno::NOENT) => Ok(None),
+        Err(errno) => Err(Failure::syscall(
+            CodeKey::ConflictingDestination,
+            destination,
+            "fstatat-destination-kind",
+            errno,
+        )),
+    }
+}
+
+fn observe_mode(parent: &OwnedFd, name: &OsStr, destination: &str) -> Result<u32> {
+    match statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => Ok(stat.st_mode as u32 & 0o7777),
+        Err(errno) => Err(Failure::syscall(
+            CodeKey::ConflictingDestination,
+            destination,
+            "fstatat-destination-mode",
+            errno,
+        )),
+    }
+}
+
+// NOFOLLOW throughout: a symlink at the destination is never followed and never
+// written through, so reading one is refused rather than silently resolved.
+fn read_regular(
+    parent: &OwnedFd,
+    name: &OsStr,
+    destination: &str,
+    key: CodeKey,
+    operation: &'static str,
+) -> Result<Vec<u8>> {
+    let opened = openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|errno| Failure::syscall(key, destination, operation, errno))?;
+    let mut file = fs::File::from(opened);
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| Failure::io(key, destination, operation, &error))?;
+    Ok(bytes)
+}
+
+fn hash_regular(
+    parent: &OwnedFd,
+    name: &OsStr,
+    destination: &str,
+    key: CodeKey,
+    operation: &'static str,
+) -> Result<String> {
+    Ok(sha256_hex(&read_regular(
+        parent,
+        name,
+        destination,
+        key,
+        operation,
+    )?))
+}
+
+fn hash_source(source: &str, destination: &str) -> Result<String> {
+    let bytes = fs::read(source).map_err(|error| {
+        Failure::io(
+            CodeKey::UnresolvableDesiredTarget,
+            destination,
+            "read-source-artifact",
+            &error,
+        )
+    })?;
+    Ok(sha256_hex(&bytes))
+}
+
+// The rename is only durable once the directory entry is, so the parent is
+// synced before anything is verified or recorded as published.
+fn sync_parent(parent: &OwnedFd, destination: &str) -> Result<()> {
+    fsync(parent).map_err(|errno| {
+        Failure::syscall(
+            CodeKey::FinalVerification,
+            destination,
+            "fsync-parent",
+            errno,
+        )
+    })
+}
+
+// Nothing has been applied yet, so the prior record's applied state is carried
+// across unchanged: a pending record that dropped it would make recovery
+// converge to a state weaker than the one already durable.
+fn pending_record(
+    identity: &RunIdentity,
+    entry: &Entry,
+    prior: Option<&LedgerRecord>,
+    stage: &OsStr,
+    witness_hash: &str,
+) -> LedgerRecord {
+    let mut record = identity.record(entry, "new");
+    record.state = STATE_PENDING.to_owned();
+    record.intended_witness_hash = Some(witness_hash.to_owned());
+    record.stage_name = Some(stage.to_string_lossy().into_owned());
+    if let Some(prior) = prior {
+        record.baseline_hash = prior.baseline_hash.clone();
+        record.applied_operation_generation = prior.applied_operation_generation;
+    }
+    record
+}
+
+// Every commit that carries the applied state forward after a publish goes
+// through here, whatever the representation, so no path can write a record that
+// carries less than the one it replaces. The operation generation counts applies
+// that reached the destination, so it advances from the prior record instead of
+// restarting. The one exemption is a recovery branch that converges BACKWARD to
+// the state the ledger already describes: it restates that record rather than
+// constructing a new one, because nothing was carried forward to count.
+fn owned_record(
+    identity: &RunIdentity,
+    entry: &Entry,
+    applied_by: &str,
+    prior: Option<&LedgerRecord>,
+    witness_hash: &str,
+) -> LedgerRecord {
+    let mut record = identity.record(entry, applied_by);
+    record.state = STATE_OWNED.to_owned();
+    record.intended_witness_hash = Some(witness_hash.to_owned());
+    record.baseline_hash = baseline_for(&entry.representation, witness_hash);
+    record.applied_operation_generation = prior
+        .map_or(0, |prior| prior.applied_operation_generation)
+        .saturating_add(1);
+    record
+}
+
+// A witness hash is a baseline only where it hashes bytes that live at the
+// destination. For a symlink it hashes a path string, which is not a baseline
+// and must not be stored as one.
+fn baseline_for(representation: &str, witness_hash: &str) -> Option<String> {
+    (representation == WRITABLE_REPRESENTATION).then(|| witness_hash.to_owned())
+}
+
+// A run that publishes nothing must not erase what an earlier run recorded:
+// these fields describe the applied state, not the invocation that observed it.
+// An unresolved retirement marker is deliberately NOT among them: reaching this
+// path means the destination is declared again, and being declared again is what
+// resolves it.
+fn carry_applied_state(prior: &LedgerRecord, record: &mut LedgerRecord) {
+    record.baseline_hash = prior.baseline_hash.clone();
+    record.intended_witness_hash = prior.intended_witness_hash.clone();
+    record.applied_operation_generation = prior.applied_operation_generation;
+}
+
+// The coordinator re-derives the staged content itself rather than trusting the
+// executor's exit status, so an executor that succeeded while producing the
+// wrong bytes cannot reach a destination.
+fn stage_writable(
+    setpriv: &Path,
+    parent: &OwnedFd,
+    stage: &OsStr,
+    entry: &Entry,
+    intended_hash: &str,
+) -> Result<()> {
+    let destination = &entry.filesystem_identity.destination;
+    remove_stage(parent, stage);
+    let profile = profile_for(
+        &entry.executor.identity,
+        entry.executor.protocol_version,
+        &entry.representation,
+    )
+    .ok_or_else(|| {
+        Failure::new(
+            CodeKey::UnsupportedExecutor,
+            destination,
+            "no qualified executor for this entry",
+        )
+    })?;
+    run_executor(
+        setpriv,
+        parent,
+        stage,
+        &entry.retained_artifact_target,
+        &entry.authority,
+        profile,
+    )?;
+    fault_point("stage-written");
+    if observe_kind(parent, stage, destination)? != Some(REGULAR_MODE) {
+        remove_stage(parent, stage);
+        return Err(Failure::new(
+            CodeKey::StagingVerification,
+            destination,
+            "native executor produced an unexpected staging object",
+        ));
+    }
+    let staged_hash = hash_regular(
+        parent,
+        stage,
+        destination,
+        CodeKey::StagingVerification,
+        "read-staging",
+    )?;
+    if staged_hash != intended_hash {
+        remove_stage(parent, stage);
+        return Err(Failure::new(
+            CodeKey::StagingVerification,
+            destination,
+            "staged content does not hash to the intended source content",
+        ));
+    }
+    let mode = observe_mode(parent, stage, destination)?;
+    if mode != WRITABLE_FILE_MODE {
+        remove_stage(parent, stage);
+        return Err(Failure::new(
+            CodeKey::StagingVerification,
+            destination,
+            format!("staged file mode is {mode:04o}; expected {WRITABLE_FILE_MODE:04o}"),
+        ));
+    }
+    Ok(())
+}
+
+// Publication into an absent name. NOREPLACE is what makes this refuse rather
+// than displace, so a destination that appeared during staging is never
+// overwritten and never adopted.
+fn publish_writable_new(
+    parent: &OwnedFd,
+    name: &OsStr,
+    stage: &OsStr,
+    destination: &str,
+    intended_hash: &str,
+) -> Result<()> {
+    fault_point("stage-synced");
+    if observe_kind(parent, name, destination)?.is_some() {
+        remove_stage(parent, stage);
+        return Err(Failure::new(
+            CodeKey::PublishRace,
+            destination,
+            "destination appeared before atomic publish; refusing replacement",
+        ));
+    }
+    if let Err(errno) = renameat_with(parent, stage, parent, name, RenameFlags::NOREPLACE) {
+        remove_stage(parent, stage);
+        return Err(Failure::syscall(
+            CodeKey::PublishRace,
+            destination,
+            "renameat2-noreplace-publish",
+            errno,
+        ));
+    }
+    fault_point("published");
+    sync_parent(parent, destination)?;
+    fault_point("published-synced");
+    verify_writable_destination(parent, name, destination, intended_hash)?;
+    fault_point("verified");
+    Ok(())
+}
+
+// Ownership commits only after this returns. Observation of the published
+// object, not the executor's exit status, is what makes the claim.
+fn verify_writable_destination(
+    parent: &OwnedFd,
+    name: &OsStr,
+    destination: &str,
+    intended_hash: &str,
+) -> Result<()> {
+    if observe_kind(parent, name, destination)? != Some(REGULAR_MODE) {
+        return Err(Failure::new(
+            CodeKey::FinalVerification,
+            destination,
+            "published destination is not a regular file",
+        ));
+    }
+    let observed = hash_regular(
+        parent,
+        name,
+        destination,
+        CodeKey::ContentVerification,
+        "read-published",
+    )?;
+    if observed != intended_hash {
+        return Err(Failure::new(
+            CodeKey::ContentVerification,
+            destination,
+            "published destination failed exact-content verification",
+        ));
+    }
+    let mode = observe_mode(parent, name, destination)?;
+    if mode != WRITABLE_FILE_MODE {
+        return Err(Failure::new(
+            CodeKey::FinalVerification,
+            destination,
+            format!("published file mode is {mode:04o}; expected {WRITABLE_FILE_MODE:04o}"),
+        ));
+    }
+    Ok(())
+}
+
+const TRANSITION_MARKER: &str = "transition";
+
+fn transition_source_of(target: &str) -> Option<&'static str> {
+    TRANSITION_PAIRS
+        .iter()
+        .find(|(_, to)| *to == target)
+        .map(|(from, _)| *from)
+}
+
+fn representation_of_kind(kind: u32) -> Option<&'static str> {
+    match kind {
+        SYMLINK_MODE => Some(NATIVE_REPRESENTATION),
+        REGULAR_MODE => Some(WRITABLE_REPRESENTATION),
+        _ => None,
+    }
+}
+
+// Recovery replay. A pending record authorizes recovery only when destination,
+// intended source hash, and artifact identity all agree with it; anything else
+// is not authorship, so the record is cleared and the ordinary path decides
+// again from observation.
+fn recover_pending(entry: &Entry, ledger: &mut LedgerState, identity: &RunIdentity) -> Result<()> {
+    let canonical = &entry.filesystem_identity.canonical;
+    let destination = &entry.filesystem_identity.destination;
+    let Some(record) = ledger.record(canonical).cloned() else {
+        return Ok(());
+    };
+    if record.state != STATE_PENDING {
+        return Ok(());
+    }
+
+    let (parent, name) = open_parent(destination, &record.managed_root)?;
+    let stage = record.stage_name.clone().map(OsString::from);
+    let observed = observe_kind(&parent, &name, destination)?;
+    let artifact_matches = record.applied_artifact_target == entry.retained_artifact_target;
+
+    if record.applied_by == TRANSITION_MARKER {
+        return recover_transition(
+            entry, ledger, identity, &record, &parent, &name, observed, stage,
+        );
+    }
+
+    let authored = match observed {
+        None => false,
+        Some(kind)
+            if representation_of_kind(kind).as_deref() != Some(record.representation.as_str()) =>
+        {
+            false
+        }
+        Some(kind) if kind == REGULAR_MODE => {
+            match (&record.intended_witness_hash, artifact_matches) {
+                (Some(intended), true) => {
+                    &hash_regular(
+                        &parent,
+                        &name,
+                        destination,
+                        CodeKey::PendingRecovery,
+                        "read-pending-recovery",
+                    )? == intended
+                }
+                _ => false,
+            }
+        }
+        Some(_) => {
+            let target = symlink_target(&parent, &name).map_err(|errno| {
+                Failure::syscall(
+                    CodeKey::PendingRecovery,
+                    destination,
+                    "readlinkat-pending-recovery",
+                    errno,
+                )
+            })?;
+            artifact_matches
+                && target.as_deref() == Some(OsStr::new(&record.applied_artifact_target))
+        }
+    };
+
+    if authored {
+        // Converted to owned at the source this record was pending for, not at
+        // the current one. A stale pending record converges to owned-at-old-S
+        // and the ordinary path then takes it forward. Two steps, both recorded.
+        let mut owned = record.clone();
+        owned.state = STATE_OWNED.to_owned();
+        owned.baseline_hash = record
+            .intended_witness_hash
+            .as_deref()
+            .and_then(|witness| baseline_for(&record.representation, witness));
+        owned.stage_name = None;
+        owned.applied_operation_generation = record.applied_operation_generation.saturating_add(1);
+        ledger.commit(canonical, owned)?;
+        return Ok(());
+    }
+
+    // Not ours. The staged object is content this coordinator wrote and never
+    // published, so removing it destroys nothing a user could have edited.
+    if observed.is_none()
+        && let Some(stage) = stage.as_deref()
+    {
+        remove_stage(&parent, stage);
+    }
+    let _ = identity;
+    ledger.retire(canonical)?;
+    Ok(())
+}
+
+// Recovery for a crash between the exchange and the ledger advancing. The
+// destination already holds the new representation and the displaced object
+// sits at the stage name; for a writable source that displaced object may hold
+// edited user bytes, so it is never unlinked without being hashed against the
+// baseline first.
+#[allow(clippy::too_many_arguments)]
+fn recover_transition(
+    entry: &Entry,
+    ledger: &mut LedgerState,
+    identity: &RunIdentity,
+    record: &LedgerRecord,
+    parent: &OwnedFd,
+    name: &OsStr,
+    observed: Option<u32>,
+    stage: Option<OsString>,
+) -> Result<()> {
+    let canonical = &entry.filesystem_identity.canonical;
+    let destination = &entry.filesystem_identity.destination;
+    let target_representation = record.representation.clone();
+    let Some(source_representation) = transition_source_of(&target_representation) else {
+        return Err(Failure::new(
+            CodeKey::TransitionRefused,
+            destination,
+            "pending transition names a representation pair that is not gated",
+        ));
+    };
+    let observed_representation = observed.and_then(representation_of_kind);
+    let stage = stage.ok_or_else(|| {
+        Failure::new(
+            CodeKey::TransitionRefused,
+            destination,
+            "pending transition record carries no staging name",
+        )
+    })?;
+
+    // The exchange never happened: the destination is still what it was, so this
+    // converges backward by restating the record the ledger already holds.
+    if observed_representation == Some(source_representation) {
+        if observe_kind(parent, &stage, destination)?.is_some() {
+            remove_stage(parent, &stage);
+        }
+        let mut owned = record.clone();
+        owned.state = STATE_OWNED.to_owned();
+        owned.representation = source_representation.to_owned();
+        owned.stage_name = None;
+        ledger.commit(canonical, owned)?;
+        return Ok(());
+    }
+
+    if observed_representation != Some(target_representation.as_str()) {
+        return Err(Failure::new(
+            CodeKey::TransitionRefused,
+            destination,
+            "destination is neither side of the pending transition; refusing",
+        ));
+    }
+
+    // Forward: the destination already holds the new representation.
+    if target_representation == WRITABLE_REPRESENTATION {
+        let Some(intended) = record.intended_witness_hash.clone() else {
+            return Err(Failure::new(
+                CodeKey::TransitionRefused,
+                destination,
+                "pending transition record carries no intended content hash",
+            ));
+        };
+        verify_writable_destination(parent, name, destination, &intended)?;
+        remove_stage(parent, &stage);
+        ledger.commit(
+            canonical,
+            owned_record(identity, entry, "update", Some(record), &intended),
+        )?;
+        return Ok(());
+    }
+
+    // Forward into symlink. The displaced object is the regular file, and it is
+    // the one thing here that can hold work a user cannot get back.
+    let displaced_hash = hash_regular(
+        parent,
+        &stage,
+        destination,
+        CodeKey::TransitionRefused,
+        "read-displaced-writable",
+    )?;
+    let pristine = record.baseline_hash.as_deref() == Some(displaced_hash.as_str());
+    if !pristine {
+        // Exchange back, so the edited bytes return to the destination the user
+        // knows, and the transition is refused rather than completed.
+        if let Err(errno) = renameat_with(parent, &stage, parent, name, RenameFlags::EXCHANGE) {
+            return Err(Failure::syscall(
+                CodeKey::TransitionRefused,
+                destination,
+                "renameat2-exchange-restore",
+                errno,
+            ));
+        }
+        sync_parent(parent, destination)?;
+        // What sits at the stage name now is the symlink this run staged, which
+        // is ours and holds nothing of the user's.
+        remove_stage(parent, &stage);
+        // Backward convergence again: the destination is back to the writable
+        // file it was, so the record it already had is restated, baseline
+        // included.
+        let mut owned = record.clone();
+        owned.state = STATE_OWNED.to_owned();
+        owned.representation = WRITABLE_REPRESENTATION.to_owned();
+        owned.stage_name = None;
+        ledger.commit(canonical, owned)?;
+        return Err(Failure::new(
+            CodeKey::TransitionRefused,
+            destination,
+            "refusing to retire a writable destination that no longer matches its baseline; edited content was restored",
+        ));
+    }
+    remove_stage(parent, &stage);
+    // The exchange landed, so this carries the applied state forward and takes
+    // the same constructor as any other post-publish commit.
+    let owned = owned_record(
+        identity,
+        entry,
+        "update",
+        Some(record),
+        &sha256_hex(entry.retained_artifact_target.as_bytes()),
+    );
+    ledger.commit(canonical, owned)?;
+    Ok(())
+}
+
+// Transfer between representations. Post-write verification completes before
+// the ledger representation changes, in both directions.
+fn transition_representation(
+    entry: &Entry,
+    setpriv: &Path,
+    index: usize,
+    ledger: &mut LedgerState,
+    identity: &RunIdentity,
+    record: &LedgerRecord,
+) -> Result<()> {
+    let canonical = &entry.filesystem_identity.canonical;
+    let destination = &entry.filesystem_identity.destination;
+    let from = record.representation.clone();
+    let to = entry.representation.clone();
+    if !transition_is_gated(&from, &to) {
+        return Err(Failure::new(
+            CodeKey::TransitionRefused,
+            destination,
+            format!("no gated transfer from {from} to {to}"),
+        ));
+    }
+    let (parent, name) = open_parent(destination, &entry.managed_root)?;
+    let stage = stage_name(index);
+    let recorded = OsStr::new(&record.applied_artifact_target);
+
+    if to == WRITABLE_REPRESENTATION {
+        // Safe only when the current symlink is exactly the recorded one.
+        let observed = symlink_target(&parent, &name).map_err(|errno| {
+            Failure::syscall(
+                CodeKey::TransitionRefused,
+                destination,
+                "readlinkat-transition",
+                errno,
+            )
+        })?;
+        if observed.as_deref() != Some(recorded) {
+            return Err(Failure::new(
+                CodeKey::TransitionRefused,
+                destination,
+                "refusing to transfer a destination that is not the link recorded as furnish-owned",
+            ));
+        }
+        let intended = hash_source(&entry.retained_artifact_target, destination)?;
+        fault_point("pre-pending");
+        let mut pending = pending_record(identity, entry, Some(record), &stage, &intended);
+        pending.applied_by = TRANSITION_MARKER.to_owned();
+        pending.representation = WRITABLE_REPRESENTATION.to_owned();
+        pending.applied_artifact_target = record.applied_artifact_target.clone();
+        ledger.commit(canonical, pending)?;
+        fault_point("pending-committed");
+        stage_writable(setpriv, &parent, &stage, entry, &intended)?;
+        fault_point("stage-synced");
+        if let Err(errno) = renameat_with(
+            &parent,
+            &stage,
+            &parent,
+            name.as_os_str(),
+            RenameFlags::EXCHANGE,
+        ) {
+            remove_stage(&parent, &stage);
+            return Err(Failure::syscall(
+                CodeKey::TransitionRefused,
+                destination,
+                "renameat2-exchange-transition",
+                errno,
+            ));
+        }
+        fault_point("exchange-published");
+        sync_parent(&parent, destination)?;
+        verify_writable_destination(&parent, &name, destination, &intended)?;
+        fault_point("verified");
+        remove_stage(&parent, &stage);
+        ledger.commit(
+            canonical,
+            owned_record(identity, entry, "update", Some(record), &intended),
+        )?;
+        return Ok(());
+    }
+
+    // Writable to symlink is automatic only when the destination still equals
+    // its baseline. An edited file is never silently converted away.
+    let Some(baseline) = record.baseline_hash.clone() else {
+        return Err(Failure::new(
+            CodeKey::TransitionRefused,
+            destination,
+            "refusing to transfer a writable destination with no recorded baseline",
+        ));
+    };
+    let observed_hash = hash_regular(
+        &parent,
+        &name,
+        destination,
+        CodeKey::TransitionRefused,
+        "read-writable-transition",
+    )?;
+    if observed_hash != baseline {
+        return Err(Failure::new(
+            CodeKey::TransitionRefused,
+            destination,
+            "refusing to transfer a writable destination that no longer matches its baseline",
+        ));
+    }
+    let expected = OsStr::new(&entry.retained_artifact_target);
+    fault_point("pre-pending");
+    let mut pending = pending_record(
+        identity,
+        entry,
+        Some(record),
+        &stage,
+        &sha256_hex(entry.retained_artifact_target.as_bytes()),
+    );
+    pending.applied_by = TRANSITION_MARKER.to_owned();
+    pending.representation = NATIVE_REPRESENTATION.to_owned();
+    ledger.commit(canonical, pending)?;
+    fault_point("pending-committed");
+    stage_symlink(setpriv, &parent, &stage, entry, expected)?;
+    fault_point("stage-synced");
+    if let Err(errno) = renameat_with(
+        &parent,
+        &stage,
+        &parent,
+        name.as_os_str(),
+        RenameFlags::EXCHANGE,
+    ) {
+        remove_stage(&parent, &stage);
+        return Err(Failure::syscall(
+            CodeKey::TransitionRefused,
+            destination,
+            "renameat2-exchange-transition",
+            errno,
+        ));
+    }
+    fault_point("exchange-published");
+    sync_parent(&parent, destination)?;
+    let published = symlink_target(&parent, &name).map_err(|errno| {
+        Failure::syscall(
+            CodeKey::TransitionRefused,
+            destination,
+            "readlinkat-transition-published",
+            errno,
+        )
+    })?;
+    if published.as_deref() != Some(expected) {
+        return Err(Failure::new(
+            CodeKey::TransitionRefused,
+            destination,
+            "post-transfer verification did not observe the intended link",
+        ));
+    }
+    fault_point("verified");
+    // The displaced object is the pristine regular file, proven equal to its
+    // baseline above, so removing it destroys no work.
+    remove_stage(&parent, &stage);
+    let mut owned = owned_record(
+        identity,
+        entry,
+        "update",
+        Some(record),
+        &sha256_hex(entry.retained_artifact_target.as_bytes()),
+    );
+    ledger.commit(canonical, owned)?;
+    Ok(())
+}
+
+// First ownership of an absent destination, the self-heal for an owned one that
+// has gone missing, and the convergence for a destination that already equals
+// the source while the recorded baseline does not. Divergent content is refused
+// rather than reconciled.
+fn reconcile_writable_entry(
+    entry: &Entry,
+    setpriv: &Path,
+    index: usize,
+    ledger: &mut LedgerState,
+    identity: &RunIdentity,
+) -> Result<()> {
+    let canonical = &entry.filesystem_identity.canonical;
+    let destination = &entry.filesystem_identity.destination;
+    let (parent, name) = open_parent(destination, &entry.managed_root)?;
+    let intended = hash_source(&entry.retained_artifact_target, destination)?;
+    let record = ledger.record(canonical).cloned();
+    let observed = observe_kind(&parent, &name, destination)?;
+
+    match (observed, record) {
+        // First ownership, and the self-heal for an owned destination that has
+        // gone missing. Both publish into an absent name; they differ only in
+        // what the record says about how it was decided.
+        (None, prior) => {
+            let applied_by = if prior.is_some() { "repair" } else { "new" };
+            let stage = stage_name(index);
+            fault_point("pre-pending");
+            ledger.commit(
+                canonical,
+                pending_record(identity, entry, prior.as_ref(), &stage, &intended),
+            )?;
+            fault_point("pending-committed");
+            stage_writable(setpriv, &parent, &stage, entry, &intended)?;
+            publish_writable_new(&parent, &name, &stage, destination, &intended)?;
+            ledger.commit(
+                canonical,
+                owned_record(identity, entry, applied_by, prior.as_ref(), &intended),
+            )?;
+            Ok(())
+        }
+        // Refused by default even when the content already equals the source.
+        // Equality is not adoption proof.
+        (Some(_), None) => Err(Failure::new(
+            CodeKey::ConflictingDestination,
+            destination,
+            "refusing to take ownership of a pre-existing destination: applied state records no furnish ownership of it",
+        )),
+        (Some(kind), Some(record)) => {
+            if kind != REGULAR_MODE {
+                return Err(Failure::new(
+                    CodeKey::ConflictingDestination,
+                    destination,
+                    "refusing a destination that is not a regular file",
+                ));
+            }
+            let observed_hash = hash_regular(
+                &parent,
+                &name,
+                destination,
+                CodeKey::ContentVerification,
+                "read-destination",
+            )?;
+            if observed_hash != intended {
+                // Deciding between edited runtime content and a changed source
+                // needs a three-way comparison that does not exist yet.
+                // Refusing is the conservative direction: it neither adopts nor
+                // overwrites.
+                return Err(Failure::new(
+                    CodeKey::ConflictingDestination,
+                    destination,
+                    "destination content differs from the source; reconciliation of divergent writable content is not yet supported",
+                ));
+            }
+            // Destination equals the source. If the baseline does not, this is
+            // the crash window after replacement and before the baseline was
+            // committed: verify the representation, advance the baseline, and
+            // never report a conflict.
+            if record.baseline_hash.as_deref() != Some(intended.as_str()) {
+                verify_writable_destination(&parent, &name, destination, &intended)?;
+                ledger.commit(
+                    canonical,
+                    owned_record(
+                        identity,
+                        entry,
+                        &record.applied_by,
+                        Some(&record),
+                        &intended,
+                    ),
+                )?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -996,6 +2162,23 @@ fn reconcile_entry(
 ) -> Result<()> {
     let destination = &entry.filesystem_identity.destination;
     let canonical = &entry.filesystem_identity.canonical;
+
+    // Recovery runs before the ordinary path and only ever converts pending to
+    // owned. The two are never fused, so a stale pending record converges to
+    // owned at the source it was pending for and is then carried forward.
+    recover_pending(entry, ledger, identity)?;
+
+    if let Some(record) = ledger.record(canonical).cloned()
+        && record.state == STATE_OWNED
+        && record.representation != entry.representation
+    {
+        return transition_representation(entry, setpriv, index, ledger, identity, &record);
+    }
+
+    if entry.representation == WRITABLE_REPRESENTATION {
+        return reconcile_writable_entry(entry, setpriv, index, ledger, identity);
+    }
+
     let expected = OsStr::new(&entry.retained_artifact_target);
     let (parent, name) = open_parent(destination, &entry.managed_root)?;
 
@@ -1011,9 +2194,22 @@ fn reconcile_entry(
     match observed {
         None => {
             let stage = stage_name(index);
+            let intended = sha256_hex(entry.retained_artifact_target.as_bytes());
+            let prior = ledger.record(canonical).cloned();
+            fault_point("pre-pending");
+            ledger.commit(
+                canonical,
+                pending_record(identity, entry, prior.as_ref(), &stage, &intended),
+            )?;
+            fault_point("pending-committed");
             stage_symlink(setpriv, &parent, &stage, entry, expected)?;
+            fault_point("stage-synced");
             publish_new(&parent, &name, &stage, destination, expected)?;
-            ledger.commit(canonical, identity.record(entry, "new"))?;
+            fault_point("verified");
+            ledger.commit(
+                canonical,
+                owned_record(identity, entry, "new", prior.as_ref(), &intended),
+            )?;
             Ok(())
         }
         Some(actual) if actual == expected => {
@@ -1022,12 +2218,12 @@ fn reconcile_entry(
             // host whose link predates the ledger stays unrecorded here and
             // acquires from absence instead.
             // Nothing was published, so the branch that produced this target is
-            // carried forward rather than restated as a decision this run made.
-            if let Some(applied_by) = ledger
-                .record(canonical)
-                .map(|prior| prior.applied_by.clone())
-            {
-                ledger.commit(canonical, identity.record(entry, &applied_by))?;
+            // carried forward rather than restated as a decision this run made,
+            // and so is everything else the applied state already recorded.
+            if let Some(prior) = ledger.record(canonical).cloned() {
+                let mut refreshed = identity.record(entry, &prior.applied_by);
+                carry_applied_state(&prior, &mut refreshed);
+                ledger.commit(canonical, refreshed)?;
             }
             Ok(())
         }
@@ -1062,12 +2258,13 @@ fn reconcile_entry(
                 ));
             }
 
-            // Conditions 1 through 5 hold, so the destination is provably ours
-            // and the only question left is which owned branch this is. Both
-            // publish to desired through the same exchange; they differ in what
-            // they mean. A resolving recorded target says the declaration moved,
-            // which is a fact about the config. A reaped one says the store
-            // object furnish published is gone, which is a fact about the world.
+            // The destination is recorded as furnish-owned and the link on disk
+            // still points at the recorded target, so what remains is only which
+            // owned branch this is. Both publish to desired through the same
+            // exchange; they differ in what they mean. A resolving recorded target
+            // says the declaration moved, which is a fact about the config. A
+            // reaped one says the store object furnish published is gone, which is
+            // a fact about the world.
             //
             // Resolution is only ever tested against a target furnish published
             // itself, which is always a store path on an already-mounted
@@ -1101,16 +2298,22 @@ fn reconcile_entry(
             }
 
             let stage = stage_name(index);
+            let intended = sha256_hex(entry.retained_artifact_target.as_bytes());
             stage_symlink(setpriv, &parent, &stage, entry, expected)?;
             publish_exchange(&parent, &name, &stage, destination, expected, recorded)?;
-            ledger.commit(canonical, identity.record(entry, applied_by))?;
+            ledger.commit(
+                canonical,
+                owned_record(identity, entry, applied_by, Some(&record), &intended),
+            )?;
             Ok(())
         }
     }
 }
 
-fn acquire_lock(run_lock: &OwnedFd, lock_name: &OsStr) -> Result<OwnedFd> {
-    let label = Path::new("/run/lock").join(lock_name);
+fn acquire_lock(run_lock: &OwnedFd, lock_dir: &Path, lock_name: &OsStr) -> Result<OwnedFd> {
+    // The directory comes from the caller so a failure names the file it failed
+    // on, which is not always the default one.
+    let label = lock_dir.join(lock_name);
     let lock = openat(
         run_lock,
         lock_name,
@@ -1136,7 +2339,12 @@ fn acquire_lock(run_lock: &OwnedFd, lock_name: &OsStr) -> Result<OwnedFd> {
     Ok(lock)
 }
 
-fn open_host_lock(lock_name: &OsStr) -> Result<OwnedFd> {
+const DEFAULT_LOCK_DIR: &str = "/run/lock";
+
+// The lock directory is a seam so crash cases can be exercised without a boot.
+// Nothing in the module set passes it, so the unit and the activation script
+// are byte-unchanged and it never becomes a host-visible option.
+fn open_host_lock(lock_name: &OsStr, lock_dir: &Path) -> Result<OwnedFd> {
     let mut components = Path::new(lock_name).components();
     if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
         return Err(Failure::new(
@@ -1146,19 +2354,19 @@ fn open_host_lock(lock_name: &OsStr) -> Result<OwnedFd> {
         ));
     }
     let run_lock = open(
-        "/run/lock",
+        lock_dir,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
     .map_err(|errno| {
         Failure::syscall(
             CodeKey::InvalidManifest,
-            "/run/lock",
+            lock_dir.to_string_lossy(),
             "open-run-lock",
             errno,
         )
     })?;
-    acquire_lock(&run_lock, lock_name)
+    acquire_lock(&run_lock, lock_dir, lock_name)
 }
 
 fn reconcile(
@@ -1166,6 +2374,7 @@ fn reconcile(
     lock_name: &OsStr,
     setpriv: &Path,
     state_dir: &Path,
+    lock_dir: &Path,
 ) -> ExitCode {
     let bytes = match fs::read(manifest_path) {
         Ok(bytes) => bytes,
@@ -1204,7 +2413,7 @@ fn reconcile(
         return ExitCode::FAILURE;
     }
 
-    let _lock = match open_host_lock(lock_name) {
+    let _lock = match open_host_lock(lock_name, lock_dir) {
         Ok(lock) => lock,
         Err(failure) => {
             emit_failure(&manifest.diagnostic_contract.codes, &failure, None);
@@ -1245,22 +2454,46 @@ fn reconcile(
         if desired.contains(canonical.as_str()) {
             continue;
         }
-        if let Err(failure) = retire_record(&record) {
-            emit_failure(&manifest.diagnostic_contract.codes, &failure, None);
-            return ExitCode::FAILURE;
-        }
-        if let Err(failure) = ledger.retire(&canonical) {
-            emit_failure(&manifest.diagnostic_contract.codes, &failure, None);
-            return ExitCode::FAILURE;
+        match retire_record(&record) {
+            Ok(RetireOutcome::Removed) => {
+                if let Err(failure) = ledger.retire(&canonical) {
+                    emit_failure(&manifest.diagnostic_contract.codes, &failure, None);
+                    return ExitCode::FAILURE;
+                }
+            }
+            // The record is the point: it is what stops the file becoming an
+            // unexplained orphan, so ownership is preserved rather than dropped
+            // and the prune is refused rather than the activation.
+            Ok(RetireOutcome::Unresolved(unresolved)) => {
+                let failure = Failure::new(
+                    CodeKey::UnresolvedRetirement,
+                    &record.destination,
+                    format!(
+                        "retirement is blocked: {}; the file and its ownership record are preserved",
+                        unresolved.reason
+                    ),
+                );
+                emit_warning(&manifest.diagnostic_contract.codes, &failure, None);
+                let mut kept = record.clone();
+                kept.unresolved_retirement = Some(unresolved);
+                if let Err(failure) = ledger.commit(&canonical, kept) {
+                    emit_failure(&manifest.diagnostic_contract.codes, &failure, None);
+                    return ExitCode::FAILURE;
+                }
+            }
+            Err(failure) => {
+                emit_failure(&manifest.diagnostic_contract.codes, &failure, None);
+                return ExitCode::FAILURE;
+            }
         }
     }
     ExitCode::SUCCESS
 }
 
-fn worker(args: &[OsString]) -> ExitCode {
+fn worker(args: &[OsString], profile: &ExecutorProfile) -> ExitCode {
     let mut parent_fd = None;
     let mut name = None;
-    let mut target = None;
+    let mut value = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].to_string_lossy().as_ref() {
@@ -1272,14 +2505,14 @@ fn worker(args: &[OsString]) -> ExitCode {
                 name = Some(args[index + 1].clone());
                 index += 2;
             }
-            "--target" if index + 1 < args.len() => {
-                target = Some(args[index + 1].clone());
+            flag if flag == profile.worker_value_flag && index + 1 < args.len() => {
+                value = Some(args[index + 1].clone());
                 index += 2;
             }
             _ => return ExitCode::FAILURE,
         }
     }
-    let (Some(parent_fd), Some(name), Some(target)) = (parent_fd, name, target) else {
+    let (Some(parent_fd), Some(name), Some(value)) = (parent_fd, name, value) else {
         return ExitCode::FAILURE;
     };
     let inherited = PathBuf::from(format!("/proc/self/fd/{parent_fd}"));
@@ -1291,10 +2524,50 @@ fn worker(args: &[OsString]) -> ExitCode {
         Ok(parent) => parent,
         Err(_) => return ExitCode::FAILURE,
     };
-    match symlinkat(&target, &parent, &name) {
+    if profile.representation == WRITABLE_REPRESENTATION {
+        return stage_writable_content(&parent, &name, Path::new(&value));
+    }
+    match symlinkat(&value, &parent, &name) {
         Ok(()) => ExitCode::SUCCESS,
         Err(_) => ExitCode::FAILURE,
     }
+}
+
+// The bytes are written and durable before the coordinator is told anything
+// succeeded, so a crash after the executor returns can never leave a stage the
+// coordinator would mistake for complete.
+fn stage_writable_content(parent: &OwnedFd, name: &OsStr, source: &Path) -> ExitCode {
+    let bytes = match fs::read(source) {
+        Ok(bytes) => bytes,
+        Err(_) => return ExitCode::FAILURE,
+    };
+    let staged = match openat(
+        parent,
+        name,
+        OFlags::CREATE | OFlags::WRONLY | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::from_bits_truncate(WRITABLE_FILE_MODE),
+    ) {
+        Ok(fd) => fd,
+        Err(_) => return ExitCode::FAILURE,
+    };
+    let mut file = fs::File::from(staged);
+    if file.write_all(&bytes).is_err() {
+        return ExitCode::FAILURE;
+    }
+    // The mode is asserted rather than assumed, because O_CREAT is subject to
+    // the umask of whichever authority the executor is running under.
+    if fs::set_permissions(
+        format!("/proc/self/fd/{}", file.as_raw_fd()),
+        fs::Permissions::from_mode(WRITABLE_FILE_MODE),
+    )
+    .is_err()
+    {
+        return ExitCode::FAILURE;
+    }
+    if file.sync_all().is_err() {
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
 }
 
 fn option(args: &[OsString], flag: &str) -> Option<PathBuf> {
@@ -1319,9 +2592,25 @@ fn main() -> ExitCode {
             let Some(state_dir) = option(&args[1..], "--state-dir") else {
                 return ExitCode::FAILURE;
             };
-            reconcile(&manifest, lock_name.as_os_str(), &setpriv, &state_dir)
+            let lock_dir =
+                option(&args[1..], "--lock-dir").unwrap_or_else(|| PathBuf::from(DEFAULT_LOCK_DIR));
+            reconcile(
+                &manifest,
+                lock_name.as_os_str(),
+                &setpriv,
+                &state_dir,
+                &lock_dir,
+            )
         }
-        Some("stage-native-symlink") => worker(&args[1..]),
+        Some(subcommand) => {
+            match EXECUTOR_PROFILES
+                .iter()
+                .find(|profile| profile.worker_subcommand == subcommand)
+            {
+                Some(profile) => worker(&args[1..], profile),
+                None => ExitCode::FAILURE,
+            }
+        }
         _ => ExitCode::FAILURE,
     }
 }
@@ -1366,6 +2655,27 @@ mod tests {
         }
     }
 
+    // Pinned to published vectors rather than to this implementation. Every
+    // other assertion here computes its expectation with the same function it
+    // is checking, so a wrong compression function would be self-consistent and
+    // green, and content ownership decisions ride on these digests. The third
+    // vector spans two blocks, where the padding is easiest to get wrong.
+    #[test]
+    fn sha256_reproduces_known_answers() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            sha256_hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+    }
+
     #[test]
     fn stage_names_are_hidden_and_process_scoped() {
         let name = stage_name(7);
@@ -1385,7 +2695,7 @@ mod tests {
     fn absent_lock_file_is_created_and_locked() {
         let root = TestLockRoot::new();
         let lock_name = OsStr::new("furnish-test.lock");
-        let _lock = acquire_lock(&root.open(), lock_name).expect("acquire fresh lock");
+        let _lock = acquire_lock(&root.open(), &root.0, lock_name).expect("acquire fresh lock");
         assert!(root.0.join(lock_name).is_file());
     }
 
@@ -1394,7 +2704,8 @@ mod tests {
         let root = TestLockRoot::new();
         let lock_name = OsStr::new("furnish-test.lock");
         symlink("elsewhere", root.0.join(lock_name)).expect("plant lock symlink");
-        let failure = acquire_lock(&root.open(), lock_name).expect_err("refuse lock symlink");
+        let failure =
+            acquire_lock(&root.open(), &root.0, lock_name).expect_err("refuse lock symlink");
         assert_eq!(failure.operation, Some("openat-lock"));
         assert_eq!(failure.errno, Some(Errno::LOOP.raw_os_error()));
         let codes = DiagnosticCodes {
@@ -1413,19 +2724,20 @@ mod tests {
     fn concurrent_lock_acquisition_serializes() {
         let root = TestLockRoot::new();
         let lock_name = OsString::from("furnish-test.lock");
-        let first = acquire_lock(&root.open(), &lock_name).expect("acquire first lock");
+        let first = acquire_lock(&root.open(), &root.0, &lock_name).expect("acquire first lock");
         let lock_root = root.0.clone();
         let (started_tx, started_rx) = mpsc::channel();
         let (acquired_tx, acquired_rx) = mpsc::channel();
         let waiter = thread::spawn(move || {
             let directory = open(
-                lock_root,
+                &lock_root,
                 OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
             )
             .expect("open lock directory for waiter");
             started_tx.send(()).expect("signal waiter start");
-            let _lock = acquire_lock(&directory, &lock_name).expect("acquire second lock");
+            let _lock =
+                acquire_lock(&directory, &lock_root, &lock_name).expect("acquire second lock");
             acquired_tx.send(()).expect("signal waiter acquisition");
         });
         started_rx.recv().expect("waiter started");
@@ -1850,5 +3162,539 @@ mod tests {
         // directory); ELOOP only applies to the O_NOFOLLOW-without-O_DIRECTORY
         // lock-file open. Either way the symlink is refused without being followed.
         assert_eq!(failure.errno, Some(Errno::NOTDIR.raw_os_error()));
+    }
+
+    // Crash-boundary coverage. A unit test cannot kill the process mid-apply,
+    // so each of these plants exactly the on-disk and ledger state a death at
+    // that boundary leaves behind and asserts where the next run converges.
+    // Real process death at the same points is proven by the fault-injection
+    // build in the regression harness.
+
+    fn sample_writable_entry(managed_root: &str, destination: &str, source: &str) -> Entry {
+        let mut entry = sample_entry(managed_root, destination, source);
+        entry.representation = WRITABLE_REPRESENTATION.to_owned();
+        entry.executor = Executor {
+            identity: NATIVE_WRITABLE_IDENTITY.to_owned(),
+            protocol_version: NATIVE_WRITABLE_PROTOCOL,
+        };
+        entry.cleanup_strategy = "exact-source-content".to_owned();
+        entry.self_heal_strategy = "exact-source-content".to_owned();
+        entry
+    }
+
+    fn write_source(dir: &TestDir, name: &str, contents: &str) -> String {
+        let path = dir.path().join(name);
+        fs::write(&path, contents).expect("write source artifact");
+        path.to_str().unwrap().to_owned()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn plant_record(
+        ledger: &mut LedgerState,
+        entry: &Entry,
+        state: &str,
+        applied_by: &str,
+        representation: &str,
+        target: &str,
+        baseline: Option<&str>,
+        intended: Option<&str>,
+        stage: Option<&str>,
+    ) {
+        let identity = RunIdentity::observe();
+        let mut record = identity.record(entry, applied_by);
+        record.state = state.to_owned();
+        record.representation = representation.to_owned();
+        record.applied_artifact_target = target.to_owned();
+        record.baseline_hash = baseline.map(str::to_owned);
+        record.intended_witness_hash = intended.map(str::to_owned);
+        record.stage_name = stage.map(str::to_owned);
+        ledger
+            .commit(&entry.filesystem_identity.canonical, record)
+            .expect("plant record");
+    }
+
+    #[test]
+    fn crash_at_pre_pending_leaves_nothing_owned() {
+        let dir = TestDir::new();
+        let source = write_source(&dir, "source", "payload\n");
+        let destination = dir.path().join("value");
+        let entry = sample_writable_entry(
+            dir.path().to_str().unwrap(),
+            destination.to_str().unwrap(),
+            &source,
+        );
+        let mut ledger = test_ledger(&dir);
+        // Nothing was recorded and nothing was written, so recovery has nothing
+        // to convert and the destination is still absent.
+        recover_pending(&entry, &mut ledger, &RunIdentity::observe()).expect("recovery is a no-op");
+        assert!(
+            ledger
+                .record(&entry.filesystem_identity.canonical)
+                .is_none()
+        );
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn crash_at_pending_committed_clears_the_record_and_keeps_the_destination_absent() {
+        let dir = TestDir::new();
+        let source = write_source(&dir, "source", "payload\n");
+        let destination = dir.path().join("value");
+        let entry = sample_writable_entry(
+            dir.path().to_str().unwrap(),
+            destination.to_str().unwrap(),
+            &source,
+        );
+        let intended = sha256_hex(b"payload\n");
+        let mut ledger = test_ledger(&dir);
+        plant_record(
+            &mut ledger,
+            &entry,
+            STATE_PENDING,
+            "new",
+            WRITABLE_REPRESENTATION,
+            &source,
+            None,
+            Some(&intended),
+            Some(".furnish.test.stage"),
+        );
+        recover_pending(&entry, &mut ledger, &RunIdentity::observe()).expect("recovery converges");
+        // The publication never happened, so the pending record is not evidence
+        // of ownership and is cleared rather than promoted.
+        assert!(
+            ledger
+                .record(&entry.filesystem_identity.canonical)
+                .is_none()
+        );
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn crash_at_stage_written_removes_the_orphaned_stage() {
+        let dir = TestDir::new();
+        let source = write_source(&dir, "source", "payload\n");
+        let destination = dir.path().join("value");
+        let stage = ".furnish.test.stage";
+        fs::write(dir.path().join(stage), "payload\n").expect("plant staged content");
+        let entry = sample_writable_entry(
+            dir.path().to_str().unwrap(),
+            destination.to_str().unwrap(),
+            &source,
+        );
+        let intended = sha256_hex(b"payload\n");
+        let mut ledger = test_ledger(&dir);
+        plant_record(
+            &mut ledger,
+            &entry,
+            STATE_PENDING,
+            "new",
+            WRITABLE_REPRESENTATION,
+            &source,
+            None,
+            Some(&intended),
+            Some(stage),
+        );
+        recover_pending(&entry, &mut ledger, &RunIdentity::observe()).expect("recovery converges");
+        // The stage is content this coordinator wrote and never published, so
+        // removing it destroys nothing a user could have edited.
+        assert!(!dir.path().join(stage).exists());
+        assert!(!destination.exists());
+        assert!(
+            ledger
+                .record(&entry.filesystem_identity.canonical)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn crash_after_publication_converts_pending_to_owned_at_the_intended_source() {
+        let dir = TestDir::new();
+        let source = write_source(&dir, "source", "payload\n");
+        let destination = dir.path().join("value");
+        fs::write(&destination, "payload\n").expect("plant published content");
+        let entry = sample_writable_entry(
+            dir.path().to_str().unwrap(),
+            destination.to_str().unwrap(),
+            &source,
+        );
+        let intended = sha256_hex(b"payload\n");
+        let mut ledger = test_ledger(&dir);
+        plant_record(
+            &mut ledger,
+            &entry,
+            STATE_PENDING,
+            "new",
+            WRITABLE_REPRESENTATION,
+            &source,
+            None,
+            Some(&intended),
+            Some(".furnish.test.stage"),
+        );
+        recover_pending(&entry, &mut ledger, &RunIdentity::observe()).expect("recovery converges");
+        let record = ledger
+            .record(&entry.filesystem_identity.canonical)
+            .expect("recovered record")
+            .clone();
+        assert_eq!(record.state, STATE_OWNED);
+        assert_eq!(record.baseline_hash.as_deref(), Some(intended.as_str()));
+        assert!(record.stage_name.is_none());
+    }
+
+    #[test]
+    fn recovery_refuses_a_destination_the_pending_record_did_not_author() {
+        let dir = TestDir::new();
+        let source = write_source(&dir, "source", "payload\n");
+        let destination = dir.path().join("value");
+        fs::write(&destination, "somebody elses bytes\n").expect("plant foreign content");
+        let entry = sample_writable_entry(
+            dir.path().to_str().unwrap(),
+            destination.to_str().unwrap(),
+            &source,
+        );
+        let intended = sha256_hex(b"payload\n");
+        let mut ledger = test_ledger(&dir);
+        plant_record(
+            &mut ledger,
+            &entry,
+            STATE_PENDING,
+            "new",
+            WRITABLE_REPRESENTATION,
+            &source,
+            None,
+            Some(&intended),
+            Some(".furnish.test.stage"),
+        );
+        recover_pending(&entry, &mut ledger, &RunIdentity::observe()).expect("recovery converges");
+        // Content that does not match the intent is not authorship, so the
+        // record is cleared and the file is left exactly as found.
+        assert!(
+            ledger
+                .record(&entry.filesystem_identity.canonical)
+                .is_none()
+        );
+        assert_eq!(
+            fs::read_to_string(&destination).unwrap(),
+            "somebody elses bytes\n"
+        );
+    }
+
+    #[test]
+    fn a_stale_pending_record_converges_to_owned_at_its_own_source_not_the_current_one() {
+        let dir = TestDir::new();
+        let source = write_source(&dir, "source", "new payload\n");
+        let destination = dir.path().join("value");
+        fs::write(&destination, "old payload\n").expect("plant older publication");
+        let entry = sample_writable_entry(
+            dir.path().to_str().unwrap(),
+            destination.to_str().unwrap(),
+            &source,
+        );
+        let old_intended = sha256_hex(b"old payload\n");
+        let mut ledger = test_ledger(&dir);
+        plant_record(
+            &mut ledger,
+            &entry,
+            STATE_PENDING,
+            "new",
+            WRITABLE_REPRESENTATION,
+            &source,
+            None,
+            Some(&old_intended),
+            Some(".furnish.test.stage"),
+        );
+        recover_pending(&entry, &mut ledger, &RunIdentity::observe()).expect("recovery converges");
+        let record = ledger
+            .record(&entry.filesystem_identity.canonical)
+            .expect("recovered record")
+            .clone();
+        // Recovery and reconciliation are two recorded steps, never fused: this
+        // lands at the old source and the ordinary path carries it forward.
+        assert_eq!(record.state, STATE_OWNED);
+        assert_eq!(record.baseline_hash.as_deref(), Some(old_intended.as_str()));
+    }
+
+    #[test]
+    fn stale_baseline_is_advanced_as_recovery_and_never_reported_as_conflict() {
+        let dir = TestDir::new();
+        let source = write_source(&dir, "source", "payload\n");
+        let destination = dir.path().join("value");
+        fs::write(&destination, "payload\n").expect("plant matching destination");
+        fs::set_permissions(&destination, fs::Permissions::from_mode(WRITABLE_FILE_MODE))
+            .expect("set published mode");
+        let entry = sample_writable_entry(
+            dir.path().to_str().unwrap(),
+            destination.to_str().unwrap(),
+            &source,
+        );
+        let mut ledger = test_ledger(&dir);
+        plant_record(
+            &mut ledger,
+            &entry,
+            STATE_OWNED,
+            "new",
+            WRITABLE_REPRESENTATION,
+            &source,
+            Some("0000000000000000000000000000000000000000000000000000000000000000"),
+            None,
+            None,
+        );
+        reconcile_writable_entry(
+            &entry,
+            Path::new("/nonexistent/setpriv"),
+            0,
+            &mut ledger,
+            &RunIdentity::observe(),
+        )
+        .expect("stale baseline converges without conflict");
+        let record = ledger
+            .record(&entry.filesystem_identity.canonical)
+            .expect("record")
+            .clone();
+        assert_eq!(
+            record.baseline_hash.as_deref(),
+            Some(sha256_hex(b"payload\n").as_str())
+        );
+    }
+
+    #[test]
+    fn writable_destination_equal_to_the_source_but_never_owned_is_refused() {
+        let dir = TestDir::new();
+        let source = write_source(&dir, "source", "payload\n");
+        let destination = dir.path().join("value");
+        fs::write(&destination, "payload\n").expect("plant identical content");
+        let entry = sample_writable_entry(
+            dir.path().to_str().unwrap(),
+            destination.to_str().unwrap(),
+            &source,
+        );
+        let mut ledger = test_ledger(&dir);
+        let failure = reconcile_writable_entry(
+            &entry,
+            Path::new("/nonexistent/setpriv"),
+            0,
+            &mut ledger,
+            &RunIdentity::observe(),
+        )
+        .expect_err("equality is not adoption proof");
+        assert!(matches!(failure.key, CodeKey::ConflictingDestination));
+        assert!(
+            ledger
+                .record(&entry.filesystem_identity.canonical)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn crash_at_exchange_published_completes_the_transfer_into_writable() {
+        let dir = TestDir::new();
+        let source = write_source(&dir, "source", "payload\n");
+        let destination = dir.path().join("value");
+        let stage = ".furnish.test.stage";
+        // Post-EXCHANGE: the destination is the new regular file and the
+        // displaced old symlink is sitting at the stage name.
+        fs::write(&destination, "payload\n").expect("plant exchanged destination");
+        fs::set_permissions(&destination, fs::Permissions::from_mode(WRITABLE_FILE_MODE))
+            .expect("set published mode");
+        symlink("/old/target", dir.path().join(stage)).expect("plant displaced symlink");
+        let entry = sample_writable_entry(
+            dir.path().to_str().unwrap(),
+            destination.to_str().unwrap(),
+            &source,
+        );
+        let intended = sha256_hex(b"payload\n");
+        let mut ledger = test_ledger(&dir);
+        plant_record(
+            &mut ledger,
+            &entry,
+            STATE_PENDING,
+            TRANSITION_MARKER,
+            WRITABLE_REPRESENTATION,
+            "/old/target",
+            None,
+            Some(&intended),
+            Some(stage),
+        );
+        recover_pending(&entry, &mut ledger, &RunIdentity::observe())
+            .expect("transition recovery converges forward");
+        let record = ledger
+            .record(&entry.filesystem_identity.canonical)
+            .expect("record")
+            .clone();
+        assert_eq!(record.state, STATE_OWNED);
+        assert_eq!(record.representation, WRITABLE_REPRESENTATION);
+        // Unlinking a symlink never touches its pointee.
+        assert!(!dir.path().join(stage).exists());
+    }
+
+    #[test]
+    fn crash_at_exchange_published_restores_edited_writable_and_refuses() {
+        let dir = TestDir::new();
+        let source = write_source(&dir, "source", "payload\n");
+        let destination = dir.path().join("value");
+        let stage = ".furnish.test.stage";
+        // Post-EXCHANGE the other way: the destination is now the symlink and
+        // the displaced regular file holds bytes the user edited.
+        symlink(&source, &destination).expect("plant exchanged symlink");
+        fs::write(dir.path().join(stage), "the user edited this\n")
+            .expect("plant displaced edited file");
+        let mut entry = sample_writable_entry(
+            dir.path().to_str().unwrap(),
+            destination.to_str().unwrap(),
+            &source,
+        );
+        entry.representation = NATIVE_REPRESENTATION.to_owned();
+        let mut ledger = test_ledger(&dir);
+        plant_record(
+            &mut ledger,
+            &entry,
+            STATE_PENDING,
+            TRANSITION_MARKER,
+            NATIVE_REPRESENTATION,
+            &source,
+            Some(&sha256_hex(b"payload\n")),
+            Some(&sha256_hex(source.as_bytes())),
+            Some(stage),
+        );
+        let failure = recover_pending(&entry, &mut ledger, &RunIdentity::observe())
+            .expect_err("an edited displaced file refuses the transfer");
+        assert!(matches!(failure.key, CodeKey::TransitionRefused));
+        // The edited bytes are back at the destination and were never unlinked.
+        assert_eq!(
+            fs::read_to_string(&destination).unwrap(),
+            "the user edited this\n"
+        );
+        let record = ledger
+            .record(&entry.filesystem_identity.canonical)
+            .expect("ownership is preserved")
+            .clone();
+        assert_eq!(record.representation, WRITABLE_REPRESENTATION);
+    }
+
+    #[test]
+    fn crash_at_exchange_published_completes_the_transfer_into_symlink_when_pristine() {
+        let dir = TestDir::new();
+        let source = write_source(&dir, "source", "payload\n");
+        let destination = dir.path().join("value");
+        let stage = ".furnish.test.stage";
+        symlink(&source, &destination).expect("plant exchanged symlink");
+        fs::write(dir.path().join(stage), "payload\n").expect("plant pristine displaced file");
+        let mut entry = sample_writable_entry(
+            dir.path().to_str().unwrap(),
+            destination.to_str().unwrap(),
+            &source,
+        );
+        entry.representation = NATIVE_REPRESENTATION.to_owned();
+        let mut ledger = test_ledger(&dir);
+        plant_record(
+            &mut ledger,
+            &entry,
+            STATE_PENDING,
+            TRANSITION_MARKER,
+            NATIVE_REPRESENTATION,
+            &source,
+            Some(&sha256_hex(b"payload\n")),
+            Some(&sha256_hex(source.as_bytes())),
+            Some(stage),
+        );
+        recover_pending(&entry, &mut ledger, &RunIdentity::observe())
+            .expect("a pristine displaced file completes the transfer");
+        let record = ledger
+            .record(&entry.filesystem_identity.canonical)
+            .expect("record")
+            .clone();
+        assert_eq!(record.state, STATE_OWNED);
+        assert_eq!(record.representation, NATIVE_REPRESENTATION);
+        assert!(!dir.path().join(stage).exists());
+    }
+
+    #[test]
+    fn writable_retirement_preserves_edited_content_and_records_it_unresolved() {
+        let dir = TestDir::new();
+        let source = write_source(&dir, "source", "payload\n");
+        let destination = dir.path().join("value");
+        fs::write(&destination, "the user edited this\n").expect("plant edited destination");
+        let entry = sample_writable_entry(
+            dir.path().to_str().unwrap(),
+            destination.to_str().unwrap(),
+            &source,
+        );
+        let identity = RunIdentity::observe();
+        let mut record = identity.record(&entry, "new");
+        record.state = STATE_OWNED.to_owned();
+        record.representation = WRITABLE_REPRESENTATION.to_owned();
+        record.baseline_hash = Some(sha256_hex(b"payload\n"));
+        let outcome = retire_record(&record).expect("retirement is refused, not failed");
+        // Edited data is never deleted to satisfy cleanup, and the refusal is
+        // recorded rather than thrown away.
+        assert!(matches!(outcome, RetireOutcome::Unresolved(_)));
+        assert_eq!(
+            fs::read_to_string(&destination).unwrap(),
+            "the user edited this\n"
+        );
+    }
+
+    #[test]
+    fn writable_retirement_removes_a_pristine_destination() {
+        let dir = TestDir::new();
+        let source = write_source(&dir, "source", "payload\n");
+        let destination = dir.path().join("value");
+        fs::write(&destination, "payload\n").expect("plant pristine destination");
+        let entry = sample_writable_entry(
+            dir.path().to_str().unwrap(),
+            destination.to_str().unwrap(),
+            &source,
+        );
+        let identity = RunIdentity::observe();
+        let mut record = identity.record(&entry, "new");
+        record.state = STATE_OWNED.to_owned();
+        record.representation = WRITABLE_REPRESENTATION.to_owned();
+        record.baseline_hash = Some(sha256_hex(b"payload\n"));
+        let outcome = retire_record(&record).expect("pristine retirement succeeds");
+        assert!(matches!(outcome, RetireOutcome::Removed));
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn unknown_newer_ledger_schema_is_refused_before_any_mutation() {
+        let dir = TestDir::new();
+        let state = dir.path().join("state");
+        fs::create_dir_all(&state).expect("create state directory");
+        let ledger_path = state.join(LEDGER_FILE_NAME);
+        let payload = "{\"schemaVersion\":99,\"records\":{}}";
+        fs::write(&ledger_path, payload).expect("plant newer state");
+        let failure = LedgerState::load(&state).expect_err("newer schema is refused");
+        assert!(matches!(failure.key, CodeKey::LedgerInvalid));
+        // Refused before anything was touched: the file is byte-identical and no
+        // rollback copy was taken, because no migration was attempted.
+        assert_eq!(fs::read_to_string(&ledger_path).unwrap(), payload);
+        assert!(!state.join(LEDGER_ROLLBACK_FILE_NAME).exists());
+    }
+
+    #[test]
+    fn a_v1_ledger_migrates_to_v2_and_leaves_rollback_evidence() {
+        let dir = TestDir::new();
+        let state = dir.path().join("state");
+        fs::create_dir_all(&state).expect("create state directory");
+        let ledger_path = state.join(LEDGER_FILE_NAME);
+        // Byte-for-byte what the v1 coordinator could have written: camelCase,
+        // and none of the v2 fields, so the defaults are what get exercised.
+        let original = concat!(
+            "{\"schemaVersion\":1,\"records\":{\"test:/tmp/value\":{",
+            "\"destination\":\"/tmp/value\",",
+            "\"appliedArtifactTarget\":\"/nix/store/example\",",
+            "\"managedRoot\":\"/tmp\",\"appliedBy\":\"new\",",
+            "\"appliedGeneration\":null,",
+            "\"lastSuccessfulReload\":{\"invocationId\":null,\"monotonicSeconds\":0.0},",
+            "\"reloadActionIdentity\":null,\"bootId\":null}}}"
+        );
+        fs::write(&ledger_path, original).expect("plant v1 state");
+        let ledger = LedgerState::load(&state).expect("v1 migrates");
+        let record = ledger.record("test:/tmp/value").expect("migrated record");
+        // Writable did not exist in v1, so every v1 record is owned and symlink.
+        assert_eq!(record.state, STATE_OWNED);
+        assert_eq!(record.representation, NATIVE_REPRESENTATION);
+        // The rollback copy is the evidence, and it is the untouched original.
+        let rollback = state.join(LEDGER_ROLLBACK_FILE_NAME);
+        assert_eq!(fs::read_to_string(&rollback).unwrap(), original);
     }
 }
