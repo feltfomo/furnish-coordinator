@@ -26,7 +26,7 @@ const WRITABLE_REPRESENTATION: &str = "writable";
 const SYMLINK_MODE: u32 = 0o120000;
 const REGULAR_MODE: u32 = 0o100000;
 const FILE_TYPE_MASK: u32 = 0o170000;
-// One mode for both authority scopes. A mode that varies by scope is the
+// one mode for both authority scopes. a mode that varies by scope is the
 // deferred permissions feature arriving early under another name.
 const WRITABLE_FILE_MODE: u32 = 0o644;
 const LEDGER_SCHEMA_VERSION: u64 = 2;
@@ -35,7 +35,7 @@ const LEDGER_ROLLBACK_FILE_NAME: &str = "applied-state.v1.json";
 const STATE_PENDING: &str = "pending";
 const STATE_OWNED: &str = "owned";
 
-// Qualification is a table lookup, not a chain of name comparisons. Nothing in
+// qualification is a table lookup, not a chain of name comparisons. nothing in
 // the protocol asks whether an executor is the native one; it asks whether the
 // tuple it presents appears here.
 struct ExecutorProfile {
@@ -66,7 +66,7 @@ const EXECUTOR_PROFILES: [ExecutorProfile; 2] = [
     },
 ];
 
-// Transfer is generic over representation pairs; the gate is the set of pairs
+// transfer is generic over representation pairs; the gate is the set of pairs
 // that actually exist today.
 const TRANSITION_PAIRS: [(&str, &str); 2] = [
     (NATIVE_REPRESENTATION, WRITABLE_REPRESENTATION),
@@ -92,7 +92,7 @@ fn transition_is_gated(from: &str, to: &str) -> bool {
 }
 const LEDGER_STAGE_PREFIX: &str = ".applied-state";
 
-// Hand-rolled because a crate would mean regenerating and committing the lock,
+// hand-rolled because a crate would mean regenerating and committing the lock,
 // and that wasn't worth it for a digest over small config files.
 const SHA256_K: [u32; 64] = [
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -162,9 +162,9 @@ fn sha256_hex(bytes: &[u8]) -> String {
     state.iter().map(|word| format!("{word:08x}")).collect()
 }
 
-// A real process death, not a simulated error return, so recovery is exercised
-// against the same state a power loss would leave. Compiled out entirely unless
-// the feature is on, which is why the shipped binary cannot reach it.
+// a real process death, not a simulated error return, so recovery is exercised
+// against the same state a power loss would leave. compiled out entirely unless
+// the feature is on, so the shipped binary cannot reach it.
 #[cfg(feature = "fault-injection")]
 fn fault_point(name: &str) {
     if env::var("FURNISH_FAULT_POINT").ok().as_deref() == Some(name) {
@@ -421,7 +421,7 @@ fn emit_failure(codes: &DiagnosticCodes, failure: &Failure, provenance: Option<&
     }
 }
 
-// Loud but not fatal. What an unresolved retirement blocks is the retirement,
+// loud but not fatal. what an unresolved retirement blocks is the retirement,
 // not the activation around it, so this path reports and continues rather than
 // returning a Failure.
 fn emit_warning(codes: &DiagnosticCodes, failure: &Failure, provenance: Option<&Provenance>) {
@@ -670,42 +670,42 @@ struct ReloadEvidence {
 struct LedgerRecord {
     destination: String,
     applied_artifact_target: String,
-    // Retirement has to prove the destination sits beneath a managed root, and
+    // retirement has to prove the destination sits beneath a managed root, and
     // by the time an entry is retired the declaration that named that root is
-    // gone. The record is the only place left to read it from.
+    // gone. the record is the only place left to read it from.
     managed_root: String,
-    // Which branch published the target above: new, update, or repair. A record
-    // that cannot say how it was decided is not evidence of a decision.
+    // which branch published the target above, one of new, update, or repair. a
+    // record that cannot say how it was decided is not evidence of a decision.
     applied_by: String,
     applied_generation: Option<String>,
     last_successful_reload: ReloadEvidence,
     reload_action_identity: Option<String>,
     boot_id: Option<String>,
-    // Everything below is v2. The defaults describe what a v1 record could only
-    // have been: writable did not exist and pending state was never written, so
-    // every v1 record is an owned symlink as a matter of what the code could
-    // produce, not as an assumption about the data.
+    // everything below is v2. the defaults describe what a v1 record could only
+    // have been, since writable did not exist and pending state was never
+    // written, so every v1 record is an owned symlink as a matter of what the
+    // code could produce rather than an assumption about the data.
     #[serde(default = "default_state")]
     state: String,
     #[serde(default = "default_representation")]
     representation: String,
-    // Only a representation that keeps bytes at the destination can drift under
-    // the user, so a symlink record carries no baseline. A path that writes one
+    // only a representation that keeps bytes at the destination can drift under
+    // the user, so a symlink record carries no baseline. a path that writes one
     // for a symlink is writing a claim it cannot check.
     #[serde(default)]
     baseline_hash: Option<String>,
-    // What this record intended to put at the destination. Its meaning is fixed
-    // by `representation` and by nothing else: on a writable record it hashes
+    // what this record intended to put at the destination. its meaning is fixed
+    // by `representation` and by nothing else. on a writable record it hashes
     // the file's CONTENT, on a symlink record it hashes the target PATH STRING
-    // the link must point at. The two readings are never interchangeable, so
-    // neither is ever derived from the other. Only the writable reading is read
+    // the link must point at. the two readings are never interchangeable, so
+    // neither is ever derived from the other. only the writable reading is read
     // back to prove authorship; symlink authorship compares the target string
     // itself, so on a symlink record this field is written and never consulted.
     #[serde(default)]
     intended_witness_hash: Option<String>,
     #[serde(default)]
     applied_operation_generation: u64,
-    // Recovery has to find the displaced object by name, and a writable file
+    // recovery has to find the displaced object by name, and a writable file
     // displaced by a transition may hold edited bytes.
     #[serde(default)]
     stage_name: Option<String>,
@@ -728,8 +728,8 @@ struct Ledger {
     records: BTreeMap<String, LedgerRecord>,
 }
 
-// Two runs can produce byte-identical values, so values alone cannot say which
-// run produced a record. The invocation ID and the monotonic reading are what
+// two runs can produce byte-identical values, so values alone cannot say which
+// run produced a record. the invocation ID and the monotonic reading are what
 // make a record evidence of a specific reconciliation rather than an assertion
 // about a target.
 #[derive(Debug)]
@@ -755,7 +755,7 @@ impl RunIdentity {
                         .and_then(|first| first.parse::<f64>().ok())
                 })
                 .unwrap_or(0.0),
-            // Diagnostic only. A boot ID says which boot wrote the record; it is
+            // diagnostic only. a boot ID says which boot wrote the record; it is
             // never consulted when deciding ownership, because a record that
             // stopped counting after a reboot would be useless to a ledger whose
             // entire purpose is surviving one.
@@ -786,7 +786,7 @@ impl RunIdentity {
                 invocation_id: self.invocation_id.clone(),
                 monotonic_seconds: self.monotonic_seconds,
             },
-            // Reload actions do not exist yet. The field is written null rather
+            // reload actions do not exist yet. the field is written null rather
             // than omitted so a later reader can tell "no reload was requested"
             // apart from "this record predates reload actions".
             reload_action_identity: None,
@@ -855,10 +855,10 @@ impl LedgerState {
                 &error,
             ));
         }
-        // Writability is the privilege here: anything that can write this file
-        // can claim ownership of a destination. Readability is not, and keeping
-        // it readable lets the unprivileged harness verify that the record
-        // survived a root wipe without being handed root to look.
+        // writability is the privilege here, since anything that can write this
+        // file can claim ownership of a destination. readability is not, and
+        // keeping it readable lets the unprivileged harness verify that the
+        // record survived a root wipe without being handed root to look.
         if let Err(error) = fs::set_permissions(directory, fs::Permissions::from_mode(0o755)) {
             return Err(Failure::io(
                 CodeKey::LedgerUnreadable,
@@ -867,7 +867,7 @@ impl LedgerState {
                 &error,
             ));
         }
-        // Asserted rather than assumed. A mode that is 0755 because it was chosen
+        // asserted rather than assumed. a mode that is 0755 because it was chosen
         // is a decision; a mode that is 0755 because of this host's umask is an
         // accident that will silently be something else on the next host.
         match fs::metadata(directory) {
@@ -891,7 +891,7 @@ impl LedgerState {
             }
         }
         let (document, migrated) = match (existing, on_disk_version) {
-            // An absent ledger is a cold start, not a clean bill of health: it
+            // an absent ledger is a cold start, not a clean bill of health. it
             // proves nothing was recorded, so nothing is owned, so nothing is
             // repairable until acquisition-from-absence records something.
             (None, _) => (
@@ -912,7 +912,7 @@ impl LedgerState {
                 (parsed, false)
             }
             (Some(bytes), Some(1)) => {
-                // The copy is the rollback evidence, and it is written before the
+                // the copy is the rollback evidence, and it is written before the
                 // first v2 write so a downgrade always has the exact input the
                 // migration consumed.
                 let rollback = directory.join(LEDGER_ROLLBACK_FILE_NAME);
@@ -999,8 +999,8 @@ impl LedgerState {
                 format!("cannot encode applied state: {error}"),
             )
         })?;
-        // Staged beside the ledger rather than in a temporary directory: a
-        // rename across filesystems is not atomic, and EXDEV here would mean
+        // staged beside the ledger rather than in a temporary directory, because
+        // a rename across filesystems is not atomic and EXDEV here would mean
         // publishing evidence by copy.
         let stage = self.directory.join(format!(
             "{LEDGER_STAGE_PREFIX}.{}.stage",
@@ -1021,9 +1021,9 @@ impl LedgerState {
                 )
             })?;
         // OpenOptions::mode is masked by the ambient umask, so the mode above is
-        // a request, not a guarantee. Set it explicitly and assert it: the record
-        // has to be readable by the unprivileged verifier on every host, not only
-        // on hosts whose umask happens to be 022.
+        // a request, not a guarantee. it is set explicitly and asserted, since the
+        // record has to be readable by the unprivileged verifier on every host,
+        // not only on hosts whose umask happens to be 022.
         if let Err(error) = fs::set_permissions(&stage, fs::Permissions::from_mode(0o644)) {
             let _ = fs::remove_file(&stage);
             return Err(Failure::io(
@@ -1064,7 +1064,7 @@ impl LedgerState {
                 &error,
             ));
         }
-        // Contents durable before the name is published, so a crash can lose the
+        // contents durable before the name is published, so a crash can lose the
         // update but cannot expose a truncated one under the real name.
         if let Err(error) = file.sync_all() {
             let _ = fs::remove_file(&stage);
@@ -1098,7 +1098,7 @@ impl LedgerState {
                 errno,
             )
         })?;
-        // The bytes were synced; this syncs the name. Without it the rename can
+        // the bytes were synced; this syncs the name. without it the rename can
         // be lost across a power cut and the ledger reverts to a state that
         // disagrees with the symlink already on disk.
         fsync(&directory).map_err(|errno| {
@@ -1215,8 +1215,8 @@ fn publish_new(
     Ok(())
 }
 
-// Both owned branches land here, and neither is reachable without a LedgerRecord
-// in hand. The recorded target is a parameter rather than something re-read here
+// both owned branches land here, and neither is reachable without a LedgerRecord
+// in hand. the recorded target is a parameter rather than something re-read here
 // so that the thing being exchanged away has to have been proven, not assumed, by
 // the caller.
 fn publish_exchange(
@@ -1229,9 +1229,9 @@ fn publish_exchange(
 ) -> Result<()> {
     if let Err(errno) = renameat_with(parent, stage, parent, name, RenameFlags::EXCHANGE) {
         remove_stage(parent, stage);
-        // ENOENT means the destination we proved ownership of is no longer the
-        // thing on disk. The proof is stale, so the next reconcile decides again
-        // from observation. Falling back to a create here would be publishing on
+        // ENOENT means the destination proved ownership of is no longer the thing
+        // on disk. the proof is stale, so the next reconcile decides again from
+        // observation. falling back to a create here would be publishing on
         // evidence already known to be out of date.
         return Err(Failure::syscall(
             CodeKey::PublishRace,
@@ -1241,9 +1241,8 @@ fn publish_exchange(
         ));
     }
 
-    // Both sides, because an exchange that put the right link at the destination
-    // while displacing something we did not identify is not a repair we can
-    // account for.
+    // both sides, because an exchange that put the right link at the destination
+    // while displacing something unidentified is not an accountable repair.
     let published = symlink_target(parent, name).map_err(|errno| {
         Failure::syscall(
             CodeKey::RepairVerification,
@@ -1268,22 +1267,22 @@ fn publish_exchange(
         ));
     }
 
-    // Only the displaced symlink is unlinked. Under repair it pointed at a target
+    // only the displaced symlink is unlinked. under repair it pointed at a target
     // that was already reaped; under update it points at one that is still live
-    // and still referenced by the generation that declared it. Unlinking a
+    // and still referenced by the generation that declared it. unlinking a
     // symlink never touches its pointee, so neither case destroys anything.
     remove_stage(parent, stage);
     Ok(())
 }
 
-// Retirement is the destructive direction, so it runs on exactly the same
-// ownership conditions as the two publishing branches, plus one more: no desired
-// entry claims this destination any more. Anything that is not a link furnish
-// can still prove it published is left exactly where it is.
+// retirement is the destructive direction, so it runs on the same ownership
+// conditions as the two publishing branches, plus one more, that no desired entry
+// claims this destination any more. anything that is not a link furnish can still
+// prove it published is left exactly where it is.
 #[derive(Debug)]
 enum RetireOutcome {
     Removed,
-    // Edited data is never deleted to satisfy cleanup, so the file stays,
+    // edited data is never deleted to satisfy cleanup, so the file stays,
     // ownership stays to explain it, and what is blocked is the retirement.
     Unresolved(UnresolvedRetirement),
 }
@@ -1305,8 +1304,8 @@ fn retire_record(record: &LedgerRecord) -> Result<RetireOutcome> {
                     "read-retire-writable",
                 )?;
                 if record.baseline_hash.as_deref() == Some(observed_hash.as_str()) {
-                    // Pristine: the destination is exactly what furnish put
-                    // there, so removing it destroys nothing.
+                    // pristine, so the destination is exactly what furnish put
+                    // there and removing it destroys nothing.
                     unlinkat(&parent, name.as_os_str(), AtFlags::empty()).map_err(|errno| {
                         Failure::syscall(
                             CodeKey::ExecutorFailed,
@@ -1342,7 +1341,7 @@ fn retire_record(record: &LedgerRecord) -> Result<RetireOutcome> {
     })?;
     let recorded = OsStr::new(&record.applied_artifact_target);
     match observed {
-        // Already gone. There is nothing to unlink, and the record is the only
+        // already gone. there is nothing to unlink, and the record is the only
         // thing left to remove.
         None => Ok(RetireOutcome::Removed),
         Some(actual) if !actual.is_empty() && actual == recorded => {
@@ -1364,7 +1363,7 @@ fn retire_record(record: &LedgerRecord) -> Result<RetireOutcome> {
     }
 }
 
-// Observation is by file type, not by a link read, because writable has to tell
+// observation is by file type, not by a link read, because writable has to tell
 // a regular file from a directory or a device before it will touch anything.
 fn observe_kind(parent: &OwnedFd, name: &OsStr, destination: &str) -> Result<Option<u32>> {
     match statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
@@ -1391,8 +1390,8 @@ fn observe_mode(parent: &OwnedFd, name: &OsStr, destination: &str) -> Result<u32
     }
 }
 
-// NOFOLLOW throughout: a symlink at the destination is never followed and never
-// written through, so reading one is refused rather than silently resolved.
+// NOFOLLOW throughout, so a symlink at the destination is never followed and
+// never written through, and reading one is refused rather than resolved.
 fn read_regular(
     parent: &OwnedFd,
     name: &OsStr,
@@ -1442,7 +1441,7 @@ fn hash_source(source: &str, destination: &str) -> Result<String> {
     Ok(sha256_hex(&bytes))
 }
 
-// The rename is only durable once the directory entry is, so the parent is
+// the rename is only durable once the directory entry is, so the parent is
 // synced before anything is verified or recorded as published.
 fn sync_parent(parent: &OwnedFd, destination: &str) -> Result<()> {
     fsync(parent).map_err(|errno| {
@@ -1455,8 +1454,8 @@ fn sync_parent(parent: &OwnedFd, destination: &str) -> Result<()> {
     })
 }
 
-// Nothing has been applied yet, so the prior record's applied state is carried
-// across unchanged: a pending record that dropped it would make recovery
+// nothing has been applied yet, so the prior record's applied state is carried
+// across unchanged. a pending record that dropped it would make recovery
 // converge to a state weaker than the one already durable.
 fn pending_record(
     identity: &RunIdentity,
@@ -1476,12 +1475,12 @@ fn pending_record(
     record
 }
 
-// Every commit that carries the applied state forward after a publish goes
+// every commit that carries the applied state forward after a publish goes
 // through here, whatever the representation, so no path can write a record that
-// carries less than the one it replaces. The operation generation counts applies
+// carries less than the one it replaces. the operation generation counts applies
 // that reached the destination, so it advances from the prior record instead of
-// restarting. The one exemption is a recovery branch that converges BACKWARD to
-// the state the ledger already describes: it restates that record rather than
+// restarting. the one exemption is a recovery branch that converges BACKWARD to
+// the state the ledger already describes, which restates that record rather than
 // constructing a new one, because nothing was carried forward to count.
 fn owned_record(
     identity: &RunIdentity,
@@ -1500,25 +1499,25 @@ fn owned_record(
     record
 }
 
-// A witness hash is a baseline only where it hashes bytes that live at the
-// destination. For a symlink it hashes a path string, which is not a baseline
+// a witness hash is a baseline only where it hashes bytes that live at the
+// destination. for a symlink it hashes a path string, which is not a baseline
 // and must not be stored as one.
 fn baseline_for(representation: &str, witness_hash: &str) -> Option<String> {
     (representation == WRITABLE_REPRESENTATION).then(|| witness_hash.to_owned())
 }
 
-// A run that publishes nothing must not erase what an earlier run recorded:
-// these fields describe the applied state, not the invocation that observed it.
-// An unresolved retirement marker is deliberately NOT among them: reaching this
-// path means the destination is declared again, and being declared again is what
-// resolves it.
+// a run that publishes nothing must not erase what an earlier run recorded,
+// because these fields describe the applied state, not the invocation that
+// observed it. an unresolved retirement marker is deliberately NOT among them,
+// since reaching this path means the destination is declared again, and being
+// declared again is what resolves it.
 fn carry_applied_state(prior: &LedgerRecord, record: &mut LedgerRecord) {
     record.baseline_hash = prior.baseline_hash.clone();
     record.intended_witness_hash = prior.intended_witness_hash.clone();
     record.applied_operation_generation = prior.applied_operation_generation;
 }
 
-// The coordinator re-derives the staged content itself rather than trusting the
+// the coordinator re-derives the staged content itself rather than trusting the
 // executor's exit status, so an executor that succeeded while producing the
 // wrong bytes cannot reach a destination.
 fn stage_writable(
@@ -1586,7 +1585,7 @@ fn stage_writable(
     Ok(())
 }
 
-// Publication into an absent name. NOREPLACE is what makes this refuse rather
+// publication into an absent name. NOREPLACE is what makes this refuse rather
 // than displace, so a destination that appeared during staging is never
 // overwritten and never adopted.
 fn publish_writable_new(
@@ -1622,7 +1621,7 @@ fn publish_writable_new(
     Ok(())
 }
 
-// Ownership commits only after this returns. Observation of the published
+// ownership commits only after this returns. observation of the published
 // object, not the executor's exit status, is what makes the claim.
 fn verify_writable_destination(
     parent: &OwnedFd,
@@ -1679,7 +1678,7 @@ fn representation_of_kind(kind: u32) -> Option<&'static str> {
     }
 }
 
-// Recovery replay. A pending record authorizes recovery only when destination,
+// recovery replay. a pending record authorizes recovery only when destination,
 // intended source hash, and artifact identity all agree with it; anything else
 // is not authorship, so the record is cleared and the ordinary path decides
 // again from observation.
@@ -1740,9 +1739,9 @@ fn recover_pending(entry: &Entry, ledger: &mut LedgerState, identity: &RunIdenti
     };
 
     if authored {
-        // Converted to owned at the source this record was pending for, not at
-        // the current one. A stale pending record converges to owned-at-old-S
-        // and the ordinary path then takes it forward. Two steps, both recorded.
+        // converted to owned at the source this record was pending for, not at
+        // the current one. a stale pending record converges to owned-at-old-S
+        // and the ordinary path then takes it forward, both steps recorded.
         let mut owned = record.clone();
         owned.state = STATE_OWNED.to_owned();
         owned.baseline_hash = record
@@ -1755,7 +1754,7 @@ fn recover_pending(entry: &Entry, ledger: &mut LedgerState, identity: &RunIdenti
         return Ok(());
     }
 
-    // Not ours. The staged object is content this coordinator wrote and never
+    // not ours. the staged object is content this coordinator wrote and never
     // published, so removing it destroys nothing a user could have edited.
     if observed.is_none()
         && let Some(stage) = stage.as_deref()
@@ -1767,7 +1766,7 @@ fn recover_pending(entry: &Entry, ledger: &mut LedgerState, identity: &RunIdenti
     Ok(())
 }
 
-// Recovery for a crash between the exchange and the ledger advancing. The
+// recovery for a crash between the exchange and the ledger advancing. the
 // destination already holds the new representation and the displaced object
 // sits at the stage name; for a writable source that displaced object may hold
 // edited user bytes, so it is never unlinked without being hashed against the
@@ -1802,8 +1801,8 @@ fn recover_transition(
         )
     })?;
 
-    // The exchange never happened: the destination is still what it was, so this
-    // converges backward by restating the record the ledger already holds.
+    // the exchange never happened, so the destination is still what it was and
+    // this converges backward by restating the record the ledger already holds.
     if observed_representation == Some(source_representation) {
         if observe_kind(parent, &stage, destination)?.is_some() {
             remove_stage(parent, &stage);
@@ -1824,7 +1823,7 @@ fn recover_transition(
         ));
     }
 
-    // Forward: the destination already holds the new representation.
+    // forward, so the destination already holds the new representation.
     if target_representation == WRITABLE_REPRESENTATION {
         let Some(intended) = record.intended_witness_hash.clone() else {
             return Err(Failure::new(
@@ -1842,7 +1841,7 @@ fn recover_transition(
         return Ok(());
     }
 
-    // Forward into symlink. The displaced object is the regular file, and it is
+    // forward into symlink. the displaced object is the regular file, and it is
     // the one thing here that can hold work a user cannot get back.
     let displaced_hash = hash_regular(
         parent,
@@ -1853,7 +1852,7 @@ fn recover_transition(
     )?;
     let pristine = record.baseline_hash.as_deref() == Some(displaced_hash.as_str());
     if !pristine {
-        // Exchange back, so the edited bytes return to the destination the user
+        // exchange back, so the edited bytes return to the destination the user
         // knows, and the transition is refused rather than completed.
         if let Err(errno) = renameat_with(parent, &stage, parent, name, RenameFlags::EXCHANGE) {
             return Err(Failure::syscall(
@@ -1864,11 +1863,11 @@ fn recover_transition(
             ));
         }
         sync_parent(parent, destination)?;
-        // What sits at the stage name now is the symlink this run staged, which
+        // what sits at the stage name now is the symlink this run staged, which
         // is ours and holds nothing of the user's.
         remove_stage(parent, &stage);
-        // Backward convergence again: the destination is back to the writable
-        // file it was, so the record it already had is restated, baseline
+        // backward convergence again, so the destination is back to the writable
+        // file it was and the record it already had is restated, baseline
         // included.
         let mut owned = record.clone();
         owned.state = STATE_OWNED.to_owned();
@@ -1882,7 +1881,7 @@ fn recover_transition(
         ));
     }
     remove_stage(parent, &stage);
-    // The exchange landed, so this carries the applied state forward and takes
+    // the exchange landed, so this carries the applied state forward and takes
     // the same constructor as any other post-publish commit.
     let owned = owned_record(
         identity,
@@ -1895,7 +1894,7 @@ fn recover_transition(
     Ok(())
 }
 
-// Transfer between representations. Post-write verification completes before
+// transfer between representations. post-write verification completes before
 // the ledger representation changes, in both directions.
 fn transition_representation(
     entry: &Entry,
@@ -1921,7 +1920,7 @@ fn transition_representation(
     let recorded = OsStr::new(&record.applied_artifact_target);
 
     if to == WRITABLE_REPRESENTATION {
-        // Safe only when the current symlink is exactly the recorded one.
+        // only sound when the current symlink is exactly the recorded one.
         let observed = symlink_target(&parent, &name).map_err(|errno| {
             Failure::syscall(
                 CodeKey::TransitionRefused,
@@ -1974,8 +1973,8 @@ fn transition_representation(
         return Ok(());
     }
 
-    // Writable to symlink is automatic only when the destination still equals
-    // its baseline. An edited file is never silently converted away.
+    // writable to symlink is automatic only when the destination still equals
+    // its baseline. an edited file is never silently converted away.
     let Some(baseline) = record.baseline_hash.clone() else {
         return Err(Failure::new(
             CodeKey::TransitionRefused,
@@ -2045,10 +2044,10 @@ fn transition_representation(
         ));
     }
     fault_point("verified");
-    // The displaced object is the pristine regular file, proven equal to its
+    // the displaced object is the pristine regular file, proven equal to its
     // baseline above, so removing it destroys no work.
     remove_stage(&parent, &stage);
-    let mut owned = owned_record(
+    let owned = owned_record(
         identity,
         entry,
         "update",
@@ -2059,9 +2058,9 @@ fn transition_representation(
     Ok(())
 }
 
-// First ownership of an absent destination, the self-heal for an owned one that
+// first ownership of an absent destination, the self-heal for an owned one that
 // has gone missing, and the convergence for a destination that already equals
-// the source while the recorded baseline does not. Divergent content is refused
+// the source while the recorded baseline does not. divergent content is refused
 // rather than reconciled.
 fn reconcile_writable_entry(
     entry: &Entry,
@@ -2078,8 +2077,8 @@ fn reconcile_writable_entry(
     let observed = observe_kind(&parent, &name, destination)?;
 
     match (observed, record) {
-        // First ownership, and the self-heal for an owned destination that has
-        // gone missing. Both publish into an absent name; they differ only in
+        // first ownership, and the self-heal for an owned destination that has
+        // gone missing. both publish into an absent name; they differ only in
         // what the record says about how it was decided.
         (None, prior) => {
             let applied_by = if prior.is_some() { "repair" } else { "new" };
@@ -2098,8 +2097,8 @@ fn reconcile_writable_entry(
             )?;
             Ok(())
         }
-        // Refused by default even when the content already equals the source.
-        // Equality is not adoption proof.
+        // refused by default even when the content already equals the source.
+        // equality is not adoption proof.
         (Some(_), None) => Err(Failure::new(
             CodeKey::ConflictingDestination,
             destination,
@@ -2121,20 +2120,19 @@ fn reconcile_writable_entry(
                 "read-destination",
             )?;
             if observed_hash != intended {
-                // Deciding between edited runtime content and a changed source
-                // needs a three-way comparison that does not exist yet.
-                // Refusing is the conservative direction: it neither adopts nor
-                // overwrites.
+                // deciding between edited runtime content and a changed source
+                // needs a three-way comparison that does not exist yet, and
+                // refusing neither adopts nor overwrites.
                 return Err(Failure::new(
                     CodeKey::ConflictingDestination,
                     destination,
                     "destination content differs from the source; reconciliation of divergent writable content is not yet supported",
                 ));
             }
-            // Destination equals the source. If the baseline does not, this is
+            // destination equals the source. if the baseline does not, this is
             // the crash window after replacement and before the baseline was
-            // committed: verify the representation, advance the baseline, and
-            // never report a conflict.
+            // committed, so the representation is verified, the baseline
+            // advances, and no conflict is reported.
             if record.baseline_hash.as_deref() != Some(intended.as_str()) {
                 verify_writable_destination(&parent, &name, destination, &intended)?;
                 ledger.commit(
@@ -2163,8 +2161,8 @@ fn reconcile_entry(
     let destination = &entry.filesystem_identity.destination;
     let canonical = &entry.filesystem_identity.canonical;
 
-    // Recovery runs before the ordinary path and only ever converts pending to
-    // owned. The two are never fused, so a stale pending record converges to
+    // recovery runs before the ordinary path and only ever converts pending to
+    // owned. the two are never fused, so a stale pending record converges to
     // owned at the source it was pending for and is then carried forward.
     recover_pending(entry, ledger, identity)?;
 
@@ -2213,11 +2211,11 @@ fn reconcile_entry(
             Ok(())
         }
         Some(actual) if actual == expected => {
-            // Ownership is never inferred from a matching target: a destination
-            // furnish never published is indistinguishable from one it did. A
-            // host whose link predates the ledger stays unrecorded here and
-            // acquires from absence instead.
-            // Nothing was published, so the branch that produced this target is
+            // ownership is never inferred from a matching target, because a
+            // destination furnish never published is indistinguishable from one
+            // it did. a host whose link predates the ledger stays unrecorded
+            // here and acquires from absence instead.
+            // nothing was published, so the branch that produced this target is
             // carried forward rather than restated as a decision this run made,
             // and so is everything else the applied state already recorded.
             if let Some(prior) = ledger.record(canonical).cloned() {
@@ -2243,8 +2241,8 @@ fn reconcile_entry(
                 ));
             };
             let recorded = OsStr::new(&record.applied_artifact_target);
-            // Exact match against the RECORD, not against the desired target.
-            // Read against desired this condition could never be satisfied by
+            // exact match against the RECORD, not against the desired target.
+            // read against desired this condition could never be satisfied by
             // any repairable state, because a destination already equal to
             // desired needs no repair.
             if actual.is_empty() || actual != recorded {
@@ -2258,23 +2256,23 @@ fn reconcile_entry(
                 ));
             }
 
-            // The destination is recorded as furnish-owned and the link on disk
+            // the destination is recorded as furnish-owned and the link on disk
             // still points at the recorded target, so what remains is only which
-            // owned branch this is. Both publish to desired through the same
-            // exchange; they differ in what they mean. A resolving recorded target
-            // says the declaration moved, which is a fact about the config. A
+            // owned branch this is. both publish to desired through the same
+            // exchange; they differ in what they mean. a resolving recorded target
+            // says the declaration moved, which is a fact about the config. a
             // reaped one says the store object furnish published is gone, which is
             // a fact about the world.
             //
-            // Resolution is only ever tested against a target furnish published
+            // resolution is only ever tested against a target furnish published
             // itself, which is always a store path on an already-mounted
-            // filesystem. Applied to a foreign target this test would be a race:
-            // a link into a late-mounting filesystem reads unresolvable at boot
-            // and resolvable at switch, and the coordinator runs at both.
+            // filesystem. applied to a foreign target this test would be a race,
+            // since a link into a late-mounting filesystem reads unresolvable at
+            // boot and resolvable at switch, and the coordinator runs at both.
             let applied_by = match statat(&parent, &name, AtFlags::empty()) {
-                // What we published is still live.
+                // what furnish published is still live.
                 Ok(_) => "update",
-                // What we published was reaped.
+                // what furnish published was reaped.
                 Err(Errno::NOENT) => "repair",
                 Err(errno) => {
                     return Err(Failure::syscall(
@@ -2286,7 +2284,7 @@ fn reconcile_entry(
                 }
             };
 
-            // Republishing toward a target that is not there would manufacture
+            // republishing toward a target that is not there would manufacture
             // the exact breakage being repaired.
             if let Err(error) = fs::metadata(&entry.retained_artifact_target) {
                 return Err(Failure::io(
@@ -2311,7 +2309,7 @@ fn reconcile_entry(
 }
 
 fn acquire_lock(run_lock: &OwnedFd, lock_dir: &Path, lock_name: &OsStr) -> Result<OwnedFd> {
-    // The directory comes from the caller so a failure names the file it failed
+    // the directory comes from the caller so a failure names the file it failed
     // on, which is not always the default one.
     let label = lock_dir.join(lock_name);
     let lock = openat(
@@ -2341,8 +2339,8 @@ fn acquire_lock(run_lock: &OwnedFd, lock_dir: &Path, lock_name: &OsStr) -> Resul
 
 const DEFAULT_LOCK_DIR: &str = "/run/lock";
 
-// The lock directory is a seam so crash cases can be exercised without a boot.
-// Nothing in the module set passes it, so the unit and the activation script
+// the lock directory is a seam so crash cases can be exercised without a boot.
+// nothing in the module set passes it, so the unit and the activation script
 // are byte-unchanged and it never becomes a host-visible option.
 fn open_host_lock(lock_name: &OsStr, lock_dir: &Path) -> Result<OwnedFd> {
     let mut components = Path::new(lock_name).components();
@@ -2421,7 +2419,7 @@ fn reconcile(
         }
     };
 
-    // Applied state is read under the host lock, so no other reconcile can be
+    // applied state is read under the host lock, so no other reconcile can be
     // deciding ownership against a copy of it.
     let mut ledger = match LedgerState::load(state_dir) {
         Ok(ledger) => ledger,
@@ -2443,7 +2441,7 @@ fn reconcile(
         }
     }
 
-    // A manifest with no entries is a real desired set, not a no-op. This is the
+    // a manifest with no entries is a real desired set, not a no-op. this is the
     // only place a record is ever removed.
     let desired: BTreeSet<&str> = manifest
         .entries
@@ -2461,9 +2459,9 @@ fn reconcile(
                     return ExitCode::FAILURE;
                 }
             }
-            // The record is the point: it is what stops the file becoming an
-            // unexplained orphan, so ownership is preserved rather than dropped
-            // and the prune is refused rather than the activation.
+            // the record is the point, since it is what stops the file becoming
+            // an unexplained orphan, so ownership is preserved rather than
+            // dropped and the prune is refused rather than the activation.
             Ok(RetireOutcome::Unresolved(unresolved)) => {
                 let failure = Failure::new(
                     CodeKey::UnresolvedRetirement,
@@ -2533,7 +2531,7 @@ fn worker(args: &[OsString], profile: &ExecutorProfile) -> ExitCode {
     }
 }
 
-// The bytes are written and durable before the coordinator is told anything
+// the bytes are written and durable before the coordinator is told anything
 // succeeded, so a crash after the executor returns can never leave a stage the
 // coordinator would mistake for complete.
 fn stage_writable_content(parent: &OwnedFd, name: &OsStr, source: &Path) -> ExitCode {
@@ -2554,7 +2552,7 @@ fn stage_writable_content(parent: &OwnedFd, name: &OsStr, source: &Path) -> Exit
     if file.write_all(&bytes).is_err() {
         return ExitCode::FAILURE;
     }
-    // The mode is asserted rather than assumed, because O_CREAT is subject to
+    // the mode is asserted rather than assumed, because O_CREAT is subject to
     // the umask of whichever authority the executor is running under.
     if fs::set_permissions(
         format!("/proc/self/fd/{}", file.as_raw_fd()),
@@ -2655,10 +2653,10 @@ mod tests {
         }
     }
 
-    // Pinned to published vectors rather than to this implementation. Every
+    // pinned to published vectors rather than to this implementation. every
     // other assertion here computes its expectation with the same function it
     // is checking, so a wrong compression function would be self-consistent and
-    // green, and content ownership decisions ride on these digests. The third
+    // green, and content ownership decisions ride on these digests. the third
     // vector spans two blocks, where the padding is easiest to get wrong.
     #[test]
     fn sha256_reproduces_known_answers() {
@@ -2841,9 +2839,9 @@ mod tests {
             &identity,
         )
         .expect("exact target is a no-op");
-        // No adoption: a matching target furnish never published stays
-        // unrecorded, so it stays unrepairable rather than becoming owned by
-        // having been looked at.
+        // no adoption, so a matching target furnish never published stays
+        // unrecorded and unrepairable rather than becoming owned by having been
+        // looked at.
         assert!(
             ledger
                 .record(&entry.filesystem_identity.canonical)
@@ -2975,8 +2973,8 @@ mod tests {
 
     #[test]
     fn dangling_destination_that_does_not_match_the_record_is_refused() {
-        // Drift to a dead target: the link points somewhere furnish never
-        // published, and the pointee happens to be missing. Non-resolution alone
+        // drift to a dead target, where the link points somewhere furnish never
+        // published and the pointee happens to be missing. non-resolution alone
         // does not make it ours.
         let dir = TestDir::new();
         let destination = dir.path().join("value");
@@ -3006,9 +3004,9 @@ mod tests {
 
     #[test]
     fn recorded_target_that_still_resolves_takes_the_owned_update_branch() {
-        // Staging cannot run inside the test process, so the branch is proven by
-        // how far it gets: reaching the executor at all means the predicate
-        // admitted it instead of refusing. Authority is switched to user scope so
+        // staging cannot run inside the test process, so the branch is proven by
+        // how far it gets, and reaching the executor at all means the predicate
+        // admitted it instead of refusing. authority is switched to user scope so
         // the launch fails on the nonexistent setpriv rather than re-executing the
         // test binary.
         let dir = TestDir::new();
@@ -3041,7 +3039,7 @@ mod tests {
 
     #[test]
     fn owned_update_refuses_an_unresolvable_desired_target() {
-        // Desired resolution is checked before anything is staged. Republishing
+        // desired resolution is checked before anything is staged. republishing
         // toward a target that is not there would manufacture exactly the
         // breakage the repair branch exists to undo.
         let dir = TestDir::new();
@@ -3106,7 +3104,7 @@ mod tests {
         let record = identity.record(&entry, "new");
         retire_record(&record).expect("retire owned link");
         assert!(fs::symlink_metadata(&destination).is_err());
-        // Retirement removes what furnish published, never what it pointed at.
+        // retirement removes what furnish published, never what it pointed at.
         assert!(target.is_file());
     }
 
@@ -3157,17 +3155,17 @@ mod tests {
             .expect_err("refuse symlinked path component");
         assert!(matches!(failure.key, CodeKey::ParentTraversal));
         assert_eq!(failure.operation, Some("openat-parent-component"));
-        // Directory components are opened O_DIRECTORY|O_NOFOLLOW, so a symlinked
+        // directory components are opened O_DIRECTORY|O_NOFOLLOW, so a symlinked
         // component is refused with ENOTDIR (the unfollowed symlink is not a
         // directory); ELOOP only applies to the O_NOFOLLOW-without-O_DIRECTORY
-        // lock-file open. Either way the symlink is refused without being followed.
+        // lock-file open. either way the symlink is refused without being followed.
         assert_eq!(failure.errno, Some(Errno::NOTDIR.raw_os_error()));
     }
 
-    // Crash-boundary coverage. A unit test cannot kill the process mid-apply,
+    // crash-boundary coverage. a unit test cannot kill the process mid-apply,
     // so each of these plants exactly the on-disk and ledger state a death at
     // that boundary leaves behind and asserts where the next run converges.
-    // Real process death at the same points is proven by the fault-injection
+    // real process death at the same points is proven by the fault-injection
     // build in the regression harness.
 
     fn sample_writable_entry(managed_root: &str, destination: &str, source: &str) -> Entry {
@@ -3224,7 +3222,7 @@ mod tests {
             &source,
         );
         let mut ledger = test_ledger(&dir);
-        // Nothing was recorded and nothing was written, so recovery has nothing
+        // nothing was recorded and nothing was written, so recovery has nothing
         // to convert and the destination is still absent.
         recover_pending(&entry, &mut ledger, &RunIdentity::observe()).expect("recovery is a no-op");
         assert!(
@@ -3259,7 +3257,7 @@ mod tests {
             Some(".furnish.test.stage"),
         );
         recover_pending(&entry, &mut ledger, &RunIdentity::observe()).expect("recovery converges");
-        // The publication never happened, so the pending record is not evidence
+        // the publication never happened, so the pending record is not evidence
         // of ownership and is cleared rather than promoted.
         assert!(
             ledger
@@ -3295,7 +3293,7 @@ mod tests {
             Some(stage),
         );
         recover_pending(&entry, &mut ledger, &RunIdentity::observe()).expect("recovery converges");
-        // The stage is content this coordinator wrote and never published, so
+        // the stage is content this coordinator wrote and never published, so
         // removing it destroys nothing a user could have edited.
         assert!(!dir.path().join(stage).exists());
         assert!(!destination.exists());
@@ -3365,7 +3363,7 @@ mod tests {
             Some(".furnish.test.stage"),
         );
         recover_pending(&entry, &mut ledger, &RunIdentity::observe()).expect("recovery converges");
-        // Content that does not match the intent is not authorship, so the
+        // content that does not match the intent is not authorship, so the
         // record is cleared and the file is left exactly as found.
         assert!(
             ledger
@@ -3407,8 +3405,8 @@ mod tests {
             .record(&entry.filesystem_identity.canonical)
             .expect("recovered record")
             .clone();
-        // Recovery and reconciliation are two recorded steps, never fused: this
-        // lands at the old source and the ordinary path carries it forward.
+        // recovery and reconciliation are two recorded steps, never fused, so
+        // this lands at the old source and the ordinary path carries it forward.
         assert_eq!(record.state, STATE_OWNED);
         assert_eq!(record.baseline_hash.as_deref(), Some(old_intended.as_str()));
     }
@@ -3490,7 +3488,7 @@ mod tests {
         let source = write_source(&dir, "source", "payload\n");
         let destination = dir.path().join("value");
         let stage = ".furnish.test.stage";
-        // Post-EXCHANGE: the destination is the new regular file and the
+        // post-EXCHANGE, so the destination is the new regular file and the
         // displaced old symlink is sitting at the stage name.
         fs::write(&destination, "payload\n").expect("plant exchanged destination");
         fs::set_permissions(&destination, fs::Permissions::from_mode(WRITABLE_FILE_MODE))
@@ -3522,7 +3520,7 @@ mod tests {
             .clone();
         assert_eq!(record.state, STATE_OWNED);
         assert_eq!(record.representation, WRITABLE_REPRESENTATION);
-        // Unlinking a symlink never touches its pointee.
+        // unlinking a symlink never touches its pointee.
         assert!(!dir.path().join(stage).exists());
     }
 
@@ -3532,7 +3530,7 @@ mod tests {
         let source = write_source(&dir, "source", "payload\n");
         let destination = dir.path().join("value");
         let stage = ".furnish.test.stage";
-        // Post-EXCHANGE the other way: the destination is now the symlink and
+        // post-EXCHANGE the other way, so the destination is now the symlink and
         // the displaced regular file holds bytes the user edited.
         symlink(&source, &destination).expect("plant exchanged symlink");
         fs::write(dir.path().join(stage), "the user edited this\n")
@@ -3558,7 +3556,7 @@ mod tests {
         let failure = recover_pending(&entry, &mut ledger, &RunIdentity::observe())
             .expect_err("an edited displaced file refuses the transfer");
         assert!(matches!(failure.key, CodeKey::TransitionRefused));
-        // The edited bytes are back at the destination and were never unlinked.
+        // the edited bytes are back at the destination and were never unlinked.
         assert_eq!(
             fs::read_to_string(&destination).unwrap(),
             "the user edited this\n"
@@ -3624,7 +3622,7 @@ mod tests {
         record.representation = WRITABLE_REPRESENTATION.to_owned();
         record.baseline_hash = Some(sha256_hex(b"payload\n"));
         let outcome = retire_record(&record).expect("retirement is refused, not failed");
-        // Edited data is never deleted to satisfy cleanup, and the refusal is
+        // edited data is never deleted to satisfy cleanup, and the refusal is
         // recorded rather than thrown away.
         assert!(matches!(outcome, RetireOutcome::Unresolved(_)));
         assert_eq!(
@@ -3664,8 +3662,8 @@ mod tests {
         fs::write(&ledger_path, payload).expect("plant newer state");
         let failure = LedgerState::load(&state).expect_err("newer schema is refused");
         assert!(matches!(failure.key, CodeKey::LedgerInvalid));
-        // Refused before anything was touched: the file is byte-identical and no
-        // rollback copy was taken, because no migration was attempted.
+        // refused before anything was touched, so the file is byte-identical and
+        // no rollback copy was taken, because no migration was attempted.
         assert_eq!(fs::read_to_string(&ledger_path).unwrap(), payload);
         assert!(!state.join(LEDGER_ROLLBACK_FILE_NAME).exists());
     }
@@ -3676,8 +3674,8 @@ mod tests {
         let state = dir.path().join("state");
         fs::create_dir_all(&state).expect("create state directory");
         let ledger_path = state.join(LEDGER_FILE_NAME);
-        // Byte-for-byte what the v1 coordinator could have written: camelCase,
-        // and none of the v2 fields, so the defaults are what get exercised.
+        // byte-for-byte what the v1 coordinator could have written, camelCase and
+        // none of the v2 fields, so the defaults are what get exercised.
         let original = concat!(
             "{\"schemaVersion\":1,\"records\":{\"test:/tmp/value\":{",
             "\"destination\":\"/tmp/value\",",
@@ -3690,10 +3688,10 @@ mod tests {
         fs::write(&ledger_path, original).expect("plant v1 state");
         let ledger = LedgerState::load(&state).expect("v1 migrates");
         let record = ledger.record("test:/tmp/value").expect("migrated record");
-        // Writable did not exist in v1, so every v1 record is owned and symlink.
+        // writable did not exist in v1, so every v1 record is owned and symlink.
         assert_eq!(record.state, STATE_OWNED);
         assert_eq!(record.representation, NATIVE_REPRESENTATION);
-        // The rollback copy is the evidence, and it is the untouched original.
+        // the rollback copy is the evidence, and it is the untouched original.
         let rollback = state.join(LEDGER_ROLLBACK_FILE_NAME);
         assert_eq!(fs::read_to_string(&rollback).unwrap(), original);
     }
