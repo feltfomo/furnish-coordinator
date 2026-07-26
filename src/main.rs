@@ -15,7 +15,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-const MANIFEST_SCHEMA_VERSION: u64 = 1;
+const MANIFEST_SCHEMA_VERSION: u64 = 2;
 const DIAGNOSTIC_SCHEMA_VERSION: u64 = 1;
 const NATIVE_EXECUTOR_IDENTITY: &str = "furnish/native-symlink";
 const NATIVE_EXECUTOR_PROTOCOL: u64 = 1;
@@ -92,8 +92,6 @@ fn transition_is_gated(from: &str, to: &str) -> bool {
 }
 const LEDGER_STAGE_PREFIX: &str = ".applied-state";
 
-// hand-rolled because a crate would mean regenerating and committing the lock,
-// and that wasn't worth it for a digest over small config files.
 const SHA256_K: [u32; 64] = [
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
     0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
@@ -222,6 +220,18 @@ struct DiagnosticCodes {
     pending_recovery: String,
 }
 
+// how a destination that diverged from its baseline gets resolved. the choice
+// travels with the entry rather than with the run, and it has no default here,
+// so a manifest written before the choice existed fails to deserialize instead
+// of reconciling under a guess about what its author wanted.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum ConflictPolicy {
+    Error,
+    SourceWins,
+    RuntimeWins,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Entry {
@@ -229,6 +239,7 @@ struct Entry {
     filesystem_identity: FilesystemIdentity,
     authority: Authority,
     managed_root: String,
+    on_conflict: ConflictPolicy,
     representation: String,
     retained_artifact_target: String,
     executor: Executor,
@@ -273,6 +284,8 @@ struct Diagnostic<'a> {
     primary: Primary<'a>,
     provenance: Option<&'a Provenance>,
     cause: Option<Cause<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed: Option<ObservedHashes<'a>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -284,6 +297,17 @@ struct Primary<'a> {
 struct Cause<'a> {
     operation: &'a str,
     errno: i32,
+}
+
+// b, s, and d are the three hashes reported when onConflict is error. they
+// travel in the diagnostic so a reader can reconstruct what the coordinator
+// saw without re-reading either the manifest or the destination.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ObservedHashes<'a> {
+    baseline: Option<&'a str>,
+    source: &'a str,
+    destination: &'a str,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -315,6 +339,9 @@ struct Failure {
     label: String,
     operation: Option<&'static str>,
     errno: Option<i32>,
+    // set only on conflict diagnostics; carries b, s, d so the caller does
+    // not have to thread them through a separate code path.
+    observed: Option<(Option<String>, String, String)>,
 }
 
 type Result<T> = std::result::Result<T, Failure>;
@@ -327,6 +354,27 @@ impl Failure {
             label: label.into(),
             operation: None,
             errno: None,
+            observed: None,
+        }
+    }
+
+    fn conflict(
+        label: impl Into<String>,
+        baseline: Option<&str>,
+        source: &str,
+        destination: &str,
+    ) -> Self {
+        Self {
+            key: CodeKey::ConflictingDestination,
+            message: "destination and source have both diverged from the baseline and this declaration's policy is to refuse".to_owned(),
+            label: label.into(),
+            operation: None,
+            errno: None,
+            observed: Some((
+                baseline.map(str::to_owned),
+                source.to_owned(),
+                destination.to_owned(),
+            )),
         }
     }
 
@@ -342,6 +390,7 @@ impl Failure {
             label: label.into(),
             operation: Some(operation),
             errno: Some(errno.raw_os_error()),
+            observed: None,
         }
     }
 
@@ -357,6 +406,7 @@ impl Failure {
             label: label.into(),
             operation: Some(operation),
             errno: error.raw_os_error(),
+            observed: None,
         }
     }
 }
@@ -411,6 +461,11 @@ fn serialize_diagnostic(
             .operation
             .zip(failure.errno)
             .map(|(operation, errno)| Cause { operation, errno }),
+        observed: failure.observed.as_ref().map(|(b, s, d)| ObservedHashes {
+            baseline: b.as_deref(),
+            source: s,
+            destination: d,
+        }),
     })
 }
 
@@ -691,7 +746,10 @@ struct LedgerRecord {
     representation: String,
     // only a representation that keeps bytes at the destination can drift under
     // the user, so a symlink record carries no baseline. a path that writes one
-    // for a symlink is writing a claim it cannot check.
+    // for a symlink is writing a claim it cannot check. under runtime-wins the
+    // baseline is the source that was refused rather than bytes that were ever
+    // written here, so read it as the last source this record was reconciled
+    // against and not as a copy of what sits at the destination.
     #[serde(default)]
     baseline_hash: Option<String>,
     // what this record intended to put at the destination. its meaning is fixed
@@ -701,12 +759,16 @@ struct LedgerRecord {
     // neither is ever derived from the other. only the writable reading is read
     // back to prove authorship; symlink authorship compares the target string
     // itself, so on a symlink record this field is written and never consulted.
+    // a branch that converges backward sets the representation, so it restates
+    // this field to the reading that representation demands rather than carrying
+    // forward the one the pending record held.
     #[serde(default)]
     intended_witness_hash: Option<String>,
     #[serde(default)]
     applied_operation_generation: u64,
     // recovery has to find the displaced object by name, and a writable file
-    // displaced by a transition may hold edited bytes.
+    // displaced by a transition or by an update to its source may hold edited
+    // bytes.
     #[serde(default)]
     stage_name: Option<String>,
     #[serde(default)]
@@ -1456,15 +1518,19 @@ fn sync_parent(parent: &OwnedFd, destination: &str) -> Result<()> {
 
 // nothing has been applied yet, so the prior record's applied state is carried
 // across unchanged. a pending record that dropped it would make recovery
-// converge to a state weaker than the one already durable.
+// converge to a state weaker than the one already durable. the publishing
+// branch is named here and not only at the owned commit, because recovery
+// promotes this record as it stands, and a record that named a branch it was
+// not published by is not evidence of the decision that produced it.
 fn pending_record(
     identity: &RunIdentity,
     entry: &Entry,
+    applied_by: &str,
     prior: Option<&LedgerRecord>,
     stage: &OsStr,
     witness_hash: &str,
 ) -> LedgerRecord {
-    let mut record = identity.record(entry, "new");
+    let mut record = identity.record(entry, applied_by);
     record.state = STATE_PENDING.to_owned();
     record.intended_witness_hash = Some(witness_hash.to_owned());
     record.stage_name = Some(stage.to_string_lossy().into_owned());
@@ -1481,7 +1547,10 @@ fn pending_record(
 // that reached the destination, so it advances from the prior record instead of
 // restarting. the one exemption is a recovery branch that converges BACKWARD to
 // the state the ledger already describes, which restates that record rather than
-// constructing a new one, because nothing was carried forward to count.
+// constructing a new one, because nothing was carried forward to count. what it
+// is exempt from is advancing the generation, not the meanings of the fields, so
+// a restatement that sets the representation owes the witness reading that
+// representation demands.
 fn owned_record(
     identity: &RunIdentity,
     entry: &Entry,
@@ -1663,6 +1732,109 @@ fn verify_writable_destination(
 
 const TRANSITION_MARKER: &str = "transition";
 
+// materialize a new source version over an owned destination. the existing
+// destination is displaced to the stage path by an atomic exchange. after the
+// exchange the displaced bytes are hashed and compared to expected_displaced,
+// which is what was observed before staging; if they differ, a concurrent write
+// raced us and we exchange back to restore the original destination, then
+// report the race without leaving either side in an intermediate state.
+//
+// publish_exchange, the symlink route, runs the same exchange but rechecks a
+// target string, because what it guards is a representation swap. this one
+// rechecks content, because what it guards is bytes a user may have edited.
+fn publish_writable_exchange(
+    parent: &OwnedFd,
+    name: &OsStr,
+    stage: &OsStr,
+    destination: &str,
+    expected_displaced: &str,
+    intended_hash: &str,
+) -> Result<()> {
+    fault_point("stage-synced");
+    if let Err(errno) = renameat_with(parent, stage, parent, name, RenameFlags::EXCHANGE) {
+        remove_stage(parent, stage);
+        return Err(Failure::syscall(
+            CodeKey::PublishRace,
+            destination,
+            "renameat2-exchange-publish",
+            errno,
+        ));
+    }
+    fault_point("exchange-published");
+    // the displaced content now sits at the stage path. hash it and compare
+    // to what was observed before staging; a mismatch means a concurrent
+    // writer modified the destination between our read and the exchange.
+    let displaced_hash = hash_regular(
+        parent,
+        stage,
+        destination,
+        CodeKey::PublishRace,
+        "read-displaced",
+    )?;
+    if displaced_hash != expected_displaced {
+        // exchange back to restore the original destination, then remove the
+        // stage. both sides return to their pre-exchange state.
+        let _ = renameat_with(parent, stage, parent, name, RenameFlags::EXCHANGE);
+        remove_stage(parent, stage);
+        return Err(Failure::new(
+            CodeKey::PublishRace,
+            destination,
+            "destination changed between observation and publication; exchange reversed",
+        ));
+    }
+    // displaced content matched; the exchange is clean. remove the displaced
+    // bytes from the stage path and sync the directory.
+    remove_stage(parent, stage);
+    fault_point("published");
+    sync_parent(parent, destination)?;
+    fault_point("published-synced");
+    verify_writable_destination(parent, name, destination, intended_hash)?;
+    fault_point("verified");
+    Ok(())
+}
+
+// row three and source-wins publish identically and differ only in why they
+// were reached, so the pending-record bracket is written once here instead of
+// twice at the call sites. the caller has already decided that publishing is
+// the right answer; this only carries it out durably.
+#[allow(clippy::too_many_arguments)]
+fn publish_writable_update(
+    entry: &Entry,
+    setpriv: &Path,
+    index: usize,
+    ledger: &mut LedgerState,
+    identity: &RunIdentity,
+    record: &LedgerRecord,
+    parent: &OwnedFd,
+    name: &OsStr,
+    expected_displaced: &str,
+    intended: &str,
+) -> Result<()> {
+    let canonical = &entry.filesystem_identity.canonical;
+    let destination = &entry.filesystem_identity.destination;
+    let stage = stage_name(index);
+    fault_point("pre-pending");
+    ledger.commit(
+        canonical,
+        pending_record(identity, entry, "update", Some(record), &stage, intended),
+    )?;
+    fault_point("pending-committed");
+    stage_writable(setpriv, parent, &stage, entry, intended)?;
+    publish_writable_exchange(
+        parent,
+        name,
+        &stage,
+        destination,
+        expected_displaced,
+        intended,
+    )?;
+    ledger.commit(
+        canonical,
+        owned_record(identity, entry, "update", Some(record), intended),
+    )?;
+    Ok(())
+}
+
 fn transition_source_of(target: &str) -> Option<&'static str> {
     TRANSITION_PAIRS
         .iter()
@@ -1681,7 +1853,10 @@ fn representation_of_kind(kind: u32) -> Option<&'static str> {
 // recovery replay. a pending record authorizes recovery only when destination,
 // intended source hash, and artifact identity all agree with it; anything else
 // is not authorship, so the record is cleared and the ordinary path decides
-// again from observation.
+// again from observation. authorship is not the end of it for a writable
+// update, because the object the exchange displaced can still be sitting at the
+// stage name holding a user edit, and that case is restored and refused here
+// rather than promoted.
 fn recover_pending(entry: &Entry, ledger: &mut LedgerState, identity: &RunIdentity) -> Result<()> {
     let canonical = &entry.filesystem_identity.canonical;
     let destination = &entry.filesystem_identity.destination;
@@ -1750,6 +1925,66 @@ fn recover_pending(entry: &Entry, ledger: &mut LedgerState, identity: &RunIdenti
             .and_then(|witness| baseline_for(&record.representation, witness));
         owned.stage_name = None;
         owned.applied_operation_generation = record.applied_operation_generation.saturating_add(1);
+        // an exchange publish displaces the old destination to the stage name
+        // instead of consuming it, so a death between the exchange and the
+        // cleanup arrives here with the stage still populated. those bytes can
+        // be a user edit, so they are hashed against the baseline this record
+        // was pending against before anything unlinks them.
+        if let Some(stage) = stage.as_deref()
+            && observe_kind(&parent, stage, destination)? == Some(REGULAR_MODE)
+        {
+            let displaced_hash = hash_regular(
+                &parent,
+                stage,
+                destination,
+                CodeKey::PendingRecovery,
+                "read-displaced-pending",
+            )?;
+            if record.baseline_hash.as_deref() != Some(displaced_hash.as_str())
+                && entry.on_conflict != ConflictPolicy::SourceWins
+            {
+                // not what furnish wrote, and the declaration does not
+                // authorise discarding it, so the exchange is reversed and the
+                // edited bytes go back to the destination the user knows.
+                if let Err(errno) = renameat_with(
+                    &parent,
+                    stage,
+                    &parent,
+                    name.as_os_str(),
+                    RenameFlags::EXCHANGE,
+                ) {
+                    return Err(Failure::syscall(
+                        CodeKey::PendingRecovery,
+                        destination,
+                        "renameat2-exchange-restore-pending",
+                        errno,
+                    ));
+                }
+                sync_parent(&parent, destination)?;
+                // what sits at the stage name now is the content this run
+                // published, which is ours and holds nothing of the user's.
+                remove_stage(&parent, stage);
+                // backward convergence, so the owned state the ledger already
+                // describes is restated rather than advanced. that leaves the
+                // destination off both its baseline and the source, which is
+                // exactly the state the declaration's policy exists to decide,
+                // so the next run decides it there instead of here. the witness
+                // is restated with it, because on a writable owned record the
+                // witness is the baseline, and the one this pending record
+                // carries is the source that never landed.
+                let mut restored = record.clone();
+                restored.state = STATE_OWNED.to_owned();
+                restored.intended_witness_hash = record.baseline_hash.clone();
+                restored.stage_name = None;
+                ledger.commit(canonical, restored)?;
+                return Err(Failure::new(
+                    CodeKey::PendingRecovery,
+                    destination,
+                    "destination was edited while a writable update was publishing; the edited content was restored and the update was not recorded",
+                ));
+            }
+            remove_stage(&parent, stage);
+        }
         ledger.commit(canonical, owned)?;
         return Ok(());
     }
@@ -1761,7 +1996,6 @@ fn recover_pending(entry: &Entry, ledger: &mut LedgerState, identity: &RunIdenti
     {
         remove_stage(&parent, stage);
     }
-    let _ = identity;
     ledger.retire(canonical)?;
     Ok(())
 }
@@ -1807,9 +2041,31 @@ fn recover_transition(
         if observe_kind(parent, &stage, destination)?.is_some() {
             remove_stage(parent, &stage);
         }
+        // the witness reading is fixed by the representation, and this restates
+        // the representation, so carrying the pending witness across would leave
+        // a target hash on a writable record or a content hash on a symlink one.
+        // a writable record's witness is its own baseline; a symlink record's is
+        // the hash of the target it is recorded as pointing at, which the pending
+        // record carried forward for exactly this. the baseline is derived from
+        // the same representation rather than left as it stands, because a record
+        // this file did not write can carry one where the schema forbids it.
+        let witness = if source_representation == WRITABLE_REPRESENTATION {
+            let Some(baseline) = record.baseline_hash.clone() else {
+                return Err(Failure::new(
+                    CodeKey::TransitionRefused,
+                    destination,
+                    "refusing to restate a writable destination with no recorded baseline",
+                ));
+            };
+            baseline
+        } else {
+            sha256_hex(record.applied_artifact_target.as_bytes())
+        };
         let mut owned = record.clone();
         owned.state = STATE_OWNED.to_owned();
         owned.representation = source_representation.to_owned();
+        owned.baseline_hash = baseline_for(source_representation, &witness);
+        owned.intended_witness_hash = Some(witness);
         owned.stage_name = None;
         ledger.commit(canonical, owned)?;
         return Ok(());
@@ -1867,11 +2123,19 @@ fn recover_transition(
         // is ours and holds nothing of the user's.
         remove_stage(parent, &stage);
         // backward convergence again, so the destination is back to the writable
-        // file it was and the record it already had is restated, baseline
-        // included.
+        // file it was and the record it already had is restated, baseline and
+        // the witness that baseline is included.
+        let Some(baseline) = record.baseline_hash.clone() else {
+            return Err(Failure::new(
+                CodeKey::TransitionRefused,
+                destination,
+                "refusing to restate a writable destination with no recorded baseline; edited content was restored",
+            ));
+        };
         let mut owned = record.clone();
         owned.state = STATE_OWNED.to_owned();
         owned.representation = WRITABLE_REPRESENTATION.to_owned();
+        owned.intended_witness_hash = Some(baseline);
         owned.stage_name = None;
         ledger.commit(canonical, owned)?;
         return Err(Failure::new(
@@ -1938,8 +2202,14 @@ fn transition_representation(
         }
         let intended = hash_source(&entry.retained_artifact_target, destination)?;
         fault_point("pre-pending");
-        let mut pending = pending_record(identity, entry, Some(record), &stage, &intended);
-        pending.applied_by = TRANSITION_MARKER.to_owned();
+        let mut pending = pending_record(
+            identity,
+            entry,
+            TRANSITION_MARKER,
+            Some(record),
+            &stage,
+            &intended,
+        );
         pending.representation = WRITABLE_REPRESENTATION.to_owned();
         pending.applied_artifact_target = record.applied_artifact_target.clone();
         ledger.commit(canonical, pending)?;
@@ -2001,11 +2271,11 @@ fn transition_representation(
     let mut pending = pending_record(
         identity,
         entry,
+        TRANSITION_MARKER,
         Some(record),
         &stage,
         &sha256_hex(entry.retained_artifact_target.as_bytes()),
     );
-    pending.applied_by = TRANSITION_MARKER.to_owned();
     pending.representation = NATIVE_REPRESENTATION.to_owned();
     ledger.commit(canonical, pending)?;
     fault_point("pending-committed");
@@ -2086,7 +2356,14 @@ fn reconcile_writable_entry(
             fault_point("pre-pending");
             ledger.commit(
                 canonical,
-                pending_record(identity, entry, prior.as_ref(), &stage, &intended),
+                pending_record(
+                    identity,
+                    entry,
+                    applied_by,
+                    prior.as_ref(),
+                    &stage,
+                    &intended,
+                ),
             )?;
             fault_point("pending-committed");
             stage_writable(setpriv, &parent, &stage, entry, &intended)?;
@@ -2119,21 +2396,37 @@ fn reconcile_writable_entry(
                 CodeKey::ContentVerification,
                 "read-destination",
             )?;
-            if observed_hash != intended {
-                // deciding between edited runtime content and a changed source
-                // needs a three-way comparison that does not exist yet, and
-                // refusing neither adopts nor overwrites.
+            let Some(baseline) = record.baseline_hash.as_deref() else {
+                // absence of a baseline is not a diverged baseline. a record
+                // that cannot say what furnish last wrote cannot authorise
+                // overwriting whatever is there now, whichever policy the
+                // declaration carries, so this refuses in the same register
+                // the transition path already refuses in.
                 return Err(Failure::new(
                     CodeKey::ConflictingDestination,
                     destination,
-                    "destination content differs from the source; reconciliation of divergent writable content is not yet supported",
+                    "refusing to reconcile a writable destination with no recorded baseline",
                 ));
-            }
-            // destination equals the source. if the baseline does not, this is
-            // the crash window after replacement and before the baseline was
-            // committed, so the representation is verified, the baseline
-            // advances, and no conflict is reported.
-            if record.baseline_hash.as_deref() != Some(intended.as_str()) {
+            };
+            let d_eq_s = observed_hash == intended;
+            let d_eq_b = observed_hash == baseline;
+            let s_eq_b = baseline == intended.as_str();
+
+            if d_eq_s {
+                if s_eq_b {
+                    // row one. nothing to publish, but the record is refreshed
+                    // so that when this last reconciled has a live answer here
+                    // and not only on the symlink steady-state path.
+                    let mut refreshed = identity.record(entry, &record.applied_by);
+                    carry_applied_state(&record, &mut refreshed);
+                    ledger.commit(canonical, refreshed)?;
+                    return Ok(());
+                }
+                // row five. the crash window after the destination was
+                // replaced and before the baseline was committed, so the
+                // representation is verified and the baseline advances under
+                // the applied_by this record already carries rather than
+                // being reported as a conflict.
                 verify_writable_destination(&parent, &name, destination, &intended)?;
                 ledger.commit(
                     canonical,
@@ -2145,8 +2438,74 @@ fn reconcile_writable_entry(
                         &intended,
                     ),
                 )?;
+                return Ok(());
             }
-            Ok(())
+
+            if s_eq_b {
+                // row two. the source has not changed but the destination has,
+                // so a user edited the file after furnish wrote it. the edit
+                // is preserved and no reload is triggered.
+                let mut refreshed = identity.record(entry, &record.applied_by);
+                carry_applied_state(&record, &mut refreshed);
+                ledger.commit(canonical, refreshed)?;
+                return Ok(());
+            }
+
+            if d_eq_b {
+                // row three. the source changed and the destination is still
+                // exactly what furnish last wrote, so the new version goes in
+                // through the exchange route. the bytes it will displace are
+                // the ones just measured, which is what the recheck expects.
+                return publish_writable_update(
+                    entry,
+                    setpriv,
+                    index,
+                    ledger,
+                    identity,
+                    &record,
+                    &parent,
+                    &name,
+                    &observed_hash,
+                    &intended,
+                );
+            }
+
+            // row four. the destination and the source have both moved off the
+            // baseline, so nothing here is derivable from the hashes and the
+            // declaration's policy is the only thing left to decide it.
+            match entry.on_conflict {
+                ConflictPolicy::Error => Err(Failure::conflict(
+                    destination,
+                    Some(baseline),
+                    &intended,
+                    &observed_hash,
+                )),
+                ConflictPolicy::SourceWins => publish_writable_update(
+                    entry,
+                    setpriv,
+                    index,
+                    ledger,
+                    identity,
+                    &record,
+                    &parent,
+                    &name,
+                    &observed_hash,
+                    &intended,
+                ),
+                ConflictPolicy::RuntimeWins => {
+                    // the destination stays as it is and the baseline advances
+                    // to the source that was refused, so a later run sees a
+                    // settled decision instead of the same conflict again. the
+                    // witness moves with it because every writable owned
+                    // record in this file keeps the two equal.
+                    let mut refreshed = identity.record(entry, &record.applied_by);
+                    carry_applied_state(&record, &mut refreshed);
+                    refreshed.baseline_hash = baseline_for(&entry.representation, &intended);
+                    refreshed.intended_witness_hash = Some(intended.clone());
+                    ledger.commit(canonical, refreshed)?;
+                    Ok(())
+                }
+            }
         }
     }
 }
@@ -2197,7 +2556,7 @@ fn reconcile_entry(
             fault_point("pre-pending");
             ledger.commit(
                 canonical,
-                pending_record(identity, entry, prior.as_ref(), &stage, &intended),
+                pending_record(identity, entry, "new", prior.as_ref(), &stage, &intended),
             )?;
             fault_point("pending-committed");
             stage_symlink(setpriv, &parent, &stage, entry, expected)?;
@@ -2215,6 +2574,7 @@ fn reconcile_entry(
             // destination furnish never published is indistinguishable from one
             // it did. a host whose link predates the ledger stays unrecorded
             // here and acquires from absence instead.
+            //
             // nothing was published, so the branch that produced this target is
             // carried forward rather than restated as a decision this run made,
             // and so is everything else the applied state already recorded.
@@ -2802,6 +3162,7 @@ mod tests {
                 identity: "test/system".to_owned(),
             },
             managed_root: managed_root.to_owned(),
+            on_conflict: ConflictPolicy::Error,
             representation: NATIVE_REPRESENTATION.to_owned(),
             retained_artifact_target: target.to_owned(),
             executor: Executor {
@@ -3211,6 +3572,39 @@ mod tests {
             .expect("plant record");
     }
 
+    const PLANTED_GENERATION: u64 = 7;
+
+    // the counter cannot be planted through plant_record, which starts every
+    // record at zero, and a linkage proved with zero and one is a linkage between
+    // two numbers that could each have come from anywhere. a nonzero prior makes
+    // carrying the counter and advancing it different observations.
+    fn plant_generation(ledger: &mut LedgerState, entry: &Entry, generation: u64) {
+        let canonical = &entry.filesystem_identity.canonical;
+        let mut record = ledger.record(canonical).expect("planted record").clone();
+        record.applied_operation_generation = generation;
+        ledger
+            .commit(canonical, record)
+            .expect("plant operation generation");
+    }
+
+    fn committed(ledger: &LedgerState, entry: &Entry) -> LedgerRecord {
+        ledger
+            .record(&entry.filesystem_identity.canonical)
+            .expect("committed record")
+            .clone()
+    }
+
+    // every route that verifies a writable destination asserts its mode as well
+    // as its content, so a planted destination that skips the mode is a fixture
+    // that fails for a reason the test is not about.
+    fn plant_destination(dir: &TestDir, name: &str, contents: &str) -> PathBuf {
+        let path = dir.path().join(name);
+        fs::write(&path, contents).expect("plant destination content");
+        fs::set_permissions(&path, fs::Permissions::from_mode(WRITABLE_FILE_MODE))
+            .expect("set published mode");
+        path
+    }
+
     #[test]
     fn crash_at_pre_pending_leaves_nothing_owned() {
         let dir = TestDir::new();
@@ -3452,6 +3846,10 @@ mod tests {
             record.baseline_hash.as_deref(),
             Some(sha256_hex(b"payload\n").as_str())
         );
+        // the counter moves here, and moving it is not double counting. this row
+        // is reachable only when the crashed run's owned commit never landed, so
+        // the one advance recorded here is the one that run failed to record.
+        assert_eq!(record.applied_operation_generation, 1);
     }
 
     #[test]
@@ -3694,5 +4092,675 @@ mod tests {
         // the rollback copy is the evidence, and it is the untouched original.
         let rollback = state.join(LEDGER_ROLLBACK_FILE_NAME);
         assert_eq!(fs::read_to_string(&rollback).unwrap(), original);
+    }
+
+    // the causes that make a destination reload-eligible are the ones that commit
+    // new furnish-applied content, and eligibility is read off the committed
+    // record rather than off anything this coordinator does at the destination.
+    // staging cannot run inside the test process, since run_executor re-executes
+    // env::current_exe and inside these tests that is the test binary, so each
+    // publishing cause is proven in two halves. the dispatch half proves which
+    // route the reconciliation chose and that the pending record carried the
+    // prior counter unchanged into it. the recovery half proves what that route
+    // commits when it completes, advancing the same planted prior by exactly one.
+    // both halves plant PLANTED_GENERATION, which is what lets them compose.
+
+    #[test]
+    fn initial_materialization_takes_the_new_route_and_starts_the_counter_at_zero() {
+        let dir = TestDir::new();
+        let source = write_source(&dir, "source", "first\n");
+        let destination = dir.path().join("value");
+        let mut entry = sample_writable_entry(
+            dir.path().to_str().unwrap(),
+            destination.to_str().unwrap(),
+            &source,
+        );
+        // user scope so the launch fails on the nonexistent setpriv rather than
+        // re-executing the test binary with a worker subcommand it cannot read.
+        entry.authority.scope = "user".to_owned();
+        let mut ledger = test_ledger(&dir);
+        let failure = reconcile_writable_entry(
+            &entry,
+            Path::new("/nonexistent/setpriv"),
+            0,
+            &mut ledger,
+            &RunIdentity::observe(),
+        )
+        .expect_err("staging cannot run inside the test process");
+        assert!(matches!(failure.key, CodeKey::ExecutorFailed));
+        let record = committed(&ledger, &entry);
+        assert_eq!(record.state, STATE_PENDING);
+        assert_eq!(record.applied_by, "new");
+        assert_eq!(
+            record.intended_witness_hash.as_deref(),
+            Some(sha256_hex(b"first\n").as_str())
+        );
+        assert!(record.stage_name.is_some());
+        // there is no prior record to carry, so a first ownership is the one
+        // advancing cause whose prior is zero rather than planted.
+        assert_eq!(record.applied_operation_generation, 0);
+        assert!(record.baseline_hash.is_none());
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn self_heal_takes_the_repair_route_and_carries_the_prior_counter() {
+        let dir = TestDir::new();
+        let source = write_source(&dir, "source", "payload\n");
+        let baseline = sha256_hex(b"payload\n");
+        let destination = dir.path().join("value");
+        let mut entry = sample_writable_entry(
+            dir.path().to_str().unwrap(),
+            destination.to_str().unwrap(),
+            &source,
+        );
+        entry.authority.scope = "user".to_owned();
+        let mut ledger = test_ledger(&dir);
+        plant_record(
+            &mut ledger,
+            &entry,
+            STATE_OWNED,
+            "new",
+            WRITABLE_REPRESENTATION,
+            &source,
+            Some(&baseline),
+            Some(&baseline),
+            None,
+        );
+        plant_generation(&mut ledger, &entry, PLANTED_GENERATION);
+        let failure = reconcile_writable_entry(
+            &entry,
+            Path::new("/nonexistent/setpriv"),
+            0,
+            &mut ledger,
+            &RunIdentity::observe(),
+        )
+        .expect_err("staging cannot run inside the test process");
+        assert!(matches!(failure.key, CodeKey::ExecutorFailed));
+        let record = committed(&ledger, &entry);
+        assert_eq!(record.state, STATE_PENDING);
+        // an owned destination that has gone missing is a repair rather than a
+        // first ownership, and the two differ only in what the record says.
+        assert_eq!(record.applied_by, "repair");
+        assert_eq!(record.baseline_hash.as_deref(), Some(baseline.as_str()));
+        assert_eq!(record.applied_operation_generation, PLANTED_GENERATION);
+    }
+
+    #[test]
+    fn source_only_propagation_takes_the_update_route_and_carries_the_prior_counter() {
+        let dir = TestDir::new();
+        let source = write_source(&dir, "source", "second\n");
+        let destination = plant_destination(&dir, "value", "first\n");
+        let baseline = sha256_hex(b"first\n");
+        let mut entry = sample_writable_entry(
+            dir.path().to_str().unwrap(),
+            destination.to_str().unwrap(),
+            &source,
+        );
+        entry.authority.scope = "user".to_owned();
+        let mut ledger = test_ledger(&dir);
+        plant_record(
+            &mut ledger,
+            &entry,
+            STATE_OWNED,
+            "new",
+            WRITABLE_REPRESENTATION,
+            &source,
+            Some(&baseline),
+            Some(&baseline),
+            None,
+        );
+        plant_generation(&mut ledger, &entry, PLANTED_GENERATION);
+        let failure = reconcile_writable_entry(
+            &entry,
+            Path::new("/nonexistent/setpriv"),
+            0,
+            &mut ledger,
+            &RunIdentity::observe(),
+        )
+        .expect_err("staging cannot run inside the test process");
+        assert!(matches!(failure.key, CodeKey::ExecutorFailed));
+        let record = committed(&ledger, &entry);
+        assert_eq!(record.state, STATE_PENDING);
+        assert_eq!(record.applied_by, "update");
+        // the pending record names the source that has not landed while the
+        // baseline still names the bytes at the destination, which is the one
+        // state in which the two fields are allowed to differ.
+        assert_eq!(
+            record.intended_witness_hash.as_deref(),
+            Some(sha256_hex(b"second\n").as_str())
+        );
+        assert_eq!(record.baseline_hash.as_deref(), Some(baseline.as_str()));
+        assert_eq!(record.applied_operation_generation, PLANTED_GENERATION);
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "first\n");
+    }
+
+    #[test]
+    fn source_wins_takes_the_update_route_from_a_two_sided_divergence() {
+        // the preconditions are built explicitly rather than borrowed from the
+        // source-only case, because this is the only advancing cause selected by
+        // a declared policy instead of by a hash comparison. the destination and
+        // the source are both off the baseline, so nothing here is derivable and
+        // the policy is the only thing that can choose the publishing route.
+        let dir = TestDir::new();
+        let source = write_source(&dir, "source", "declared\n");
+        let destination = plant_destination(&dir, "value", "edited\n");
+        let baseline = sha256_hex(b"baseline\n");
+        let mut entry = sample_writable_entry(
+            dir.path().to_str().unwrap(),
+            destination.to_str().unwrap(),
+            &source,
+        );
+        entry.authority.scope = "user".to_owned();
+        entry.on_conflict = ConflictPolicy::SourceWins;
+        let mut ledger = test_ledger(&dir);
+        plant_record(
+            &mut ledger,
+            &entry,
+            STATE_OWNED,
+            "new",
+            WRITABLE_REPRESENTATION,
+            &source,
+            Some(&baseline),
+            Some(&baseline),
+            None,
+        );
+        plant_generation(&mut ledger, &entry, PLANTED_GENERATION);
+        let failure = reconcile_writable_entry(
+            &entry,
+            Path::new("/nonexistent/setpriv"),
+            0,
+            &mut ledger,
+            &RunIdentity::observe(),
+        )
+        .expect_err("staging cannot run inside the test process");
+        assert!(matches!(failure.key, CodeKey::ExecutorFailed));
+        let record = committed(&ledger, &entry);
+        assert_eq!(record.state, STATE_PENDING);
+        assert_eq!(record.applied_by, "update");
+        assert_eq!(record.applied_operation_generation, PLANTED_GENERATION);
+        // the edit is still there. a policy that authorises discarding it does
+        // not discard it before the replacement content exists.
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "edited\n");
+    }
+
+    #[test]
+    fn a_completed_new_publish_advances_the_counter_by_exactly_one() {
+        let dir = TestDir::new();
+        let source = write_source(&dir, "source", "payload\n");
+        let destination = plant_destination(&dir, "value", "payload\n");
+        let intended = sha256_hex(b"payload\n");
+        let entry = sample_writable_entry(
+            dir.path().to_str().unwrap(),
+            destination.to_str().unwrap(),
+            &source,
+        );
+        let mut ledger = test_ledger(&dir);
+        plant_record(
+            &mut ledger,
+            &entry,
+            STATE_PENDING,
+            "new",
+            WRITABLE_REPRESENTATION,
+            &source,
+            None,
+            Some(&intended),
+            Some(".furnish.test.stage"),
+        );
+        plant_generation(&mut ledger, &entry, PLANTED_GENERATION);
+        recover_pending(&entry, &mut ledger, &RunIdentity::observe()).expect("recovery converges");
+        let record = committed(&ledger, &entry);
+        assert_eq!(record.state, STATE_OWNED);
+        assert_eq!(record.applied_by, "new");
+        // the same prior the dispatch half carried unchanged, advanced once here.
+        assert_eq!(record.applied_operation_generation, PLANTED_GENERATION + 1);
+        assert_eq!(record.baseline_hash.as_deref(), Some(intended.as_str()));
+        assert_eq!(
+            record.intended_witness_hash.as_deref(),
+            Some(intended.as_str())
+        );
+    }
+
+    #[test]
+    fn a_completed_repair_advances_the_counter_by_exactly_one() {
+        let dir = TestDir::new();
+        let source = write_source(&dir, "source", "payload\n");
+        let destination = plant_destination(&dir, "value", "payload\n");
+        let intended = sha256_hex(b"payload\n");
+        let entry = sample_writable_entry(
+            dir.path().to_str().unwrap(),
+            destination.to_str().unwrap(),
+            &source,
+        );
+        let mut ledger = test_ledger(&dir);
+        plant_record(
+            &mut ledger,
+            &entry,
+            STATE_PENDING,
+            "repair",
+            WRITABLE_REPRESENTATION,
+            &source,
+            Some(&sha256_hex(b"older\n")),
+            Some(&intended),
+            Some(".furnish.test.stage"),
+        );
+        plant_generation(&mut ledger, &entry, PLANTED_GENERATION);
+        recover_pending(&entry, &mut ledger, &RunIdentity::observe()).expect("recovery converges");
+        let record = committed(&ledger, &entry);
+        assert_eq!(record.state, STATE_OWNED);
+        assert_eq!(record.applied_by, "repair");
+        assert_eq!(record.applied_operation_generation, PLANTED_GENERATION + 1);
+        // the stale baseline the pending record carried is replaced by the
+        // witness that landed, not kept alongside it.
+        assert_eq!(record.baseline_hash.as_deref(), Some(intended.as_str()));
+        assert_eq!(
+            record.intended_witness_hash.as_deref(),
+            Some(intended.as_str())
+        );
+    }
+
+    #[test]
+    fn a_completed_update_advances_the_counter_by_exactly_one() {
+        // one advance half per applied_by the publishing routes can commit, and
+        // source-wins publishes through the same route as source-only
+        // propagation under the same applied_by, so it needs no second copy of
+        // this. what distinguishes the two is the dispatch, which is where they
+        // are each proven.
+        let dir = TestDir::new();
+        let source = write_source(&dir, "source", "second\n");
+        let destination = plant_destination(&dir, "value", "second\n");
+        let intended = sha256_hex(b"second\n");
+        let entry = sample_writable_entry(
+            dir.path().to_str().unwrap(),
+            destination.to_str().unwrap(),
+            &source,
+        );
+        let mut ledger = test_ledger(&dir);
+        plant_record(
+            &mut ledger,
+            &entry,
+            STATE_PENDING,
+            "update",
+            WRITABLE_REPRESENTATION,
+            &source,
+            Some(&sha256_hex(b"first\n")),
+            Some(&intended),
+            Some(".furnish.test.stage"),
+        );
+        plant_generation(&mut ledger, &entry, PLANTED_GENERATION);
+        recover_pending(&entry, &mut ledger, &RunIdentity::observe()).expect("recovery converges");
+        let record = committed(&ledger, &entry);
+        assert_eq!(record.state, STATE_OWNED);
+        assert_eq!(record.applied_by, "update");
+        assert_eq!(record.applied_operation_generation, PLANTED_GENERATION + 1);
+        assert_eq!(record.baseline_hash.as_deref(), Some(intended.as_str()));
+        assert_eq!(
+            record.intended_witness_hash.as_deref(),
+            Some(intended.as_str())
+        );
+    }
+
+    #[test]
+    fn a_settled_destination_publishes_nothing_and_leaves_the_counter_alone() {
+        let dir = TestDir::new();
+        let source = write_source(&dir, "source", "payload\n");
+        let destination = plant_destination(&dir, "value", "payload\n");
+        let baseline = sha256_hex(b"payload\n");
+        let entry = sample_writable_entry(
+            dir.path().to_str().unwrap(),
+            destination.to_str().unwrap(),
+            &source,
+        );
+        let mut ledger = test_ledger(&dir);
+        plant_record(
+            &mut ledger,
+            &entry,
+            STATE_OWNED,
+            "new",
+            WRITABLE_REPRESENTATION,
+            &source,
+            Some(&baseline),
+            Some(&baseline),
+            None,
+        );
+        plant_generation(&mut ledger, &entry, PLANTED_GENERATION);
+        reconcile_writable_entry(
+            &entry,
+            Path::new("/nonexistent/setpriv"),
+            0,
+            &mut ledger,
+            &RunIdentity::observe(),
+        )
+        .expect("a settled destination reconciles");
+        let record = committed(&ledger, &entry);
+        // the record is refreshed so that when this was last reconciled has a
+        // live answer, and refreshing is not applying.
+        assert_eq!(record.state, STATE_OWNED);
+        assert_eq!(record.applied_operation_generation, PLANTED_GENERATION);
+        assert_eq!(record.baseline_hash.as_deref(), Some(baseline.as_str()));
+        assert_eq!(
+            record.intended_witness_hash.as_deref(),
+            Some(baseline.as_str())
+        );
+    }
+
+    #[test]
+    fn a_runtime_edit_under_an_unchanged_source_is_preserved_and_advances_nothing() {
+        let dir = TestDir::new();
+        let source = write_source(&dir, "source", "payload\n");
+        let destination = plant_destination(&dir, "value", "user edit\n");
+        let baseline = sha256_hex(b"payload\n");
+        let entry = sample_writable_entry(
+            dir.path().to_str().unwrap(),
+            destination.to_str().unwrap(),
+            &source,
+        );
+        let mut ledger = test_ledger(&dir);
+        plant_record(
+            &mut ledger,
+            &entry,
+            STATE_OWNED,
+            "new",
+            WRITABLE_REPRESENTATION,
+            &source,
+            Some(&baseline),
+            Some(&baseline),
+            None,
+        );
+        plant_generation(&mut ledger, &entry, PLANTED_GENERATION);
+        reconcile_writable_entry(
+            &entry,
+            Path::new("/nonexistent/setpriv"),
+            0,
+            &mut ledger,
+            &RunIdentity::observe(),
+        )
+        .expect("an unchanged source preserves the edit");
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "user edit\n");
+        let record = committed(&ledger, &entry);
+        // the baseline still names what furnish wrote, because what furnish wrote
+        // is what a later source change will be measured against.
+        assert_eq!(record.baseline_hash.as_deref(), Some(baseline.as_str()));
+        assert_eq!(record.applied_operation_generation, PLANTED_GENERATION);
+    }
+
+    #[test]
+    fn runtime_wins_settles_the_conflict_without_publishing_or_advancing() {
+        let dir = TestDir::new();
+        let source = write_source(&dir, "source", "declared\n");
+        let destination = plant_destination(&dir, "value", "edited\n");
+        let intended = sha256_hex(b"declared\n");
+        let mut entry = sample_writable_entry(
+            dir.path().to_str().unwrap(),
+            destination.to_str().unwrap(),
+            &source,
+        );
+        entry.on_conflict = ConflictPolicy::RuntimeWins;
+        let mut ledger = test_ledger(&dir);
+        plant_record(
+            &mut ledger,
+            &entry,
+            STATE_OWNED,
+            "new",
+            WRITABLE_REPRESENTATION,
+            &source,
+            Some(&sha256_hex(b"baseline\n")),
+            Some(&sha256_hex(b"baseline\n")),
+            None,
+        );
+        plant_generation(&mut ledger, &entry, PLANTED_GENERATION);
+        reconcile_writable_entry(
+            &entry,
+            Path::new("/nonexistent/setpriv"),
+            0,
+            &mut ledger,
+            &RunIdentity::observe(),
+        )
+        .expect("runtime wins settles rather than refusing");
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "edited\n");
+        let record = committed(&ledger, &entry);
+        // the baseline advances to the source that was refused so the same
+        // conflict is not rediscovered every run, and nothing was applied, so
+        // the counter does not move with it.
+        assert_eq!(record.baseline_hash.as_deref(), Some(intended.as_str()));
+        assert_eq!(
+            record.intended_witness_hash.as_deref(),
+            Some(intended.as_str())
+        );
+        assert_eq!(record.applied_operation_generation, PLANTED_GENERATION);
+    }
+
+    #[test]
+    fn the_error_policy_refuses_a_two_sided_divergence_and_commits_nothing() {
+        let dir = TestDir::new();
+        let source = write_source(&dir, "source", "declared\n");
+        let destination = plant_destination(&dir, "value", "edited\n");
+        let entry = sample_writable_entry(
+            dir.path().to_str().unwrap(),
+            destination.to_str().unwrap(),
+            &source,
+        );
+        let mut ledger = test_ledger(&dir);
+        plant_record(
+            &mut ledger,
+            &entry,
+            STATE_OWNED,
+            "new",
+            WRITABLE_REPRESENTATION,
+            &source,
+            Some(&sha256_hex(b"baseline\n")),
+            Some(&sha256_hex(b"baseline\n")),
+            None,
+        );
+        plant_generation(&mut ledger, &entry, PLANTED_GENERATION);
+        let before = committed(&ledger, &entry);
+        let failure = reconcile_writable_entry(
+            &entry,
+            Path::new("/nonexistent/setpriv"),
+            0,
+            &mut ledger,
+            &RunIdentity::observe(),
+        )
+        .expect_err("the declared policy is to refuse");
+        assert!(matches!(failure.key, CodeKey::ConflictingDestination));
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "edited\n");
+        // an untouched counter is a weaker claim than no commit at all, and no
+        // commit at all is what refusing promises, so the whole record is
+        // compared. a ledger record is not comparable directly, and its encoded
+        // form is the shape the file on disk would have held anyway.
+        assert_eq!(
+            serde_json::to_value(&before).unwrap(),
+            serde_json::to_value(committed(&ledger, &entry)).unwrap()
+        );
+    }
+
+    #[test]
+    fn every_owned_writable_record_holds_a_baseline_equal_to_its_witness() {
+        // the walk is filtered to owned records deliberately. a pending record is
+        // supposed to carry a baseline that differs from its witness, because the
+        // witness names the source that has not landed yet, and the dispatch
+        // halves above commit exactly those records on purpose.
+        let dir = TestDir::new();
+        let mut ledger = test_ledger(&dir);
+        let identity = RunIdentity::observe();
+        let setpriv = Path::new("/nonexistent/setpriv");
+
+        let settled_source = write_source(&dir, "settled-source", "same\n");
+        let settled_destination = plant_destination(&dir, "settled-value", "same\n");
+        let settled = sample_writable_entry(
+            dir.path().to_str().unwrap(),
+            settled_destination.to_str().unwrap(),
+            &settled_source,
+        );
+        plant_record(
+            &mut ledger,
+            &settled,
+            STATE_OWNED,
+            "new",
+            WRITABLE_REPRESENTATION,
+            &settled_source,
+            Some(&sha256_hex(b"same\n")),
+            Some(&sha256_hex(b"same\n")),
+            None,
+        );
+        reconcile_writable_entry(&settled, setpriv, 0, &mut ledger, &identity)
+            .expect("the refreshing route settles");
+
+        let stale_source = write_source(&dir, "stale-source", "landed\n");
+        let stale_destination = plant_destination(&dir, "stale-value", "landed\n");
+        let stale = sample_writable_entry(
+            dir.path().to_str().unwrap(),
+            stale_destination.to_str().unwrap(),
+            &stale_source,
+        );
+        plant_record(
+            &mut ledger,
+            &stale,
+            STATE_OWNED,
+            "update",
+            WRITABLE_REPRESENTATION,
+            &stale_source,
+            Some(&sha256_hex(b"before\n")),
+            Some(&sha256_hex(b"before\n")),
+            None,
+        );
+        reconcile_writable_entry(&stale, setpriv, 1, &mut ledger, &identity)
+            .expect("the advancing route settles");
+
+        let refused_source = write_source(&dir, "refused-source", "declared\n");
+        let refused_destination = plant_destination(&dir, "refused-value", "edited\n");
+        let mut refused = sample_writable_entry(
+            dir.path().to_str().unwrap(),
+            refused_destination.to_str().unwrap(),
+            &refused_source,
+        );
+        refused.on_conflict = ConflictPolicy::RuntimeWins;
+        plant_record(
+            &mut ledger,
+            &refused,
+            STATE_OWNED,
+            "new",
+            WRITABLE_REPRESENTATION,
+            &refused_source,
+            Some(&sha256_hex(b"baseline\n")),
+            Some(&sha256_hex(b"baseline\n")),
+            None,
+        );
+        reconcile_writable_entry(&refused, setpriv, 2, &mut ledger, &identity)
+            .expect("the policy route settles");
+
+        let recovered_source = write_source(&dir, "recovered-source", "recovered\n");
+        let recovered_destination = plant_destination(&dir, "recovered-value", "recovered\n");
+        let recovered = sample_writable_entry(
+            dir.path().to_str().unwrap(),
+            recovered_destination.to_str().unwrap(),
+            &recovered_source,
+        );
+        plant_record(
+            &mut ledger,
+            &recovered,
+            STATE_PENDING,
+            "update",
+            WRITABLE_REPRESENTATION,
+            &recovered_source,
+            Some(&sha256_hex(b"before\n")),
+            Some(&sha256_hex(b"recovered\n")),
+            Some(".furnish.test.stage"),
+        );
+        recover_pending(&recovered, &mut ledger, &identity).expect("the recovery route settles");
+
+        let owned_writable: Vec<LedgerRecord> = ledger
+            .recorded()
+            .into_iter()
+            .map(|(_, record)| record)
+            .filter(|record| {
+                record.state == STATE_OWNED && record.representation == WRITABLE_REPRESENTATION
+            })
+            .collect();
+        // four routes, four distinct commit paths, and the count is asserted so
+        // that a route which silently stopped committing cannot leave this
+        // passing over a smaller set than it was written for.
+        assert_eq!(owned_writable.len(), 4);
+        for record in owned_writable {
+            let baseline = record
+                .baseline_hash
+                .as_deref()
+                .expect("an owned writable record names what furnish last wrote");
+            assert_eq!(Some(baseline), record.intended_witness_hash.as_deref());
+        }
+    }
+
+    #[test]
+    fn every_owned_symlink_record_holds_no_baseline_and_a_target_witness() {
+        let dir = TestDir::new();
+        let mut ledger = test_ledger(&dir);
+        let target = dir.path().join("target");
+        fs::write(&target, b"linked").expect("create link target");
+
+        // written by a reconciliation: the backward transition restatement, which
+        // sets the representation and therefore owes the reading that
+        // representation fixes.
+        let restored_destination = dir.path().join("restored-value");
+        symlink(&target, &restored_destination).expect("plant symlink destination");
+        let restored = sample_writable_entry(
+            dir.path().to_str().unwrap(),
+            restored_destination.to_str().unwrap(),
+            target.to_str().unwrap(),
+        );
+        plant_record(
+            &mut ledger,
+            &restored,
+            STATE_PENDING,
+            TRANSITION_MARKER,
+            WRITABLE_REPRESENTATION,
+            target.to_str().unwrap(),
+            Some(&sha256_hex(b"linked")),
+            Some(&sha256_hex(b"linked")),
+            Some(".furnish.test.stage"),
+        );
+        recover_pending(&restored, &mut ledger, &RunIdentity::observe())
+            .expect("the transition converges backward");
+        let record = committed(&ledger, &restored);
+        assert_eq!(record.representation, NATIVE_REPRESENTATION);
+        assert_eq!(
+            record.intended_witness_hash.as_deref(),
+            Some(sha256_hex(target.to_str().unwrap().as_bytes()).as_str())
+        );
+
+        // not written by a reconciliation: a record planted the way the v1
+        // migration and RunIdentity::record leave one, with both fields at their
+        // defaults.
+        let planted_destination = dir.path().join("planted-value");
+        let planted = sample_entry(
+            dir.path().to_str().unwrap(),
+            planted_destination.to_str().unwrap(),
+            target.to_str().unwrap(),
+        );
+        record_ownership(&mut ledger, &planted, target.to_str().unwrap());
+
+        let owned_symlinks: Vec<LedgerRecord> = ledger
+            .recorded()
+            .into_iter()
+            .map(|(_, record)| record)
+            .filter(|record| {
+                record.state == STATE_OWNED && record.representation == NATIVE_REPRESENTATION
+            })
+            .collect();
+        assert_eq!(owned_symlinks.len(), 2);
+        for record in owned_symlinks {
+            // a path string is not content at the destination, so a symlink
+            // record never carries a baseline under any state.
+            assert!(record.baseline_hash.is_none());
+            // the absent witness is a carve-out for records no reconciliation
+            // wrote, which today means migrated v1 records and records planted
+            // before a publish. it is permitted here by name rather than by
+            // silence, and it expires when the v1 migration path does.
+            if let Some(witness) = record.intended_witness_hash.as_deref() {
+                assert_eq!(
+                    witness,
+                    sha256_hex(record.applied_artifact_target.as_bytes())
+                );
+            }
+        }
     }
 }
