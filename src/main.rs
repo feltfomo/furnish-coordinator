@@ -4307,6 +4307,10 @@ mod tests {
             Some(&intended),
             Some(".furnish.test.stage"),
         );
+        // a first ownership has no prior, so a pending new record carrying a
+        // nonzero generation is not a state the live route can reach. it is
+        // planted anyway because the advance has to be prior-relative, and a
+        // prior of zero cannot tell that apart from arithmetic that starts there.
         plant_generation(&mut ledger, &entry, PLANTED_GENERATION);
         recover_pending(&entry, &mut ledger, &RunIdentity::observe()).expect("recovery converges");
         let record = committed(&ledger, &entry);
