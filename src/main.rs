@@ -1,6 +1,6 @@
 use rustix::fs::{
-    AtFlags, FlockOperation, Mode, OFlags, RenameFlags, flock, fsync, open, openat, readlinkat,
-    renameat_with, statat, symlinkat, unlinkat,
+    AtFlags, FlockOperation, Mode, OFlags, RenameFlags, flock, fsync, mkdirat, open, openat,
+    readlinkat, renameat_with, statat, symlinkat, unlinkat,
 };
 use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
@@ -65,6 +65,32 @@ const EXECUTOR_PROFILES: [ExecutorProfile; 2] = [
         worker_value_flag: "--source",
     },
 ];
+
+// creating a parent is not an executor. it presents no representation, owns no
+// destination and is never recorded, so it stays out of the table a manifest
+// entry is qualified against and lives in a worker-only one that main scans
+// second. what the worker does is chosen by which table matched, never by a
+// representation.
+struct WorkerAction {
+    subcommand: &'static str,
+}
+
+const DIRECTORY_ACTION: WorkerAction = WorkerAction {
+    subcommand: "create-native-directory",
+};
+
+const WORKER_ACTIONS: [&WorkerAction; 1] = [&DIRECTORY_ACTION];
+
+// one mode for a created parent, asserted rather than requested, because
+// mkdirat is masked by the umask of whichever authority created it.
+const DIRECTORY_MODE: u32 = 0o755;
+
+fn worker_action_for(subcommand: &str) -> Option<&'static WorkerAction> {
+    WORKER_ACTIONS
+        .iter()
+        .copied()
+        .find(|action| action.subcommand == subcommand)
+}
 
 // transfer is generic over representation pairs; the gate is the set of pairs
 // that actually exist today.
@@ -563,7 +589,27 @@ fn validate_manifest(manifest: &Manifest) -> Result<()> {
     Ok(())
 }
 
+// how the walk treats a parent component that is not there. the traversal is
+// identical either way, so a component that exists as a symlink or as a
+// non-directory refuses in both modes for the same reason.
+enum ParentMode<'a> {
+    Refuse,
+    Create {
+        setpriv: &'a Path,
+        authority: &'a Authority,
+    },
+}
+
+// the no-create walk. every caller that must not create keeps this one.
 fn open_parent(destination: &str, managed_root: &str) -> Result<(OwnedFd, OsString)> {
+    walk_parent(destination, managed_root, &ParentMode::Refuse)
+}
+
+fn walk_parent(
+    destination: &str,
+    managed_root: &str,
+    mode: &ParentMode<'_>,
+) -> Result<(OwnedFd, OsString)> {
     let destination_path = Path::new(destination);
     let managed_root_path = Path::new(managed_root);
     if !destination_path.is_absolute()
@@ -602,24 +648,19 @@ fn open_parent(destination: &str, managed_root: &str) -> Result<(OwnedFd, OsStri
     )
     .map_err(|errno| Failure::syscall(CodeKey::ParentTraversal, destination, "open-root", errno))?;
 
+    // creation is bounded by the managed root, so the components at and above it
+    // are traversed and never made. the bound is counted on the walk itself
+    // rather than matched on the string, because the walk is where a component is
+    // opened and so is the only place the bound can hold.
+    let boundary = managed_root_path.components().count();
+    let mut depth = 0;
     for component in parent.components() {
+        depth += 1;
         match component {
             Component::RootDir => {}
             Component::Normal(part) => {
-                current = openat(
-                    &current,
-                    part,
-                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
-                    Mode::empty(),
-                )
-                .map_err(|errno| {
-                    Failure::syscall(
-                        CodeKey::ParentTraversal,
-                        destination,
-                        "openat-parent-component",
-                        errno,
-                    )
-                })?;
+                current =
+                    open_parent_component(&current, part, destination, mode, depth > boundary)?;
             }
             _ => {
                 return Err(Failure::new(
@@ -631,6 +672,47 @@ fn open_parent(destination: &str, managed_root: &str) -> Result<(OwnedFd, OsStri
         }
     }
     Ok((current, name))
+}
+
+// one component of the walk. a component that is absent below the managed root
+// is delegated to the authority that will own it and then reopened through this
+// same refusing openat, so a symlink that appears in the gap loses to the reopen
+// rather than to a check that ran before it. an existing component is opened and
+// never touched, because its mode and ownership are somebody else's.
+fn open_parent_component(
+    parent: &OwnedFd,
+    part: &OsStr,
+    destination: &str,
+    mode: &ParentMode<'_>,
+    creatable: bool,
+) -> Result<OwnedFd> {
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW;
+    let refusal = |errno: Errno| {
+        Failure::syscall(
+            CodeKey::ParentTraversal,
+            destination,
+            "openat-parent-component",
+            errno,
+        )
+    };
+    match openat(parent, part, flags, Mode::empty()) {
+        Ok(opened) => Ok(opened),
+        Err(Errno::NOENT) => match mode {
+            ParentMode::Create { setpriv, authority } if creatable => {
+                run_directory_executor(setpriv, parent, part, destination, authority)?;
+                openat(parent, part, flags, Mode::empty()).map_err(|errno| {
+                    Failure::syscall(
+                        CodeKey::ParentTraversal,
+                        destination,
+                        "openat-created-parent-component",
+                        errno,
+                    )
+                })
+            }
+            _ => Err(refusal(Errno::NOENT)),
+        },
+        Err(errno) => Err(refusal(errno)),
+    }
 }
 
 fn symlink_target<Fd: std::os::fd::AsFd>(
@@ -708,6 +790,61 @@ fn run_executor(
             CodeKey::ExecutorFailed,
             target,
             format!("native executor exited with {status}"),
+        ));
+    }
+    Ok(())
+}
+
+// creating a directory under a user's home is the user's write, so it goes
+// through the same setpriv door a staged artifact does. the name handed over is
+// a single component and the worker does no walking of its own.
+fn run_directory_executor(
+    setpriv: &Path,
+    parent: &OwnedFd,
+    name: &OsStr,
+    destination: &str,
+    authority: &Authority,
+) -> Result<()> {
+    let executable = env::current_exe().map_err(|error| {
+        Failure::new(
+            CodeKey::ExecutorFailed,
+            destination,
+            format!("cannot resolve coordinator executable: {error}"),
+        )
+    })?;
+    let mut command = if authority.scope == "user" {
+        let mut command = Command::new(setpriv);
+        command
+            .arg("--reuid")
+            .arg(&authority.identity)
+            .arg("--regid")
+            .arg(&authority.identity)
+            .arg("--init-groups")
+            .arg("--")
+            .arg(&executable);
+        command
+    } else {
+        Command::new(&executable)
+    };
+    let status = command
+        .arg(DIRECTORY_ACTION.subcommand)
+        .arg("--parent-fd")
+        .arg(parent.as_raw_fd().to_string())
+        .arg("--name")
+        .arg(name)
+        .status()
+        .map_err(|error| {
+            Failure::new(
+                CodeKey::ExecutorFailed,
+                destination,
+                format!("failed to launch parent creation: {error}"),
+            )
+        })?;
+    if !status.success() {
+        return Err(Failure::new(
+            CodeKey::ExecutorFailed,
+            destination,
+            format!("parent creation exited with {status}"),
         ));
     }
     Ok(())
@@ -2167,6 +2304,8 @@ fn transition_representation(
     ledger: &mut LedgerState,
     identity: &RunIdentity,
     record: &LedgerRecord,
+    parent: &OwnedFd,
+    name: &OsStr,
 ) -> Result<()> {
     let canonical = &entry.filesystem_identity.canonical;
     let destination = &entry.filesystem_identity.destination;
@@ -2179,7 +2318,6 @@ fn transition_representation(
             format!("no gated transfer from {from} to {to}"),
         ));
     }
-    let (parent, name) = open_parent(destination, &entry.managed_root)?;
     let stage = stage_name(index);
     let recorded = OsStr::new(&record.applied_artifact_target);
 
@@ -2216,13 +2354,7 @@ fn transition_representation(
         fault_point("pending-committed");
         stage_writable(setpriv, &parent, &stage, entry, &intended)?;
         fault_point("stage-synced");
-        if let Err(errno) = renameat_with(
-            &parent,
-            &stage,
-            &parent,
-            name.as_os_str(),
-            RenameFlags::EXCHANGE,
-        ) {
+        if let Err(errno) = renameat_with(&parent, &stage, &parent, name, RenameFlags::EXCHANGE) {
             remove_stage(&parent, &stage);
             return Err(Failure::syscall(
                 CodeKey::TransitionRefused,
@@ -2281,13 +2413,7 @@ fn transition_representation(
     fault_point("pending-committed");
     stage_symlink(setpriv, &parent, &stage, entry, expected)?;
     fault_point("stage-synced");
-    if let Err(errno) = renameat_with(
-        &parent,
-        &stage,
-        &parent,
-        name.as_os_str(),
-        RenameFlags::EXCHANGE,
-    ) {
+    if let Err(errno) = renameat_with(&parent, &stage, &parent, name, RenameFlags::EXCHANGE) {
         remove_stage(&parent, &stage);
         return Err(Failure::syscall(
             CodeKey::TransitionRefused,
@@ -2338,10 +2464,11 @@ fn reconcile_writable_entry(
     index: usize,
     ledger: &mut LedgerState,
     identity: &RunIdentity,
+    parent: &OwnedFd,
+    name: &OsStr,
 ) -> Result<()> {
     let canonical = &entry.filesystem_identity.canonical;
     let destination = &entry.filesystem_identity.destination;
-    let (parent, name) = open_parent(destination, &entry.managed_root)?;
     let intended = hash_source(&entry.retained_artifact_target, destination)?;
     let record = ledger.record(canonical).cloned();
     let observed = observe_kind(&parent, &name, destination)?;
@@ -2520,26 +2647,44 @@ fn reconcile_entry(
     let destination = &entry.filesystem_identity.destination;
     let canonical = &entry.filesystem_identity.canonical;
 
+    // the one walk for this entry, and the only one allowed to create. it runs
+    // ahead of recovery because recovery resolves the parent too, so a
+    // destination whose directory nothing else creates has to be reachable
+    // before any branch reads it. every branch below is handed this descriptor
+    // rather than repeating the walk.
+    let (parent, name) = walk_parent(
+        destination,
+        &entry.managed_root,
+        &ParentMode::Create {
+            setpriv,
+            authority: &entry.authority,
+        },
+    )?;
+    let name = name.as_os_str();
+
     // recovery runs before the ordinary path and only ever converts pending to
     // owned. the two are never fused, so a stale pending record converges to
-    // owned at the source it was pending for and is then carried forward.
+    // owned at the source it was pending for and is then carried forward. it
+    // resolves the parent from the record's own managed root, which is not
+    // always the entry's, so it keeps its own refusing walk.
     recover_pending(entry, ledger, identity)?;
 
     if let Some(record) = ledger.record(canonical).cloned()
         && record.state == STATE_OWNED
         && record.representation != entry.representation
     {
-        return transition_representation(entry, setpriv, index, ledger, identity, &record);
+        return transition_representation(
+            entry, setpriv, index, ledger, identity, &record, &parent, name,
+        );
     }
 
     if entry.representation == WRITABLE_REPRESENTATION {
-        return reconcile_writable_entry(entry, setpriv, index, ledger, identity);
+        return reconcile_writable_entry(entry, setpriv, index, ledger, identity, &parent, name);
     }
 
     let expected = OsStr::new(&entry.retained_artifact_target);
-    let (parent, name) = open_parent(destination, &entry.managed_root)?;
 
-    let observed = symlink_target(&parent, &name).map_err(|errno| {
+    let observed = symlink_target(&parent, name).map_err(|errno| {
         Failure::syscall(
             CodeKey::ConflictingDestination,
             destination,
@@ -2629,7 +2774,7 @@ fn reconcile_entry(
             // filesystem. applied to a foreign target this test would be a race,
             // since a link into a late-mounting filesystem reads unresolvable at
             // boot and resolvable at switch, and the coordinator runs at both.
-            let applied_by = match statat(&parent, &name, AtFlags::empty()) {
+            let applied_by = match statat(&parent, name, AtFlags::empty()) {
                 // what furnish published is still live.
                 Ok(_) => "update",
                 // what furnish published was reaped.
@@ -2891,6 +3036,81 @@ fn worker(args: &[OsString], profile: &ExecutorProfile) -> ExitCode {
     }
 }
 
+// the worker half of parent creation. a name that is anything other than one
+// ordinary component is refused before a syscall runs, on the same reasoning the
+// lock name is guarded. an existing directory is success and is left untouched;
+// only a component this call actually created has its mode asserted.
+fn create_directory_component(args: &[OsString]) -> ExitCode {
+    let mut parent_fd = None;
+    let mut name = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].to_string_lossy().as_ref() {
+            "--parent-fd" if index + 1 < args.len() => {
+                parent_fd = args[index + 1].to_string_lossy().parse::<i32>().ok();
+                index += 2;
+            }
+            "--name" if index + 1 < args.len() => {
+                name = Some(args[index + 1].clone());
+                index += 2;
+            }
+            _ => return ExitCode::FAILURE,
+        }
+    }
+    let (Some(parent_fd), Some(name)) = (parent_fd, name) else {
+        return ExitCode::FAILURE;
+    };
+    if !is_single_component(&name) {
+        return ExitCode::FAILURE;
+    }
+    let inherited = PathBuf::from(format!("/proc/self/fd/{parent_fd}"));
+    let parent = match open(
+        &inherited,
+        OFlags::RDONLY | OFlags::DIRECTORY,
+        Mode::empty(),
+    ) {
+        Ok(parent) => parent,
+        Err(_) => return ExitCode::FAILURE,
+    };
+    match mkdirat(&parent, &name, Mode::from_bits_truncate(DIRECTORY_MODE)) {
+        Ok(()) => {}
+        // somebody else got there first, which is the same end state and is not a
+        // failure. it is also not permission to touch what they made.
+        Err(Errno::EXIST) => return ExitCode::SUCCESS,
+        Err(_) => return ExitCode::FAILURE,
+    }
+    let created = match openat(
+        &parent,
+        &name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(created) => created,
+        Err(_) => return ExitCode::FAILURE,
+    };
+    let path = format!("/proc/self/fd/{}", created.as_raw_fd());
+    if fs::set_permissions(&path, fs::Permissions::from_mode(DIRECTORY_MODE)).is_err() {
+        return ExitCode::FAILURE;
+    }
+    // the request is not the guarantee, so the mode is read back off the
+    // descriptor that was just created rather than trusted.
+    match fs::metadata(&path) {
+        Ok(metadata) => {
+            if !metadata.is_dir() || metadata.permissions().mode() & 0o7777 != DIRECTORY_MODE {
+                return ExitCode::FAILURE;
+            }
+        }
+        Err(_) => return ExitCode::FAILURE,
+    }
+    ExitCode::SUCCESS
+}
+
+fn is_single_component(name: &OsStr) -> bool {
+    let path = Path::new(name);
+    let mut components = path.components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+}
+
 // the bytes are written and durable before the coordinator is told anything
 // succeeded, so a crash after the executor returns can never leave a stage the
 // coordinator would mistake for complete.
@@ -2966,7 +3186,10 @@ fn main() -> ExitCode {
                 .find(|profile| profile.worker_subcommand == subcommand)
             {
                 Some(profile) => worker(&args[1..], profile),
-                None => ExitCode::FAILURE,
+                None => match worker_action_for(subcommand) {
+                    Some(_) => create_directory_component(&args[1..]),
+                    None => ExitCode::FAILURE,
+                },
             }
         }
         _ => ExitCode::FAILURE,
@@ -2983,6 +3206,29 @@ mod tests {
     use std::time::Duration;
 
     static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    // production resolves the parent once in reconcile_entry and threads it, so a
+    // test that drives the writable path directly does the same walk rather than
+    // a second version of it.
+    fn reconcile_writable_at(
+        entry: &Entry,
+        setpriv: &Path,
+        index: usize,
+        ledger: &mut LedgerState,
+        identity: &RunIdentity,
+    ) -> Result<()> {
+        let (parent, name) =
+            open_parent(&entry.filesystem_identity.destination, &entry.managed_root)?;
+        reconcile_writable_entry(
+            entry,
+            setpriv,
+            index,
+            ledger,
+            identity,
+            &parent,
+            name.as_os_str(),
+        )
+    }
 
     struct TestLockRoot(PathBuf);
 
@@ -3504,6 +3750,93 @@ mod tests {
         assert!(matches!(failure.key, CodeKey::InvalidDestination));
     }
 
+    // the creating walk must weaken nothing. a component that exists as a symlink
+    // or as a plain file is refused exactly as it is on the no-create walk, and a
+    // component missing at or above the managed root is refused rather than made.
+    // the setpriv path handed in cannot be executed, so any test here that
+    // reached delegation would fail on that instead of passing quietly.
+    fn refusing_create_mode<'a>(authority: &'a Authority) -> ParentMode<'a> {
+        ParentMode::Create {
+            setpriv: Path::new("/nonexistent/setpriv"),
+            authority,
+        }
+    }
+
+    #[test]
+    fn creating_walk_refuses_symlinked_path_component() {
+        let dir = TestDir::new();
+        let real = dir.path().join("real");
+        fs::create_dir(&real).expect("create real directory");
+        let link = dir.path().join("link");
+        symlink(&real, &link).expect("plant symlinked component");
+        let destination = link.join("nested").join("value");
+        let entry = sample_entry(
+            link.to_str().unwrap(),
+            destination.to_str().unwrap(),
+            "/desired/target",
+        );
+        let failure = walk_parent(
+            destination.to_str().unwrap(),
+            link.to_str().unwrap(),
+            &refusing_create_mode(&entry.authority),
+        )
+        .expect_err("refuse symlinked path component while creating");
+        assert!(matches!(failure.key, CodeKey::ParentTraversal));
+        assert_eq!(failure.operation, Some("openat-parent-component"));
+        assert_eq!(failure.errno, Some(Errno::NOTDIR.raw_os_error()));
+        // the symlink is left as it was found and nothing was made behind it.
+        assert_eq!(fs::read_link(&link).unwrap(), real);
+        assert!(!real.join("nested").exists());
+    }
+
+    #[test]
+    fn creating_walk_refuses_non_directory_path_component() {
+        let dir = TestDir::new();
+        let managed_root = dir.path().join("managed");
+        fs::create_dir(&managed_root).expect("create managed root");
+        let occupied = managed_root.join("occupied");
+        fs::write(&occupied, b"foreign").expect("plant regular file component");
+        let destination = occupied.join("value");
+        let entry = sample_entry(
+            managed_root.to_str().unwrap(),
+            destination.to_str().unwrap(),
+            "/desired/target",
+        );
+        let failure = walk_parent(
+            destination.to_str().unwrap(),
+            managed_root.to_str().unwrap(),
+            &refusing_create_mode(&entry.authority),
+        )
+        .expect_err("refuse non-directory path component while creating");
+        assert!(matches!(failure.key, CodeKey::ParentTraversal));
+        assert_eq!(failure.operation, Some("openat-parent-component"));
+        assert_eq!(failure.errno, Some(Errno::NOTDIR.raw_os_error()));
+        // the foreign file keeps its bytes; nothing replaced it to make room.
+        assert_eq!(fs::read(&occupied).unwrap(), b"foreign");
+    }
+
+    #[test]
+    fn creating_walk_never_creates_at_or_above_the_managed_root() {
+        let dir = TestDir::new();
+        let managed_root = dir.path().join("absent-root");
+        let destination = managed_root.join("value");
+        let entry = sample_entry(
+            managed_root.to_str().unwrap(),
+            destination.to_str().unwrap(),
+            "/desired/target",
+        );
+        let failure = walk_parent(
+            destination.to_str().unwrap(),
+            managed_root.to_str().unwrap(),
+            &refusing_create_mode(&entry.authority),
+        )
+        .expect_err("refuse a managed root that does not exist");
+        assert!(matches!(failure.key, CodeKey::ParentTraversal));
+        assert_eq!(failure.operation, Some("openat-parent-component"));
+        assert_eq!(failure.errno, Some(Errno::NOENT.raw_os_error()));
+        assert!(!managed_root.exists());
+    }
+
     #[test]
     fn open_parent_refuses_symlinked_path_component() {
         let dir = TestDir::new();
@@ -3830,7 +4163,7 @@ mod tests {
             None,
             None,
         );
-        reconcile_writable_entry(
+        reconcile_writable_at(
             &entry,
             Path::new("/nonexistent/setpriv"),
             0,
@@ -3864,7 +4197,7 @@ mod tests {
             &source,
         );
         let mut ledger = test_ledger(&dir);
-        let failure = reconcile_writable_entry(
+        let failure = reconcile_writable_at(
             &entry,
             Path::new("/nonexistent/setpriv"),
             0,
@@ -4119,7 +4452,7 @@ mod tests {
         // re-executing the test binary with a worker subcommand it cannot read.
         entry.authority.scope = "user".to_owned();
         let mut ledger = test_ledger(&dir);
-        let failure = reconcile_writable_entry(
+        let failure = reconcile_writable_at(
             &entry,
             Path::new("/nonexistent/setpriv"),
             0,
@@ -4168,7 +4501,7 @@ mod tests {
             None,
         );
         plant_generation(&mut ledger, &entry, PLANTED_GENERATION);
-        let failure = reconcile_writable_entry(
+        let failure = reconcile_writable_at(
             &entry,
             Path::new("/nonexistent/setpriv"),
             0,
@@ -4211,7 +4544,7 @@ mod tests {
             None,
         );
         plant_generation(&mut ledger, &entry, PLANTED_GENERATION);
-        let failure = reconcile_writable_entry(
+        let failure = reconcile_writable_at(
             &entry,
             Path::new("/nonexistent/setpriv"),
             0,
@@ -4266,7 +4599,7 @@ mod tests {
             None,
         );
         plant_generation(&mut ledger, &entry, PLANTED_GENERATION);
-        let failure = reconcile_writable_entry(
+        let failure = reconcile_writable_at(
             &entry,
             Path::new("/nonexistent/setpriv"),
             0,
@@ -4428,7 +4761,7 @@ mod tests {
             None,
         );
         plant_generation(&mut ledger, &entry, PLANTED_GENERATION);
-        reconcile_writable_entry(
+        reconcile_writable_at(
             &entry,
             Path::new("/nonexistent/setpriv"),
             0,
@@ -4472,7 +4805,7 @@ mod tests {
             None,
         );
         plant_generation(&mut ledger, &entry, PLANTED_GENERATION);
-        reconcile_writable_entry(
+        reconcile_writable_at(
             &entry,
             Path::new("/nonexistent/setpriv"),
             0,
@@ -4513,7 +4846,7 @@ mod tests {
             None,
         );
         plant_generation(&mut ledger, &entry, PLANTED_GENERATION);
-        reconcile_writable_entry(
+        reconcile_writable_at(
             &entry,
             Path::new("/nonexistent/setpriv"),
             0,
@@ -4558,7 +4891,7 @@ mod tests {
         );
         plant_generation(&mut ledger, &entry, PLANTED_GENERATION);
         let before = committed(&ledger, &entry);
-        let failure = reconcile_writable_entry(
+        let failure = reconcile_writable_at(
             &entry,
             Path::new("/nonexistent/setpriv"),
             0,
@@ -4607,7 +4940,7 @@ mod tests {
             Some(&sha256_hex(b"same\n")),
             None,
         );
-        reconcile_writable_entry(&settled, setpriv, 0, &mut ledger, &identity)
+        reconcile_writable_at(&settled, setpriv, 0, &mut ledger, &identity)
             .expect("the refreshing route settles");
 
         let stale_source = write_source(&dir, "stale-source", "landed\n");
@@ -4628,7 +4961,7 @@ mod tests {
             Some(&sha256_hex(b"before\n")),
             None,
         );
-        reconcile_writable_entry(&stale, setpriv, 1, &mut ledger, &identity)
+        reconcile_writable_at(&stale, setpriv, 1, &mut ledger, &identity)
             .expect("the advancing route settles");
 
         let refused_source = write_source(&dir, "refused-source", "declared\n");
@@ -4650,7 +4983,7 @@ mod tests {
             Some(&sha256_hex(b"baseline\n")),
             None,
         );
-        reconcile_writable_entry(&refused, setpriv, 2, &mut ledger, &identity)
+        reconcile_writable_at(&refused, setpriv, 2, &mut ledger, &identity)
             .expect("the policy route settles");
 
         let recovered_source = write_source(&dir, "recovered-source", "recovered\n");
