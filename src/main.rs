@@ -3374,6 +3374,14 @@ mod tests {
         fn path(&self) -> &Path {
             &self.0
         }
+
+        // production resolves the parent once per entry and threads it, so a
+        // test that drives a publish function directly does the same walk.
+        fn entry_parent(&self, name: &str) -> (OwnedFd, OsString) {
+            let destination = self.0.join(name);
+            open_parent(destination.to_str().unwrap(), self.0.to_str().unwrap())
+                .expect("walk test entry parent")
+        }
     }
 
     impl Drop for TestDir {
@@ -4159,6 +4167,8 @@ mod tests {
             "new",
             WRITABLE_REPRESENTATION,
             &source,
+            // Opaque planted mismatch token: it names no file content and is
+            // replaced when reconciliation advances the stale baseline.
             Some("0000000000000000000000000000000000000000000000000000000000000000"),
             None,
             None,
@@ -5098,6 +5108,1105 @@ mod tests {
                     sha256_hex(record.applied_artifact_target.as_bytes())
                 );
             }
+        }
+    }
+
+    // characterization pins for behaviors no route observes from outside the
+    // crate. pure or ledger-only, so they run in the default build and never
+    // reach a worker.
+    mod characterization_pins {
+        use super::*;
+
+        #[test]
+        fn sha256_reproduces_block_edge_answers() {
+            // 55 bytes is the last single-block length, 64 forces a second
+            // block for the padding alone, 119 and 120 put the length word at
+            // the two edges of it. pinned to reference digests, because a
+            // padding bug here is self-consistent with the function it checks.
+            assert_eq!(
+                sha256_hex(&[b'a'; 55]),
+                "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318"
+            );
+            assert_eq!(
+                sha256_hex(&[b'a'; 64]),
+                "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb"
+            );
+            assert_eq!(
+                sha256_hex(&[b'a'; 119]),
+                "31eba51c313a5c08226adf18d4a359cfdfd8d2e816b13f4af952f7ea6584dcfb"
+            );
+            assert_eq!(
+                sha256_hex(&[b'a'; 120]),
+                "2f3d335432c70b580af0e8e1b3674a7c020d683aa5f73aaaedfdc55af904c21c"
+            );
+        }
+
+        // a manifest builder so each refusal below can name exactly the check
+        // it pins. entry fields are set before the manifest exists, which is
+        // the only order that keeps two failing checks in one manifest.
+        fn manifest_with(mut entries: Vec<Entry>, on_conflict: ConflictPolicy) -> Manifest {
+            for entry in &mut entries {
+                entry.on_conflict = on_conflict;
+            }
+            Manifest {
+                schema_version: MANIFEST_SCHEMA_VERSION,
+                diagnostic_contract: DiagnosticContract {
+                    schema_version: DIAGNOSTIC_SCHEMA_VERSION,
+                    codes: DiagnosticCodes::default(),
+                },
+                entries,
+            }
+        }
+
+        #[test]
+        fn manifest_schema_outranks_contract_schema() {
+            let entry = sample_entry("/managed", "/managed/value", "/desired/target");
+            let mut manifest = manifest_with(vec![entry], ConflictPolicy::Error);
+            manifest.schema_version = 99;
+            manifest.diagnostic_contract.schema_version = 0;
+            let failure =
+                validate_manifest(&manifest).expect_err("manifest schema is checked first");
+            assert_eq!(failure.label, "manifest");
+        }
+
+        #[test]
+        fn entry_schema_mismatch_is_reported_before_the_executor_tuple() {
+            let mut entry = sample_entry("/managed", "/managed/value", "/desired/target");
+            entry.schema_version = 99;
+            entry.executor.identity = "bogus".to_owned();
+            let manifest = manifest_with(vec![entry], ConflictPolicy::Error);
+            let failure = validate_manifest(&manifest)
+                .expect_err("entry schema is checked before the executor tuple");
+            assert_eq!(
+                failure.message,
+                "entry schema does not match the manifest schema"
+            );
+        }
+
+        #[test]
+        fn an_unsupported_executor_tuple_is_reported_before_the_lifecycle_strategies() {
+            let mut entry = sample_entry("/managed", "/managed/value", "/desired/target");
+            entry.executor.identity = "bogus".to_owned();
+            entry.cleanup_strategy = "bogus".to_owned();
+            let manifest = manifest_with(vec![entry], ConflictPolicy::Error);
+            let failure = validate_manifest(&manifest)
+                .expect_err("the executor tuple is checked before the lifecycle strategies");
+            assert_eq!(
+                failure.message,
+                "unsupported executor tuple (bogus, 1, symlink)"
+            );
+        }
+
+        #[test]
+        fn lifecycle_strategy_mismatch_is_reported_before_the_authority_scope() {
+            let mut entry = sample_entry("/managed", "/managed/value", "/desired/target");
+            entry.cleanup_strategy = "bogus".to_owned();
+            entry.authority.scope = "host".to_owned();
+            let manifest = manifest_with(vec![entry], ConflictPolicy::Error);
+            let failure = validate_manifest(&manifest)
+                .expect_err("the lifecycle strategies are checked before the authority scope");
+            assert_eq!(
+                failure.message,
+                "symlink reconciliation requires exact-symlink-target lifecycle strategies"
+            );
+        }
+
+        #[test]
+        fn authority_scope_is_reported_before_the_canonical_form() {
+            let mut entry = sample_entry("/managed", "/managed/value", "/desired/target");
+            entry.authority.scope = "host".to_owned();
+            entry.filesystem_identity.canonical = "bogus".to_owned();
+            let manifest = manifest_with(vec![entry], ConflictPolicy::Error);
+            let failure = validate_manifest(&manifest)
+                .expect_err("the authority scope is checked before the canonical form");
+            assert_eq!(failure.message, "authority scope must be user or system");
+        }
+
+        #[test]
+        fn the_canonical_form_is_checked_last() {
+            let mut entry = sample_entry("/managed", "/managed/value", "/desired/target");
+            entry.filesystem_identity.canonical = "bogus".to_owned();
+            let manifest = manifest_with(vec![entry], ConflictPolicy::Error);
+            let failure = validate_manifest(&manifest)
+                .expect_err("a valid entry fails only on the canonical form");
+            assert_eq!(failure.message, "filesystem identity is not canonical");
+        }
+
+        #[test]
+        fn the_first_failing_entry_decides_the_diagnostic() {
+            let mut first = sample_entry("/managed", "/managed/first", "/desired/target");
+            first.filesystem_identity.canonical = "bogus".to_owned();
+            let mut second = sample_entry("/managed", "/managed/second", "/desired/target");
+            second.authority.scope = "host".to_owned();
+            let manifest = manifest_with(vec![first, second], ConflictPolicy::Error);
+            let failure =
+                validate_manifest(&manifest).expect_err("the earlier entry fails the manifest");
+            assert_eq!(failure.message, "filesystem identity is not canonical");
+        }
+
+        #[test]
+        fn executor_qualification_table_is_exact() {
+            assert_eq!(EXECUTOR_PROFILES.len(), 2);
+            for profile in EXECUTOR_PROFILES.iter() {
+                assert!(
+                    profile_for(
+                        profile.identity,
+                        profile.protocol_version,
+                        profile.representation
+                    )
+                    .is_some()
+                );
+            }
+            assert!(profile_for(NATIVE_EXECUTOR_IDENTITY, 2, NATIVE_REPRESENTATION).is_none());
+            assert!(profile_for(NATIVE_WRITABLE_IDENTITY, 1, NATIVE_REPRESENTATION).is_none());
+            assert!(profile_for("bogus", 1, NATIVE_REPRESENTATION).is_none());
+        }
+
+        #[test]
+        fn transition_gate_table_is_exact() {
+            assert_eq!(TRANSITION_PAIRS.len(), 2);
+            assert!(transition_is_gated(
+                NATIVE_REPRESENTATION,
+                WRITABLE_REPRESENTATION
+            ));
+            assert!(transition_is_gated(
+                WRITABLE_REPRESENTATION,
+                NATIVE_REPRESENTATION
+            ));
+            assert!(!transition_is_gated(
+                NATIVE_REPRESENTATION,
+                NATIVE_REPRESENTATION
+            ));
+            assert!(!transition_is_gated(
+                WRITABLE_REPRESENTATION,
+                WRITABLE_REPRESENTATION
+            ));
+        }
+
+        #[test]
+        fn transition_source_lookup_is_exact() {
+            assert_eq!(
+                transition_source_of(WRITABLE_REPRESENTATION),
+                Some(NATIVE_REPRESENTATION)
+            );
+            assert_eq!(
+                transition_source_of(NATIVE_REPRESENTATION),
+                Some(WRITABLE_REPRESENTATION)
+            );
+            assert_eq!(transition_source_of("bogus"), None);
+        }
+
+        #[test]
+        fn kind_to_representation_lookup_is_exact() {
+            assert_eq!(
+                representation_of_kind(SYMLINK_MODE),
+                Some(NATIVE_REPRESENTATION)
+            );
+            assert_eq!(
+                representation_of_kind(REGULAR_MODE),
+                Some(WRITABLE_REPRESENTATION)
+            );
+            assert_eq!(representation_of_kind(0o040000), None);
+        }
+
+        #[test]
+        fn pending_record_carries_the_prior_applied_state_forward_unchanged() {
+            let identity = RunIdentity::observe();
+            let entry = sample_entry("/managed", "/managed/value", "/desired/target");
+            let mut prior = identity.record(&entry, "new");
+            prior.baseline_hash = Some("a".repeat(64));
+            prior.applied_operation_generation = 5;
+            let pending = pending_record(
+                &identity,
+                &entry,
+                TRANSITION_MARKER,
+                Some(&prior),
+                OsStr::new(".furnish.9.stage"),
+                "b".repeat(64).as_str(),
+            );
+            assert_eq!(pending.state, STATE_PENDING);
+            assert_eq!(pending.applied_by, TRANSITION_MARKER);
+            assert_eq!(pending.stage_name.as_deref(), Some(".furnish.9.stage"));
+            assert_eq!(
+                pending.intended_witness_hash.as_deref(),
+                Some("b".repeat(64).as_str())
+            );
+            assert_eq!(pending.baseline_hash, prior.baseline_hash);
+            assert_eq!(pending.applied_operation_generation, 5);
+        }
+
+        #[test]
+        fn owned_record_advances_the_generation_and_sets_the_baseline_by_representation() {
+            let identity = RunIdentity::observe();
+            let entry = sample_writable_entry("/managed", "/managed/value", "/tmp/source");
+            let mut prior = identity.record(&entry, "new");
+            prior.applied_operation_generation = 4;
+            let owned = owned_record(
+                &identity,
+                &entry,
+                "update",
+                Some(&prior),
+                "c".repeat(64).as_str(),
+            );
+            assert_eq!(owned.state, STATE_OWNED);
+            assert_eq!(owned.applied_operation_generation, 5);
+            assert_eq!(
+                owned.baseline_hash.as_deref(),
+                Some("c".repeat(64).as_str())
+            );
+        }
+
+        #[test]
+        fn owned_record_saturates_at_the_generation_ceiling() {
+            let identity = RunIdentity::observe();
+            let entry = sample_entry("/managed", "/managed/value", "/desired/target");
+            let mut prior = identity.record(&entry, "new");
+            prior.applied_operation_generation = u64::MAX;
+            let owned = owned_record(
+                &identity,
+                &entry,
+                "update",
+                Some(&prior),
+                "d".repeat(64).as_str(),
+            );
+            assert_eq!(owned.applied_operation_generation, u64::MAX);
+        }
+
+        #[test]
+        fn baseline_for_is_a_writable_only_reading() {
+            assert_eq!(
+                baseline_for(WRITABLE_REPRESENTATION, "e".repeat(64).as_str()),
+                Some("e".repeat(64))
+            );
+            assert_eq!(
+                baseline_for(NATIVE_REPRESENTATION, "e".repeat(64).as_str()),
+                None
+            );
+        }
+
+        #[test]
+        fn conflict_policy_uses_kebab_case_wire_names_and_refuses_absence() {
+            // an entry written before onConflict existed must fail to
+            // deserialize rather than reconcile under a guessed policy.
+            let entry_json = |policy: &str| {
+                format!(
+                    "{{\"schemaVersion\":2,\"filesystemIdentity\":{{\"namespace\":\"test\",\"destination\":\"/managed/value\",\"canonical\":\"test:/managed/value\"}},\"authority\":{{\"scope\":\"system\",\"identity\":\"test/system\"}},\"managedRoot\":\"/managed\",{policy}\"representation\":\"symlink\",\"retainedArtifactTarget\":\"/desired/target\",\"executor\":{{\"identity\":\"furnish/native-symlink\",\"protocolVersion\":1}},\"cleanupStrategy\":\"exact-symlink-target\",\"selfHealStrategy\":\"exact-symlink-target\",\"provenance\":{{\"declaration\":\"unit-test\",\"source\":\"coordinator/src/main.rs\"}}}}"
+                )
+            };
+            let entry: Entry = serde_json::from_str(&entry_json("\"onConflict\":\"error\","))
+                .expect("error parses");
+            assert!(matches!(entry.on_conflict, ConflictPolicy::Error));
+            let entry: Entry = serde_json::from_str(&entry_json("\"onConflict\":\"source-wins\","))
+                .expect("source-wins parses");
+            assert!(matches!(entry.on_conflict, ConflictPolicy::SourceWins));
+            let entry: Entry =
+                serde_json::from_str(&entry_json("\"onConflict\":\"runtime-wins\","))
+                    .expect("runtime-wins parses");
+            assert!(matches!(entry.on_conflict, ConflictPolicy::RuntimeWins));
+            assert!(
+                serde_json::from_str::<Entry>(&entry_json("\"onConflict\":\"sourceWins\","))
+                    .is_err()
+            );
+            assert!(serde_json::from_str::<Entry>(&entry_json("")).is_err());
+        }
+
+        #[test]
+        fn diagnostic_serialization_omits_only_observed_and_nulls_other_absent_parts() {
+            let codes = DiagnosticCodes::default();
+            let plain = Failure::new(CodeKey::InvalidManifest, "label", "message");
+            let encoded = serialize_diagnostic(&codes, &plain, None, "error").expect("serialize");
+            let diagnostic: serde_json::Value = serde_json::from_str(&encoded).expect("decode");
+            assert!(diagnostic.get("provenance").is_some());
+            assert!(diagnostic["provenance"].is_null());
+            assert!(diagnostic.get("cause").is_some());
+            assert!(diagnostic["cause"].is_null());
+            assert!(diagnostic.get("observed").is_none());
+            let conflict = Failure::conflict(
+                "label",
+                None,
+                "s".repeat(64).as_str(),
+                "d".repeat(64).as_str(),
+            );
+            let encoded =
+                serialize_diagnostic(&codes, &conflict, None, "error").expect("serialize");
+            let diagnostic: serde_json::Value = serde_json::from_str(&encoded).expect("decode");
+            assert!(diagnostic["observed"].get("baseline").is_some());
+            assert!(diagnostic["observed"]["baseline"].is_null());
+        }
+    }
+
+    // ledger characterization: the encoded bytes are pinned exactly where
+    // every stamp can be fixed, and the load-time behavior is pinned as it
+    // actually behaves rather than as the error arms read.
+    mod ledger_pins {
+        use super::*;
+
+        fn state_with(dir: &TestDir, bytes: Option<&str>) -> PathBuf {
+            let state = dir.path().join("state");
+            fs::create_dir_all(&state).expect("create state directory");
+            if let Some(bytes) = bytes {
+                fs::write(state.join(LEDGER_FILE_NAME), bytes).expect("plant ledger bytes");
+            }
+            state
+        }
+
+        #[test]
+        fn load_refuses_undecodable_applied_state() {
+            let dir = TestDir::new();
+            let state = state_with(&dir, Some("not json"));
+            let failure = LedgerState::load(&state).expect_err("undecodable state is refused");
+            assert!(matches!(failure.key, CodeKey::LedgerInvalid));
+            assert!(failure.message.starts_with("cannot decode applied state"));
+        }
+
+        #[test]
+        fn load_refuses_applied_state_without_a_schema_version() {
+            let dir = TestDir::new();
+            let state = state_with(&dir, Some("{\"records\":{}}"));
+            let failure = LedgerState::load(&state).expect_err("a missing version is refused");
+            assert!(matches!(failure.key, CodeKey::LedgerInvalid));
+            // the version probe parses strictly, so the refusal arrives through
+            // the decode path and the dedicated no-version arm is never reached.
+            assert!(failure.message.starts_with("cannot decode applied state"));
+        }
+
+        #[test]
+        fn load_normalizes_the_state_directory_mode_to_0755() {
+            let dir = TestDir::new();
+            let state = state_with(&dir, None);
+            fs::set_permissions(&state, fs::Permissions::from_mode(0o700))
+                .expect("set a narrower state mode");
+            LedgerState::load(&state).expect("load repairs the mode");
+            let mode = fs::metadata(&state)
+                .expect("stat state directory")
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(mode, 0o755);
+        }
+
+        #[test]
+        fn an_empty_record_serializes_every_v2_field_with_null_defaults() {
+            let identity = RunIdentity {
+                invocation_id: None,
+                monotonic_seconds: 0.0,
+                boot_id: None,
+                system_generation: None,
+            };
+            let entry = sample_entry("/managed", "/managed/value", "/desired/target");
+            let record = identity.record(&entry, "new");
+            let encoded = serde_json::to_value(&record).expect("encode record");
+            assert_eq!(encoded["appliedGeneration"], serde_json::Value::Null);
+            assert_eq!(encoded["reloadActionIdentity"], serde_json::Value::Null);
+            assert_eq!(encoded["bootId"], serde_json::Value::Null);
+            assert_eq!(encoded["baselineHash"], serde_json::Value::Null);
+            assert_eq!(encoded["intendedWitnessHash"], serde_json::Value::Null);
+            assert_eq!(encoded["stageName"], serde_json::Value::Null);
+            assert_eq!(encoded["unresolvedRetirement"], serde_json::Value::Null);
+            assert_eq!(encoded["state"], "owned");
+            assert_eq!(encoded["representation"], "symlink");
+            assert_eq!(encoded["appliedOperationGeneration"], 0);
+        }
+
+        #[test]
+        fn the_ledger_write_produces_exact_bytes() {
+            // every stamp that varies from run to run is fixed here, so the
+            // file is pinned byte for byte: schema first, records second,
+            // canonical keys sorted, record fields in declaration order, nulls
+            // emitted rather than omitted.
+            let dir = TestDir::new();
+            let state = state_with(&dir, None);
+            let mut ledger = LedgerState::load(&state).expect("load empty state");
+            let record = LedgerRecord {
+                destination: "/managed/value".to_owned(),
+                applied_artifact_target: "/nix/store/target".to_owned(),
+                managed_root: "/managed".to_owned(),
+                applied_by: "new".to_owned(),
+                applied_generation: None,
+                last_successful_reload: ReloadEvidence {
+                    invocation_id: None,
+                    monotonic_seconds: 0.0,
+                },
+                reload_action_identity: None,
+                boot_id: None,
+                state: STATE_OWNED.to_owned(),
+                representation: WRITABLE_REPRESENTATION.to_owned(),
+                // Opaque serialization token, not a claimed content digest;
+                // production writes it unchanged into both JSON fields.
+                baseline_hash: Some("a".repeat(64)),
+                intended_witness_hash: Some("a".repeat(64)),
+                applied_operation_generation: 0,
+                stage_name: None,
+                unresolved_retirement: None,
+            };
+            ledger
+                .commit("test:/managed/value", record)
+                .expect("commit");
+            let bytes = fs::read(state.join(LEDGER_FILE_NAME)).expect("read ledger file");
+            let expected = "{\"schemaVersion\":2,\"records\":{\"test:/managed/value\":{\"destination\":\"/managed/value\",\"appliedArtifactTarget\":\"/nix/store/target\",\"managedRoot\":\"/managed\",\"appliedBy\":\"new\",\"appliedGeneration\":null,\"lastSuccessfulReload\":{\"invocationId\":null,\"monotonicSeconds\":0.0},\"reloadActionIdentity\":null,\"bootId\":null,\"state\":\"owned\",\"representation\":\"writable\",\"baselineHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"intendedWitnessHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"appliedOperationGeneration\":0,\"stageName\":null,\"unresolvedRetirement\":null}}}";
+            assert_eq!(String::from_utf8(bytes).expect("utf8"), expected);
+        }
+
+        #[test]
+        fn run_identity_links_every_record_to_the_current_system_generation() {
+            let identity = RunIdentity::observe();
+            let entry = sample_entry("/managed", "/managed/value", "/desired/target");
+            let record = identity.record(&entry, "new");
+            let expected = fs::read_link("/run/current-system")
+                .ok()
+                .map(|path| path.to_string_lossy().into_owned());
+            assert_eq!(record.applied_generation, expected);
+        }
+
+        #[test]
+        fn a_migrated_v1_record_carries_no_witness() {
+            let dir = TestDir::new();
+            let original = concat!(
+                "{\"schemaVersion\":1,\"records\":{\"test:/tmp/value\":{",
+                "\"destination\":\"/tmp/value\",",
+                "\"appliedArtifactTarget\":\"/nix/store/example\",",
+                "\"managedRoot\":\"/tmp\",\"appliedBy\":\"new\",",
+                "\"appliedGeneration\":null,",
+                "\"lastSuccessfulReload\":{\"invocationId\":null,\"monotonicSeconds\":0.0},",
+                "\"reloadActionIdentity\":null,\"bootId\":null}}}"
+            );
+            let state = state_with(&dir, Some(original));
+            let ledger = LedgerState::load(&state).expect("v1 migrates");
+            let record = ledger.record("test:/tmp/value").expect("migrated record");
+            // the v1 writer had no witness to carry, so the field deserializes
+            // to its default and stays absent until a reconciliation writes one.
+            assert!(record.intended_witness_hash.is_none());
+        }
+
+        #[test]
+        fn a_record_planted_before_any_publish_carries_no_witness() {
+            let dir = TestDir::new();
+            let mut ledger = test_ledger(&dir);
+            let target = dir.path().join("target");
+            fs::write(&target, b"linked").expect("create link target");
+            let entry = sample_entry(
+                dir.path().to_str().unwrap(),
+                dir.path().join("value").to_str().unwrap(),
+                target.to_str().unwrap(),
+            );
+            record_ownership(&mut ledger, &entry, target.to_str().unwrap());
+            let record = committed(&ledger, &entry);
+            assert!(record.intended_witness_hash.is_none());
+            assert!(record.baseline_hash.is_none());
+        }
+    }
+
+    // publish_exchange verifies both sides after the rename: the destination
+    // must hold the expected link and the stage must hold the recorded one.
+    // the crash rows downstream turn on exactly this, so each refusal gets
+    // its own pin here.
+    mod publish_mechanics_pins {
+        use super::*;
+
+        #[test]
+        fn an_exchange_refuses_to_displace_other_than_the_recorded_target() {
+            let dir = TestDir::new();
+            let (parent, name) = dir.entry_parent("value");
+            fs::write(dir.path().join("stage"), b"staged").expect("plant stage");
+            let recorded = dir.path().join("recorded-target");
+            let failure = publish_exchange(
+                &parent,
+                &name,
+                OsStr::new("stage"),
+                "/dest",
+                OsStr::new("/expected"),
+                recorded.as_os_str(),
+            )
+            .expect_err("a nameless destination cannot be exchanged");
+            assert!(matches!(failure.key, CodeKey::PublishRace));
+            assert_eq!(failure.operation, Some("renameat2-exchange-publish"));
+            assert_eq!(failure.errno, Some(Errno::NOENT.raw_os_error()));
+            // a failed exchange removes the unpublished stage and orphans
+            // nothing; only a landed exchange followed by a crash can leave
+            // the displaced link behind forever (defect candidate [D]).
+            assert!(!dir.path().join("stage").exists());
+        }
+
+        #[test]
+        fn an_exchange_requires_the_displaced_object_to_equal_the_recorded_target() {
+            let dir = TestDir::new();
+            let (parent, name) = dir.entry_parent("value");
+            let recorded = dir.path().join("recorded-target");
+            symlink(&recorded, dir.path().join("value")).expect("plant recorded destination");
+            let expected = dir.path().join("expected-target");
+            symlink(&expected, dir.path().join("stage")).expect("plant staged link");
+            let failure = publish_exchange(
+                &parent,
+                &name,
+                OsStr::new("stage"),
+                "/dest",
+                expected.as_os_str(),
+                OsStr::new("/somewhere/else"),
+            )
+            .expect_err("the displaced link must equal the recorded target");
+            assert!(matches!(failure.key, CodeKey::RepairVerification));
+            // both sides were exchanged and the verification refused after, so
+            // the destination now holds the staged link.
+            assert_eq!(fs::read_link(dir.path().join("value")).unwrap(), expected);
+        }
+
+        #[test]
+        fn an_exchange_requires_the_published_side_to_equal_the_expected_target() {
+            let dir = TestDir::new();
+            let (parent, name) = dir.entry_parent("value");
+            let recorded = dir.path().join("recorded-target");
+            symlink(&recorded, dir.path().join("value")).expect("plant recorded destination");
+            let staged = dir.path().join("staged-target");
+            symlink(&staged, dir.path().join("stage")).expect("plant staged link");
+            let failure = publish_exchange(
+                &parent,
+                &name,
+                OsStr::new("stage"),
+                "/dest",
+                OsStr::new("/expected-elsewhere"),
+                recorded.as_os_str(),
+            )
+            .expect_err("the published link must equal the expected target");
+            assert!(matches!(failure.key, CodeKey::RepairVerification));
+            // the exchange happened before the refusal, so the recorded link
+            // now sits at the stage name.
+            assert_eq!(fs::read_link(dir.path().join("stage")).unwrap(), recorded);
+        }
+    }
+
+    // a backward restatement owes the witness reading of the representation it
+    // restates, and a record that cannot produce that reading is refused
+    // rather than reinterpreted.
+    mod transition_pins {
+        use super::*;
+
+        #[test]
+        fn a_writable_backward_restatement_requires_a_recorded_baseline() {
+            let dir = TestDir::new();
+            fs::write(dir.path().join("value"), b"writable bytes\n")
+                .expect("plant writable destination");
+            let entry = sample_entry(
+                dir.path().to_str().unwrap(),
+                dir.path().join("value").to_str().unwrap(),
+                "/nix/store/target",
+            );
+            let mut ledger = test_ledger(&dir);
+            plant_record(
+                &mut ledger,
+                &entry,
+                STATE_PENDING,
+                TRANSITION_MARKER,
+                NATIVE_REPRESENTATION,
+                "/nix/store/target",
+                None,
+                Some(&sha256_hex("/nix/store/target".as_bytes())),
+                Some(".furnish.test.stage"),
+            );
+            let failure = recover_pending(&entry, &mut ledger, &RunIdentity::observe())
+                .expect_err("restating writable without a baseline is refused");
+            assert!(matches!(failure.key, CodeKey::TransitionRefused));
+            assert_eq!(
+                failure.message,
+                "refusing to restate a writable destination with no recorded baseline"
+            );
+            assert_eq!(committed(&ledger, &entry).state, STATE_PENDING);
+        }
+
+        #[test]
+        fn an_ungated_pending_representation_is_refused() {
+            let dir = TestDir::new();
+            let entry = sample_entry(
+                dir.path().to_str().unwrap(),
+                dir.path().join("value").to_str().unwrap(),
+                "/nix/store/target",
+            );
+            let mut ledger = test_ledger(&dir);
+            plant_record(
+                &mut ledger,
+                &entry,
+                STATE_PENDING,
+                TRANSITION_MARKER,
+                "bogus",
+                "/nix/store/target",
+                None,
+                None,
+                Some(".furnish.test.stage"),
+            );
+            let failure = recover_pending(&entry, &mut ledger, &RunIdentity::observe())
+                .expect_err("an ungated representation is refused");
+            assert!(matches!(failure.key, CodeKey::TransitionRefused));
+            assert_eq!(
+                failure.message,
+                "pending transition names a representation pair that is not gated"
+            );
+            assert_eq!(committed(&ledger, &entry).state, STATE_PENDING);
+        }
+
+        #[test]
+        fn a_pending_transition_without_a_stage_name_is_refused() {
+            let dir = TestDir::new();
+            let entry = sample_entry(
+                dir.path().to_str().unwrap(),
+                dir.path().join("value").to_str().unwrap(),
+                "/nix/store/target",
+            );
+            let mut ledger = test_ledger(&dir);
+            plant_record(
+                &mut ledger,
+                &entry,
+                STATE_PENDING,
+                TRANSITION_MARKER,
+                NATIVE_REPRESENTATION,
+                "/nix/store/target",
+                None,
+                Some(&sha256_hex("/nix/store/target".as_bytes())),
+                None,
+            );
+            let failure = recover_pending(&entry, &mut ledger, &RunIdentity::observe())
+                .expect_err("a stageless transition record is refused");
+            assert!(matches!(failure.key, CodeKey::TransitionRefused));
+            assert_eq!(
+                failure.message,
+                "pending transition record carries no staging name"
+            );
+            assert_eq!(committed(&ledger, &entry).state, STATE_PENDING);
+        }
+    }
+
+    // the recovery and update halves the required crash rows turn on, driven
+    // against planted state the way the rest of the suite drives them.
+    mod recovery_pins {
+        use super::*;
+
+        #[test]
+        fn recovery_restamps_a_completed_publish_with_a_prior_record() {
+            let dir = TestDir::new();
+            let source = write_source(&dir, "source", "payload\n");
+            let destination = plant_destination(&dir, "value", "payload\n");
+            let intended = sha256_hex(b"payload\n");
+            let entry = sample_writable_entry(
+                dir.path().to_str().unwrap(),
+                destination.to_str().unwrap(),
+                &source,
+            );
+            let mut ledger = test_ledger(&dir);
+            plant_record(
+                &mut ledger,
+                &entry,
+                STATE_PENDING,
+                "update",
+                WRITABLE_REPRESENTATION,
+                &source,
+                Some(&sha256_hex(b"older\n")),
+                Some(&intended),
+                Some(".furnish.test.stage"),
+            );
+            plant_generation(&mut ledger, &entry, PLANTED_GENERATION);
+            recover_pending(&entry, &mut ledger, &RunIdentity::observe())
+                .expect("recovery converges");
+            let record = committed(&ledger, &entry);
+            assert_eq!(record.state, STATE_OWNED);
+            assert_eq!(record.applied_by, "update");
+            assert_eq!(record.applied_operation_generation, PLANTED_GENERATION + 1);
+            assert_eq!(record.baseline_hash.as_deref(), Some(intended.as_str()));
+            assert!(record.stage_name.is_none());
+            // the reload evidence and the generation stamp describe the run
+            // that committed the recovery, not the run that wrote the pending.
+            assert!(record.last_successful_reload.monotonic_seconds > 0.0);
+            let generation = fs::read_link("/run/current-system")
+                .ok()
+                .map(|path| path.to_string_lossy().into_owned());
+            assert_eq!(record.applied_generation, generation);
+        }
+
+        #[test]
+        fn a_stale_pending_record_converges_and_is_carried_forward_by_the_same_run() {
+            let dir = TestDir::new();
+            let source = write_source(&dir, "source", "new payload\n");
+            let destination = plant_destination(&dir, "value", "old payload\n");
+            let old_intended = sha256_hex(b"old payload\n");
+            let mut entry = sample_writable_entry(
+                dir.path().to_str().unwrap(),
+                destination.to_str().unwrap(),
+                &source,
+            );
+            entry.authority.scope = "user".to_owned();
+            let mut ledger = test_ledger(&dir);
+            plant_record(
+                &mut ledger,
+                &entry,
+                STATE_PENDING,
+                "new",
+                WRITABLE_REPRESENTATION,
+                &source,
+                None,
+                Some(&old_intended),
+                Some(".furnish.test.stage"),
+            );
+            plant_generation(&mut ledger, &entry, PLANTED_GENERATION);
+            let failure = reconcile_entry(
+                &entry,
+                Path::new("/nonexistent/setpriv"),
+                0,
+                &mut ledger,
+                &RunIdentity::observe(),
+            )
+            .expect_err("staging cannot run inside the test process");
+            assert!(matches!(failure.key, CodeKey::ExecutorFailed));
+            let record = committed(&ledger, &entry);
+            // recovery and reconciliation are two recorded steps: the recovery
+            // landed owned at the old source, and the ordinary path is now
+            // pending an update toward the current one.
+            assert_eq!(record.state, STATE_PENDING);
+            assert_eq!(record.applied_by, "update");
+            assert_eq!(
+                record.intended_witness_hash.as_deref(),
+                Some(sha256_hex(b"new payload\n").as_str())
+            );
+            assert_eq!(record.baseline_hash.as_deref(), Some(old_intended.as_str()));
+            assert_eq!(record.applied_operation_generation, PLANTED_GENERATION + 1);
+            assert_eq!(fs::read_to_string(&destination).unwrap(), "old payload\n");
+        }
+
+        #[test]
+        fn an_update_death_before_publication_retires_the_pending_record_and_keeps_the_bytes() {
+            let dir = TestDir::new();
+            let source = write_source(&dir, "source", "new payload\n");
+            let destination = plant_destination(&dir, "value", "old payload\n");
+            let entry = sample_writable_entry(
+                dir.path().to_str().unwrap(),
+                destination.to_str().unwrap(),
+                &source,
+            );
+            let mut ledger = test_ledger(&dir);
+            plant_record(
+                &mut ledger,
+                &entry,
+                STATE_PENDING,
+                "update",
+                WRITABLE_REPRESENTATION,
+                &source,
+                Some(&sha256_hex(b"old payload\n")),
+                Some(&sha256_hex(b"new payload\n")),
+                Some(".furnish.test.stage"),
+            );
+            recover_pending(&entry, &mut ledger, &RunIdentity::observe())
+                .expect("recovery converges");
+            // the destination was not authored by the pending record, so the
+            // record is cleared and the bytes are left exactly as found.
+            assert!(
+                ledger
+                    .record(&entry.filesystem_identity.canonical)
+                    .is_none()
+            );
+            assert_eq!(fs::read_to_string(&destination).unwrap(), "old payload\n");
+        }
+    }
+
+    // the writable rows whose route choice is the behavior: the ordinary
+    // update that never consults the policy, and the two refusals that fire
+    // before any policy could matter.
+    mod update_route_pins {
+        use super::*;
+
+        #[test]
+        fn an_ordinary_update_publishes_without_consulting_the_conflict_policy() {
+            // the destination is still exactly the baseline and only the
+            // source moved, so the policy is never read. setting it to error
+            // is what proves that: the route still publishes.
+            let dir = TestDir::new();
+            let source = write_source(&dir, "source", "second\n");
+            let destination = plant_destination(&dir, "value", "first\n");
+            let baseline = sha256_hex(b"first\n");
+            let mut entry = sample_writable_entry(
+                dir.path().to_str().unwrap(),
+                destination.to_str().unwrap(),
+                &source,
+            );
+            entry.on_conflict = ConflictPolicy::Error;
+            entry.authority.scope = "user".to_owned();
+            let mut ledger = test_ledger(&dir);
+            plant_record(
+                &mut ledger,
+                &entry,
+                STATE_OWNED,
+                "new",
+                WRITABLE_REPRESENTATION,
+                &source,
+                Some(&baseline),
+                Some(&baseline),
+                None,
+            );
+            let failure = reconcile_writable_at(
+                &entry,
+                Path::new("/nonexistent/setpriv"),
+                0,
+                &mut ledger,
+                &RunIdentity::observe(),
+            )
+            .expect_err("staging cannot run inside the test process");
+            assert!(matches!(failure.key, CodeKey::ExecutorFailed));
+            let record = committed(&ledger, &entry);
+            assert_eq!(record.state, STATE_PENDING);
+            assert_eq!(record.applied_by, "update");
+            assert_eq!(
+                record.intended_witness_hash.as_deref(),
+                Some(sha256_hex(b"second\n").as_str())
+            );
+            assert_eq!(record.baseline_hash.as_deref(), Some(baseline.as_str()));
+            assert_eq!(fs::read_to_string(&destination).unwrap(), "first\n");
+        }
+
+        #[test]
+        fn a_writable_destination_without_a_recorded_baseline_is_refused_under_every_policy() {
+            let dir = TestDir::new();
+            let source = write_source(&dir, "source", "declared\n");
+            let destination = plant_destination(&dir, "value", "bytes\n");
+            let mut entry = sample_writable_entry(
+                dir.path().to_str().unwrap(),
+                destination.to_str().unwrap(),
+                &source,
+            );
+            entry.on_conflict = ConflictPolicy::SourceWins;
+            let mut ledger = test_ledger(&dir);
+            plant_record(
+                &mut ledger,
+                &entry,
+                STATE_OWNED,
+                "new",
+                WRITABLE_REPRESENTATION,
+                &source,
+                None,
+                None,
+                None,
+            );
+            let failure = reconcile_writable_at(
+                &entry,
+                Path::new("/nonexistent/setpriv"),
+                0,
+                &mut ledger,
+                &RunIdentity::observe(),
+            )
+            .expect_err("a missing baseline refuses whichever policy is declared");
+            assert!(matches!(failure.key, CodeKey::ConflictingDestination));
+            assert_eq!(
+                failure.message,
+                "refusing to reconcile a writable destination with no recorded baseline"
+            );
+            assert_eq!(fs::read_to_string(&destination).unwrap(), "bytes\n");
+        }
+
+        #[test]
+        fn a_destination_that_is_not_a_regular_file_is_refused_before_any_hashing() {
+            let dir = TestDir::new();
+            let source = write_source(&dir, "source", "payload\n");
+            let target = dir.path().join("target");
+            fs::write(&target, b"live").expect("create link target");
+            let destination = dir.path().join("value");
+            symlink(&target, &destination).expect("plant symlink at the destination");
+            let entry = sample_writable_entry(
+                dir.path().to_str().unwrap(),
+                destination.to_str().unwrap(),
+                &source,
+            );
+            let mut ledger = test_ledger(&dir);
+            let baseline = sha256_hex(b"payload\n");
+            plant_record(
+                &mut ledger,
+                &entry,
+                STATE_OWNED,
+                "new",
+                WRITABLE_REPRESENTATION,
+                &source,
+                Some(&baseline),
+                Some(&baseline),
+                None,
+            );
+            let failure = reconcile_writable_at(
+                &entry,
+                Path::new("/nonexistent/setpriv"),
+                0,
+                &mut ledger,
+                &RunIdentity::observe(),
+            )
+            .expect_err("a non-regular destination is refused");
+            assert!(matches!(failure.key, CodeKey::ConflictingDestination));
+            assert_eq!(
+                failure.message,
+                "refusing a destination that is not a regular file"
+            );
+            assert_eq!(fs::read_link(&destination).unwrap(), target);
+        }
+    }
+
+    // the crash boundaries the binary fault rows reproduce with real process
+    // deaths, planted here directly so the convergence is pinned even where
+    // no fault point exists.
+    mod crash_boundary_pins {
+        use super::*;
+
+        #[test]
+        fn an_update_death_with_edited_displaced_bytes_restores_and_refuses() {
+            let dir = TestDir::new();
+            let source = write_source(&dir, "source", "new payload\n");
+            let destination = plant_destination(&dir, "value", "new payload\n");
+            let stage = ".furnish.test.stage";
+            fs::write(dir.path().join(stage), "the user edited this\n")
+                .expect("plant edited displaced file");
+            let entry = sample_writable_entry(
+                dir.path().to_str().unwrap(),
+                destination.to_str().unwrap(),
+                &source,
+            );
+            let mut ledger = test_ledger(&dir);
+            plant_record(
+                &mut ledger,
+                &entry,
+                STATE_PENDING,
+                "update",
+                WRITABLE_REPRESENTATION,
+                &source,
+                Some(&sha256_hex(b"old payload\n")),
+                Some(&sha256_hex(b"new payload\n")),
+                Some(stage),
+            );
+            let failure = recover_pending(&entry, &mut ledger, &RunIdentity::observe())
+                .expect_err("edited displaced bytes reverse the exchange");
+            assert!(matches!(failure.key, CodeKey::PendingRecovery));
+            // the edited bytes are back at the destination and the published
+            // content, which is furnish's own, is removed with the stage.
+            assert_eq!(
+                fs::read_to_string(&destination).unwrap(),
+                "the user edited this\n"
+            );
+            assert!(!dir.path().join(stage).exists());
+            let record = committed(&ledger, &entry);
+            assert_eq!(record.state, STATE_OWNED);
+            assert_eq!(
+                record.baseline_hash.as_deref(),
+                Some(sha256_hex(b"old payload\n").as_str())
+            );
+            assert_eq!(
+                record.intended_witness_hash.as_deref(),
+                Some(sha256_hex(b"old payload\n").as_str())
+            );
+        }
+
+        #[test]
+        fn a_retired_pending_record_turns_ownership_into_a_conflict() {
+            // the full arc of a writable update death before publication:
+            // recovery retires the unauthored pending record, and the same
+            // run's ordinary path then sees an occupied destination with no
+            // record and refuses to adopt it.
+            let dir = TestDir::new();
+            let source = write_source(&dir, "source", "new payload\n");
+            let destination = plant_destination(&dir, "value", "old payload\n");
+            let mut entry = sample_writable_entry(
+                dir.path().to_str().unwrap(),
+                destination.to_str().unwrap(),
+                &source,
+            );
+            entry.authority.scope = "user".to_owned();
+            let mut ledger = test_ledger(&dir);
+            plant_record(
+                &mut ledger,
+                &entry,
+                STATE_PENDING,
+                "update",
+                WRITABLE_REPRESENTATION,
+                &source,
+                Some(&sha256_hex(b"old payload\n")),
+                Some(&sha256_hex(b"new payload\n")),
+                Some(".furnish.test.stage"),
+            );
+            let failure = reconcile_entry(
+                &entry,
+                Path::new("/nonexistent/setpriv"),
+                0,
+                &mut ledger,
+                &RunIdentity::observe(),
+            )
+            .expect_err("a retired pending record leaves no ownership to publish over");
+            assert!(matches!(failure.key, CodeKey::ConflictingDestination));
+            assert!(
+                ledger
+                    .record(&entry.filesystem_identity.canonical)
+                    .is_none()
+            );
+            assert_eq!(fs::read_to_string(&destination).unwrap(), "old payload\n");
+        }
+
+        #[test]
+        fn a_landed_exchange_converges_as_a_steady_state_and_restamps_the_record() {
+            // the owned-symlink death that no fault point can reach: the
+            // exchange has landed, the ledger still records the old target,
+            // and the next ordinary run sees a destination equal to the
+            // declaration, so it takes the steady-state branch and refreshes
+            // the record rather than refusing. nothing was ever pending, so
+            // the displaced link at the stage name is nobody's to clean.
+            let dir = TestDir::new();
+            let recorded_target = dir.path().join("recorded-target");
+            fs::write(&recorded_target, b"live").expect("create recorded target");
+            let desired_target = dir.path().join("desired-target");
+            fs::write(&desired_target, b"desired").expect("create desired target");
+            let destination = dir.path().join("value");
+            symlink(&desired_target, &destination).expect("plant exchanged destination");
+            let orphan = dir.path().join(".furnish.9999.0.stage");
+            symlink(&recorded_target, &orphan).expect("plant orphaned displaced link");
+            let entry = sample_entry(
+                dir.path().to_str().unwrap(),
+                destination.to_str().unwrap(),
+                desired_target.to_str().unwrap(),
+            );
+            let mut ledger = test_ledger(&dir);
+            record_ownership(&mut ledger, &entry, recorded_target.to_str().unwrap());
+            reconcile_entry(
+                &entry,
+                Path::new("/nonexistent/setpriv"),
+                0,
+                &mut ledger,
+                &RunIdentity::observe(),
+            )
+            .expect("a destination equal to the declaration is a steady state");
+            assert_eq!(fs::read_link(&destination).unwrap(), desired_target);
+            let record = committed(&ledger, &entry);
+            // the record now names the target the crashed run published, while
+            // still crediting the branch the prior record carried.
+            assert_eq!(
+                record.applied_artifact_target,
+                desired_target.to_str().unwrap()
+            );
+            assert_eq!(record.applied_by, "new");
+            assert_eq!(record.state, STATE_OWNED);
+            assert!(fs::symlink_metadata(&orphan).is_ok());
+        }
+
+        #[test]
+        fn a_mismatched_displaced_hash_reverses_the_exchange() {
+            // the displaced bytes are re-hashed after the exchange and a
+            // mismatch reverses it, returning both sides to their pre-exchange
+            // state before the race is reported. the reverse's own result is
+            // discarded, so only the successful reverse is observable here.
+            let dir = TestDir::new();
+            let (parent, name) = dir.entry_parent("value");
+            fs::write(dir.path().join("value"), "original\n").expect("plant destination");
+            fs::write(dir.path().join("stage"), "staged\n").expect("plant stage");
+            let failure = publish_writable_exchange(
+                &parent,
+                &name,
+                OsStr::new("stage"),
+                "/dest",
+                sha256_hex(b"different\n").as_str(),
+                sha256_hex(b"staged\n").as_str(),
+            )
+            .expect_err("a displaced mismatch reverses the exchange");
+            assert!(matches!(failure.key, CodeKey::PublishRace));
+            assert_eq!(
+                failure.message,
+                "destination changed between observation and publication; exchange reversed"
+            );
+            assert_eq!(fs::read(dir.path().join("value")).unwrap(), b"original\n");
+            assert!(!dir.path().join("stage").exists());
         }
     }
 }
