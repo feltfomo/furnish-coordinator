@@ -200,6 +200,20 @@ fn fault_point(name: &str) {
 #[inline(always)]
 fn fault_point(_name: &str) {}
 
+#[cfg(feature = "fault-injection")]
+fn reverse_exchange_restore_fault() -> std::result::Result<(), Errno> {
+    if env::var("FURNISH_FAULT_POINT").ok().as_deref() == Some("reverse-exchange-restore-failed") {
+        return Err(Errno::IO);
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "fault-injection"))]
+#[inline(always)]
+fn reverse_exchange_restore_fault() -> std::result::Result<(), Errno> {
+    Ok(())
+}
+
 fn default_state() -> String {
     STATE_OWNED.to_owned()
 }
@@ -732,8 +746,37 @@ fn symlink_target<Fd: std::os::fd::AsFd>(
     }
 }
 
-fn remove_stage<Fd: std::os::fd::AsFd>(parent: Fd, stage: &OsStr) {
+fn remove_unpublished_stage<Fd: std::os::fd::AsFd>(parent: Fd, stage: &OsStr) {
     let _ = unlinkat(parent, stage, AtFlags::empty());
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_VERIFIED_DISPLACED_CLEANUP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn remove_verified_displaced<Fd: std::os::fd::AsFd>(
+    parent: Fd,
+    stage: &OsStr,
+    destination: &str,
+) -> Result<()> {
+    #[cfg(test)]
+    if FAIL_VERIFIED_DISPLACED_CLEANUP.with(|fault| fault.replace(false)) {
+        return Err(Failure::syscall(
+            CodeKey::FinalVerification,
+            destination,
+            "unlinkat-verified-displaced",
+            Errno::IO,
+        ));
+    }
+    unlinkat(parent, stage, AtFlags::empty()).map_err(|errno| {
+        Failure::syscall(
+            CodeKey::FinalVerification,
+            destination,
+            "unlinkat-verified-displaced",
+            errno,
+        )
+    })
 }
 
 fn stage_name(index: usize) -> OsString {
@@ -908,8 +951,69 @@ struct LedgerRecord {
     // bytes.
     #[serde(default)]
     stage_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prior_owned: Option<PriorOwned>,
     #[serde(default)]
     unresolved_retirement: Option<UnresolvedRetirement>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PriorOwned {
+    destination: String,
+    applied_artifact_target: String,
+    managed_root: String,
+    applied_by: String,
+    applied_generation: Option<String>,
+    last_successful_reload: ReloadEvidence,
+    reload_action_identity: Option<String>,
+    boot_id: Option<String>,
+    representation: String,
+    baseline_hash: Option<String>,
+    intended_witness_hash: Option<String>,
+    applied_operation_generation: u64,
+    unresolved_retirement: Option<UnresolvedRetirement>,
+}
+
+impl PriorOwned {
+    fn capture(record: &LedgerRecord) -> Self {
+        Self {
+            destination: record.destination.clone(),
+            applied_artifact_target: record.applied_artifact_target.clone(),
+            managed_root: record.managed_root.clone(),
+            applied_by: record.applied_by.clone(),
+            applied_generation: record.applied_generation.clone(),
+            last_successful_reload: record.last_successful_reload.clone(),
+            reload_action_identity: record.reload_action_identity.clone(),
+            boot_id: record.boot_id.clone(),
+            representation: record.representation.clone(),
+            baseline_hash: record.baseline_hash.clone(),
+            intended_witness_hash: record.intended_witness_hash.clone(),
+            applied_operation_generation: record.applied_operation_generation,
+            unresolved_retirement: record.unresolved_retirement.clone(),
+        }
+    }
+
+    fn restore(&self) -> LedgerRecord {
+        LedgerRecord {
+            destination: self.destination.clone(),
+            applied_artifact_target: self.applied_artifact_target.clone(),
+            managed_root: self.managed_root.clone(),
+            applied_by: self.applied_by.clone(),
+            applied_generation: self.applied_generation.clone(),
+            last_successful_reload: self.last_successful_reload.clone(),
+            reload_action_identity: self.reload_action_identity.clone(),
+            boot_id: self.boot_id.clone(),
+            state: STATE_OWNED.to_owned(),
+            representation: self.representation.clone(),
+            baseline_hash: self.baseline_hash.clone(),
+            intended_witness_hash: self.intended_witness_hash.clone(),
+            applied_operation_generation: self.applied_operation_generation,
+            stage_name: None,
+            prior_owned: None,
+            unresolved_retirement: self.unresolved_retirement.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -979,6 +1083,7 @@ impl RunIdentity {
             intended_witness_hash: None,
             applied_operation_generation: 0,
             stage_name: None,
+            prior_owned: None,
             unresolved_retirement: None,
             applied_generation: self.system_generation.clone(),
             last_successful_reload: ReloadEvidence {
@@ -1134,6 +1239,7 @@ impl LedgerState {
                     record.state = STATE_OWNED.to_owned();
                     record.representation = NATIVE_REPRESENTATION.to_owned();
                     record.stage_name = None;
+                    record.prior_owned = None;
                     record.unresolved_retirement = None;
                 }
                 parsed.schema_version = LEDGER_SCHEMA_VERSION;
@@ -1219,7 +1325,7 @@ impl LedgerState {
                     &error,
                 )
             })?;
-        // OpenOptions::mode is masked by the ambient umask, so the mode above is
+        // openoptions mode is masked by the ambient umask, so the mode above is
         // a request, not a guarantee. it is set explicitly and asserted, since the
         // record has to be readable by the unprivileged verifier on every host,
         // not only on hosts whose umask happens to be 022.
@@ -1320,7 +1426,7 @@ fn stage_symlink(
     expected: &OsStr,
 ) -> Result<()> {
     let destination = &entry.filesystem_identity.destination;
-    remove_stage(parent, stage);
+    remove_unpublished_stage(parent, stage);
     let profile = profile_for(
         &entry.executor.identity,
         entry.executor.protocol_version,
@@ -1350,7 +1456,7 @@ fn stage_symlink(
         )
     })?;
     if staged.as_deref() != Some(expected) {
-        remove_stage(parent, stage);
+        remove_unpublished_stage(parent, stage);
         return Err(Failure::new(
             CodeKey::StagingVerification,
             destination,
@@ -1378,7 +1484,7 @@ fn publish_new(
         })?
         .is_some()
     {
-        remove_stage(parent, stage);
+        remove_unpublished_stage(parent, stage);
         return Err(Failure::new(
             CodeKey::PublishRace,
             destination,
@@ -1387,7 +1493,7 @@ fn publish_new(
     }
 
     if let Err(errno) = renameat_with(parent, stage, parent, name, RenameFlags::NOREPLACE) {
-        remove_stage(parent, stage);
+        remove_unpublished_stage(parent, stage);
         return Err(Failure::syscall(
             CodeKey::PublishRace,
             destination,
@@ -1427,7 +1533,7 @@ fn publish_exchange(
     recorded: &OsStr,
 ) -> Result<()> {
     if let Err(errno) = renameat_with(parent, stage, parent, name, RenameFlags::EXCHANGE) {
-        remove_stage(parent, stage);
+        remove_unpublished_stage(parent, stage);
         // ENOENT means the destination proved ownership of is no longer the thing
         // on disk. the proof is stale, so the next reconcile decides again from
         // observation. falling back to a create here would be publishing on
@@ -1439,6 +1545,7 @@ fn publish_exchange(
             errno,
         ));
     }
+    fault_point("exchange-published");
 
     // both sides, because an exchange that put the right link at the destination
     // while displacing something unidentified is not an accountable repair.
@@ -1470,7 +1577,10 @@ fn publish_exchange(
     // that was already reaped; under update it points at one that is still live
     // and still referenced by the generation that declared it. unlinking a
     // symlink never touches its pointee, so neither case destroys anything.
-    remove_stage(parent, stage);
+    remove_verified_displaced(parent, stage, destination)?;
+    fault_point("published");
+    sync_parent(parent, destination)?;
+    fault_point("published-synced");
     Ok(())
 }
 
@@ -1488,6 +1598,13 @@ enum RetireOutcome {
 
 fn retire_record(record: &LedgerRecord) -> Result<RetireOutcome> {
     let destination = &record.destination;
+    if record.state == STATE_PENDING {
+        return Err(Failure::new(
+            CodeKey::PendingRecovery,
+            destination,
+            "refusing to retire a pending transaction without its declaration; both transaction names are preserved",
+        ));
+    }
     let (parent, name) = open_parent(destination, &record.managed_root)?;
 
     if record.representation == WRITABLE_REPRESENTATION {
@@ -1589,7 +1706,7 @@ fn observe_mode(parent: &OwnedFd, name: &OsStr, destination: &str) -> Result<u32
     }
 }
 
-// NOFOLLOW throughout, so a symlink at the destination is never followed and
+// nofollow throughout, so a symlink at the destination is never followed and
 // never written through, and reading one is refused rather than resolved.
 fn read_regular(
     parent: &OwnedFd,
@@ -1674,6 +1791,7 @@ fn pending_record(
     if let Some(prior) = prior {
         record.baseline_hash = prior.baseline_hash.clone();
         record.applied_operation_generation = prior.applied_operation_generation;
+        record.prior_owned = Some(PriorOwned::capture(prior));
     }
     record
 }
@@ -1734,7 +1852,7 @@ fn stage_writable(
     intended_hash: &str,
 ) -> Result<()> {
     let destination = &entry.filesystem_identity.destination;
-    remove_stage(parent, stage);
+    remove_unpublished_stage(parent, stage);
     let profile = profile_for(
         &entry.executor.identity,
         entry.executor.protocol_version,
@@ -1757,7 +1875,7 @@ fn stage_writable(
     )?;
     fault_point("stage-written");
     if observe_kind(parent, stage, destination)? != Some(REGULAR_MODE) {
-        remove_stage(parent, stage);
+        remove_unpublished_stage(parent, stage);
         return Err(Failure::new(
             CodeKey::StagingVerification,
             destination,
@@ -1772,7 +1890,7 @@ fn stage_writable(
         "read-staging",
     )?;
     if staged_hash != intended_hash {
-        remove_stage(parent, stage);
+        remove_unpublished_stage(parent, stage);
         return Err(Failure::new(
             CodeKey::StagingVerification,
             destination,
@@ -1781,7 +1899,7 @@ fn stage_writable(
     }
     let mode = observe_mode(parent, stage, destination)?;
     if mode != WRITABLE_FILE_MODE {
-        remove_stage(parent, stage);
+        remove_unpublished_stage(parent, stage);
         return Err(Failure::new(
             CodeKey::StagingVerification,
             destination,
@@ -1803,7 +1921,7 @@ fn publish_writable_new(
 ) -> Result<()> {
     fault_point("stage-synced");
     if observe_kind(parent, name, destination)?.is_some() {
-        remove_stage(parent, stage);
+        remove_unpublished_stage(parent, stage);
         return Err(Failure::new(
             CodeKey::PublishRace,
             destination,
@@ -1811,7 +1929,7 @@ fn publish_writable_new(
         ));
     }
     if let Err(errno) = renameat_with(parent, stage, parent, name, RenameFlags::NOREPLACE) {
-        remove_stage(parent, stage);
+        remove_unpublished_stage(parent, stage);
         return Err(Failure::syscall(
             CodeKey::PublishRace,
             destination,
@@ -1879,6 +1997,82 @@ const TRANSITION_MARKER: &str = "transition";
 // publish_exchange, the symlink route, runs the same exchange but rechecks a
 // target string, because what it guards is a representation swap. this one
 // rechecks content, because what it guards is bytes a user may have edited.
+#[allow(clippy::result_large_err)]
+fn verify_writable_hash(
+    parent: &OwnedFd,
+    name: &OsStr,
+    destination: &str,
+    expected: &str,
+    operation: &'static str,
+) -> Result<()> {
+    if observe_kind(parent, name, destination)? != Some(REGULAR_MODE) {
+        return Err(Failure::new(
+            CodeKey::PendingRecovery,
+            destination,
+            "transaction side is not the recorded regular file",
+        ));
+    }
+    let observed = hash_regular(
+        parent,
+        name,
+        destination,
+        CodeKey::PendingRecovery,
+        operation,
+    )?;
+    if observed != expected {
+        return Err(Failure::new(
+            CodeKey::PendingRecovery,
+            destination,
+            "transaction side does not match its recorded witness",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn rollback_exchange(
+    parent: &OwnedFd,
+    name: &OsStr,
+    stage: &OsStr,
+    destination: &str,
+    prior_hash: &str,
+    intended_hash: &str,
+) -> Result<()> {
+    reverse_exchange_restore_fault().map_err(|errno| {
+        Failure::syscall(
+            CodeKey::PendingRecovery,
+            destination,
+            "renameat2-exchange-restore-pending",
+            errno,
+        )
+    })?;
+    renameat_with(parent, stage, parent, name, RenameFlags::EXCHANGE).map_err(|errno| {
+        Failure::syscall(
+            CodeKey::PendingRecovery,
+            destination,
+            "renameat2-exchange-restore-pending",
+            errno,
+        )
+    })?;
+    sync_parent(parent, destination)?;
+    verify_writable_hash(
+        parent,
+        name,
+        destination,
+        prior_hash,
+        "read-restored-destination",
+    )?;
+    verify_writable_hash(
+        parent,
+        stage,
+        destination,
+        intended_hash,
+        "read-restored-stage",
+    )?;
+    remove_unpublished_stage(parent, stage);
+    Ok(())
+}
+
 fn publish_writable_exchange(
     parent: &OwnedFd,
     name: &OsStr,
@@ -1889,7 +2083,7 @@ fn publish_writable_exchange(
 ) -> Result<()> {
     fault_point("stage-synced");
     if let Err(errno) = renameat_with(parent, stage, parent, name, RenameFlags::EXCHANGE) {
-        remove_stage(parent, stage);
+        remove_unpublished_stage(parent, stage);
         return Err(Failure::syscall(
             CodeKey::PublishRace,
             destination,
@@ -1909,10 +2103,14 @@ fn publish_writable_exchange(
         "read-displaced",
     )?;
     if displaced_hash != expected_displaced {
-        // exchange back to restore the original destination, then remove the
-        // stage. both sides return to their pre-exchange state.
-        let _ = renameat_with(parent, stage, parent, name, RenameFlags::EXCHANGE);
-        remove_stage(parent, stage);
+        rollback_exchange(
+            parent,
+            name,
+            stage,
+            destination,
+            &displaced_hash,
+            intended_hash,
+        )?;
         return Err(Failure::new(
             CodeKey::PublishRace,
             destination,
@@ -1921,7 +2119,7 @@ fn publish_writable_exchange(
     }
     // displaced content matched; the exchange is clean. remove the displaced
     // bytes from the stage path and sync the directory.
-    remove_stage(parent, stage);
+    remove_verified_displaced(parent, stage, destination)?;
     fault_point("published");
     sync_parent(parent, destination)?;
     fault_point("published-synced");
@@ -1987,13 +2185,10 @@ fn representation_of_kind(kind: u32) -> Option<&'static str> {
     }
 }
 
-// recovery replay. a pending record authorizes recovery only when destination,
-// intended source hash, and artifact identity all agree with it; anything else
-// is not authorship, so the record is cleared and the ordinary path decides
-// again from observation. authorship is not the end of it for a writable
-// update, because the object the exchange displaced can still be sitting at the
-// stage name holding a user edit, and that case is restored and refused here
-// rather than promoted.
+// recovery promotes a pending record only when the destination proves the
+// intended publication landed. otherwise it restores an exact prior-owned
+// snapshot when the prior representation is still present. a legacy record
+// that proves neither direction preserves every transaction name and fails.
 fn recover_pending(entry: &Entry, ledger: &mut LedgerState, identity: &RunIdentity) -> Result<()> {
     let canonical = &entry.filesystem_identity.canonical;
     let destination = &entry.filesystem_identity.destination;
@@ -2061,80 +2256,192 @@ fn recover_pending(entry: &Entry, ledger: &mut LedgerState, identity: &RunIdenti
             .as_deref()
             .and_then(|witness| baseline_for(&record.representation, witness));
         owned.stage_name = None;
+        owned.prior_owned = None;
         owned.applied_operation_generation = record.applied_operation_generation.saturating_add(1);
         // an exchange publish displaces the old destination to the stage name
-        // instead of consuming it, so a death between the exchange and the
-        // cleanup arrives here with the stage still populated. those bytes can
-        // be a user edit, so they are hashed against the baseline this record
-        // was pending against before anything unlinks them.
-        if let Some(stage) = stage.as_deref()
-            && observe_kind(&parent, stage, destination)? == Some(REGULAR_MODE)
-        {
-            let displaced_hash = hash_regular(
-                &parent,
-                stage,
-                destination,
-                CodeKey::PendingRecovery,
-                "read-displaced-pending",
-            )?;
-            if record.baseline_hash.as_deref() != Some(displaced_hash.as_str())
-                && entry.on_conflict != ConflictPolicy::SourceWins
-            {
-                // not what furnish wrote, and the declaration does not
-                // authorise discarding it, so the exchange is reversed and the
-                // edited bytes go back to the destination the user knows.
-                if let Err(errno) = renameat_with(
-                    &parent,
-                    stage,
-                    &parent,
-                    name.as_os_str(),
-                    RenameFlags::EXCHANGE,
-                ) {
-                    return Err(Failure::syscall(
+        // instead of consuming it, so recovery proves the displaced side from
+        // the exact prior snapshot before removing it.
+        if let Some(stage) = stage.as_deref() {
+            match observe_kind(&parent, stage, destination)? {
+                None => {}
+                Some(REGULAR_MODE) => {
+                    let displaced_hash = hash_regular(
+                        &parent,
+                        stage,
+                        destination,
+                        CodeKey::PendingRecovery,
+                        "read-displaced-pending",
+                    )?;
+                    if record.baseline_hash.as_deref() != Some(displaced_hash.as_str())
+                        && entry.on_conflict != ConflictPolicy::SourceWins
+                    {
+                        let Some(intended) = record.intended_witness_hash.as_deref() else {
+                            return Err(Failure::new(
+                                CodeKey::PendingRecovery,
+                                destination,
+                                "pending writable transaction carries no intended witness",
+                            ));
+                        };
+                        rollback_exchange(
+                            &parent,
+                            name.as_os_str(),
+                            stage,
+                            destination,
+                            &displaced_hash,
+                            intended,
+                        )?;
+                        let Some(prior) = record.prior_owned.as_ref() else {
+                            return Err(Failure::new(
+                                CodeKey::PendingRecovery,
+                                destination,
+                                "writable rollback completed but no prior owned snapshot exists",
+                            ));
+                        };
+                        ledger.commit(canonical, prior.restore())?;
+                        return Err(Failure::new(
+                            CodeKey::PendingRecovery,
+                            destination,
+                            "destination was edited while a writable update was publishing; the edited content was restored and the update was not recorded",
+                        ));
+                    }
+                    remove_verified_displaced(&parent, stage, destination)?;
+                }
+                Some(SYMLINK_MODE) => {
+                    let Some(prior) = record.prior_owned.as_ref() else {
+                        return Err(Failure::new(
+                            CodeKey::PendingRecovery,
+                            destination,
+                            "displaced symlink has no prior owned snapshot; both names are preserved",
+                        ));
+                    };
+                    if prior.representation != NATIVE_REPRESENTATION {
+                        return Err(Failure::new(
+                            CodeKey::PendingRecovery,
+                            destination,
+                            "displaced symlink does not match the prior representation; both names are preserved",
+                        ));
+                    }
+                    let displaced = symlink_target(&parent, stage).map_err(|errno| {
+                        Failure::syscall(
+                            CodeKey::PendingRecovery,
+                            destination,
+                            "readlinkat-displaced-pending",
+                            errno,
+                        )
+                    })?;
+                    if displaced.as_deref() != Some(OsStr::new(&prior.applied_artifact_target)) {
+                        return Err(Failure::new(
+                            CodeKey::PendingRecovery,
+                            destination,
+                            "displaced symlink does not match prior ownership; both names are preserved",
+                        ));
+                    }
+                    remove_verified_displaced(&parent, stage, destination)?;
+                }
+                Some(_) => {
+                    return Err(Failure::new(
                         CodeKey::PendingRecovery,
                         destination,
-                        "renameat2-exchange-restore-pending",
-                        errno,
+                        "displaced transaction side has an unowned representation; both names are preserved",
                     ));
                 }
-                sync_parent(&parent, destination)?;
-                // what sits at the stage name now is the content this run
-                // published, which is ours and holds nothing of the user's.
-                remove_stage(&parent, stage);
-                // backward convergence, so the owned state the ledger already
-                // describes is restated rather than advanced. that leaves the
-                // destination off both its baseline and the source, which is
-                // exactly the state the declaration's policy exists to decide,
-                // so the next run decides it there instead of here. the witness
-                // is restated with it, because on a writable owned record the
-                // witness is the baseline, and the one this pending record
-                // carries is the source that never landed.
-                let mut restored = record.clone();
-                restored.state = STATE_OWNED.to_owned();
-                restored.intended_witness_hash = record.baseline_hash.clone();
-                restored.stage_name = None;
-                ledger.commit(canonical, restored)?;
-                return Err(Failure::new(
-                    CodeKey::PendingRecovery,
-                    destination,
-                    "destination was edited while a writable update was publishing; the edited content was restored and the update was not recorded",
-                ));
             }
-            remove_stage(&parent, stage);
         }
         ledger.commit(canonical, owned)?;
         return Ok(());
     }
 
-    // not ours. the staged object is content this coordinator wrote and never
-    // published, so removing it destroys nothing a user could have edited.
-    if observed.is_none()
-        && let Some(stage) = stage.as_deref()
-    {
-        remove_stage(&parent, stage);
+    if let Some(prior) = record.prior_owned.as_ref() {
+        let prior_kind = observed.and_then(representation_of_kind);
+        if prior_kind != Some(prior.representation.as_str()) {
+            return Err(Failure::new(
+                CodeKey::PendingRecovery,
+                destination,
+                "pending transaction is neither forward-complete nor at its prior owned representation; both names are preserved",
+            ));
+        }
+        if prior.representation == NATIVE_REPRESENTATION {
+            let target = symlink_target(&parent, &name).map_err(|errno| {
+                Failure::syscall(
+                    CodeKey::PendingRecovery,
+                    destination,
+                    "readlinkat-prior-owned",
+                    errno,
+                )
+            })?;
+            if target.as_deref() != Some(OsStr::new(&prior.applied_artifact_target)) {
+                return Err(Failure::new(
+                    CodeKey::PendingRecovery,
+                    destination,
+                    "pending transaction does not match its prior owned symlink; both names are preserved",
+                ));
+            }
+        } else if prior.representation == WRITABLE_REPRESENTATION {
+            let Some(baseline) = prior.baseline_hash.as_deref() else {
+                return Err(Failure::new(
+                    CodeKey::PendingRecovery,
+                    destination,
+                    "prior writable ownership carries no baseline; both names are preserved",
+                ));
+            };
+            verify_writable_hash(&parent, &name, destination, baseline, "read-prior-owned")?;
+        }
+        if let Some(stage) = stage.as_deref()
+            && observe_kind(&parent, stage, destination)?.is_some()
+        {
+            let Some(intended) = record.intended_witness_hash.as_deref() else {
+                return Err(Failure::new(
+                    CodeKey::PendingRecovery,
+                    destination,
+                    "pending transaction carries no intended witness; both names are preserved",
+                ));
+            };
+            if record.representation == WRITABLE_REPRESENTATION {
+                verify_writable_hash(
+                    &parent,
+                    stage,
+                    destination,
+                    intended,
+                    "read-unpublished-pending",
+                )?;
+            }
+            remove_unpublished_stage(&parent, stage);
+        }
+        ledger.commit(canonical, prior.restore())?;
+        return Ok(());
     }
-    ledger.retire(canonical)?;
-    Ok(())
+
+    if observed.is_none() {
+        if let Some(stage) = stage.as_deref()
+            && observe_kind(&parent, stage, destination)?.is_some()
+        {
+            let Some(intended) = record.intended_witness_hash.as_deref() else {
+                return Err(Failure::new(
+                    CodeKey::PendingRecovery,
+                    destination,
+                    "pending acquisition carries no intended witness; the stage is preserved",
+                ));
+            };
+            if record.representation == WRITABLE_REPRESENTATION {
+                verify_writable_hash(
+                    &parent,
+                    stage,
+                    destination,
+                    intended,
+                    "read-unpublished-acquisition",
+                )?;
+            }
+            remove_unpublished_stage(&parent, stage);
+        }
+        ledger.retire(canonical)?;
+        return Ok(());
+    }
+
+    Err(Failure::new(
+        CodeKey::PendingRecovery,
+        destination,
+        "pending transaction has no prior owned snapshot and cannot converge backward; both names are preserved",
+    ))
 }
 
 // recovery for a crash between the exchange and the ledger advancing. the
@@ -2142,7 +2449,7 @@ fn recover_pending(entry: &Entry, ledger: &mut LedgerState, identity: &RunIdenti
 // sits at the stage name; for a writable source that displaced object may hold
 // edited user bytes, so it is never unlinked without being hashed against the
 // baseline first.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
 fn recover_transition(
     entry: &Entry,
     ledger: &mut LedgerState,
@@ -2172,39 +2479,91 @@ fn recover_transition(
         )
     })?;
 
-    // the exchange never happened, so the destination is still what it was and
-    // this converges backward by restating the record the ledger already holds.
+    // the exchange never happened, so the destination must still prove the
+    // exact prior-owned representation before its staged scratch is removed.
     if observed_representation == Some(source_representation) {
-        if observe_kind(parent, &stage, destination)?.is_some() {
-            remove_stage(parent, &stage);
+        let Some(prior) = record.prior_owned.as_ref() else {
+            return Err(Failure::new(
+                CodeKey::TransitionRefused,
+                destination,
+                "pending transition has no prior owned snapshot; both names are preserved",
+            ));
+        };
+        if prior.representation != source_representation {
+            return Err(Failure::new(
+                CodeKey::TransitionRefused,
+                destination,
+                "pending transition prior snapshot names a different representation; both names are preserved",
+            ));
         }
-        // the witness reading is fixed by the representation, and this restates
-        // the representation, so carrying the pending witness across would leave
-        // a target hash on a writable record or a content hash on a symlink one.
-        // a writable record's witness is its own baseline; a symlink record's is
-        // the hash of the target it is recorded as pointing at, which the pending
-        // record carried forward for exactly this. the baseline is derived from
-        // the same representation rather than left as it stands, because a record
-        // this file did not write can carry one where the schema forbids it.
-        let witness = if source_representation == WRITABLE_REPRESENTATION {
-            let Some(baseline) = record.baseline_hash.clone() else {
+        if source_representation == WRITABLE_REPRESENTATION {
+            let Some(baseline) = prior.baseline_hash.as_deref() else {
                 return Err(Failure::new(
                     CodeKey::TransitionRefused,
                     destination,
-                    "refusing to restate a writable destination with no recorded baseline",
+                    "prior writable ownership carries no baseline; both names are preserved",
                 ));
             };
-            baseline
+            verify_writable_hash(
+                parent,
+                name,
+                destination,
+                baseline,
+                "read-prior-owned-transition",
+            )?;
         } else {
-            sha256_hex(record.applied_artifact_target.as_bytes())
-        };
-        let mut owned = record.clone();
-        owned.state = STATE_OWNED.to_owned();
-        owned.representation = source_representation.to_owned();
-        owned.baseline_hash = baseline_for(source_representation, &witness);
-        owned.intended_witness_hash = Some(witness);
-        owned.stage_name = None;
-        ledger.commit(canonical, owned)?;
+            let target = symlink_target(parent, name).map_err(|errno| {
+                Failure::syscall(
+                    CodeKey::TransitionRefused,
+                    destination,
+                    "readlinkat-prior-owned-transition",
+                    errno,
+                )
+            })?;
+            if target.as_deref() != Some(OsStr::new(&prior.applied_artifact_target)) {
+                return Err(Failure::new(
+                    CodeKey::TransitionRefused,
+                    destination,
+                    "destination does not match prior symlink ownership; both names are preserved",
+                ));
+            }
+        }
+        if observe_kind(parent, &stage, destination)?.is_some() {
+            if target_representation == WRITABLE_REPRESENTATION {
+                let Some(intended) = record.intended_witness_hash.as_deref() else {
+                    return Err(Failure::new(
+                        CodeKey::TransitionRefused,
+                        destination,
+                        "pending transition carries no intended witness; both names are preserved",
+                    ));
+                };
+                verify_writable_hash(
+                    parent,
+                    &stage,
+                    destination,
+                    intended,
+                    "read-unpublished-transition",
+                )?;
+            } else {
+                let target = symlink_target(parent, &stage).map_err(|errno| {
+                    Failure::syscall(
+                        CodeKey::TransitionRefused,
+                        destination,
+                        "readlinkat-unpublished-transition",
+                        errno,
+                    )
+                })?;
+                if target.as_deref() != Some(OsStr::new(&record.applied_artifact_target)) {
+                    return Err(Failure::new(
+                        CodeKey::TransitionRefused,
+                        destination,
+                        "staged transition does not match its intended symlink; both names are preserved",
+                    ));
+                }
+            }
+            remove_unpublished_stage(parent, &stage);
+        }
+        ledger.commit(canonical, prior.restore())?;
         return Ok(());
     }
 
@@ -2216,7 +2575,8 @@ fn recover_transition(
         ));
     }
 
-    // forward, so the destination already holds the new representation.
+    // forward, so both the new destination and the displaced prior side are
+    // proved before the displaced object is removed.
     if target_representation == WRITABLE_REPRESENTATION {
         let Some(intended) = record.intended_witness_hash.clone() else {
             return Err(Failure::new(
@@ -2225,17 +2585,47 @@ fn recover_transition(
                 "pending transition record carries no intended content hash",
             ));
         };
+        let Some(prior) = record.prior_owned.as_ref() else {
+            return Err(Failure::new(
+                CodeKey::TransitionRefused,
+                destination,
+                "completed transition has no prior owned snapshot; both names are preserved",
+            ));
+        };
         verify_writable_destination(parent, name, destination, &intended)?;
-        remove_stage(parent, &stage);
+        let displaced = symlink_target(parent, &stage).map_err(|errno| {
+            Failure::syscall(
+                CodeKey::TransitionRefused,
+                destination,
+                "readlinkat-displaced-transition",
+                errno,
+            )
+        })?;
+        if displaced.as_deref() != Some(OsStr::new(&prior.applied_artifact_target)) {
+            return Err(Failure::new(
+                CodeKey::TransitionRefused,
+                destination,
+                "displaced transition side does not match prior symlink ownership; both names are preserved",
+            ));
+        }
+        remove_verified_displaced(parent, &stage, destination)?;
+        let prior = prior.restore();
         ledger.commit(
             canonical,
-            owned_record(identity, entry, "update", Some(record), &intended),
+            owned_record(identity, entry, "update", Some(&prior), &intended),
         )?;
         return Ok(());
     }
 
-    // forward into symlink. the displaced object is the regular file, and it is
-    // the one thing here that can hold work a user cannot get back.
+    // forward into symlink. the displaced regular file must match the exact
+    // prior snapshot or be restored and retained as user-edited data.
+    let Some(prior) = record.prior_owned.as_ref() else {
+        return Err(Failure::new(
+            CodeKey::TransitionRefused,
+            destination,
+            "completed transition has no prior owned snapshot; both names are preserved",
+        ));
+    };
     let displaced_hash = hash_regular(
         parent,
         &stage,
@@ -2243,52 +2633,54 @@ fn recover_transition(
         CodeKey::TransitionRefused,
         "read-displaced-writable",
     )?;
-    let pristine = record.baseline_hash.as_deref() == Some(displaced_hash.as_str());
+    let pristine = prior.baseline_hash.as_deref() == Some(displaced_hash.as_str());
     if !pristine {
-        // exchange back, so the edited bytes return to the destination the user
-        // knows, and the transition is refused rather than completed.
-        if let Err(errno) = renameat_with(parent, &stage, parent, name, RenameFlags::EXCHANGE) {
-            return Err(Failure::syscall(
+        renameat_with(parent, &stage, parent, name, RenameFlags::EXCHANGE).map_err(|errno| {
+            Failure::syscall(
                 CodeKey::TransitionRefused,
                 destination,
                 "renameat2-exchange-restore",
                 errno,
-            ));
-        }
+            )
+        })?;
         sync_parent(parent, destination)?;
-        // what sits at the stage name now is the symlink this run staged, which
-        // is ours and holds nothing of the user's.
-        remove_stage(parent, &stage);
-        // backward convergence again, so the destination is back to the writable
-        // file it was and the record it already had is restated, baseline and
-        // the witness that baseline is included.
-        let Some(baseline) = record.baseline_hash.clone() else {
+        verify_writable_hash(
+            parent,
+            name,
+            destination,
+            &displaced_hash,
+            "read-restored-transition-destination",
+        )?;
+        let restored_stage = symlink_target(parent, &stage).map_err(|errno| {
+            Failure::syscall(
+                CodeKey::TransitionRefused,
+                destination,
+                "readlinkat-restored-transition-stage",
+                errno,
+            )
+        })?;
+        if restored_stage.as_deref() != Some(OsStr::new(&record.applied_artifact_target)) {
             return Err(Failure::new(
                 CodeKey::TransitionRefused,
                 destination,
-                "refusing to restate a writable destination with no recorded baseline; edited content was restored",
+                "restored transition stage does not match the intended symlink; both names are preserved",
             ));
-        };
-        let mut owned = record.clone();
-        owned.state = STATE_OWNED.to_owned();
-        owned.representation = WRITABLE_REPRESENTATION.to_owned();
-        owned.intended_witness_hash = Some(baseline);
-        owned.stage_name = None;
-        ledger.commit(canonical, owned)?;
+        }
+        remove_unpublished_stage(parent, &stage);
+        ledger.commit(canonical, prior.restore())?;
         return Err(Failure::new(
             CodeKey::TransitionRefused,
             destination,
             "refusing to retire a writable destination that no longer matches its baseline; edited content was restored",
         ));
     }
-    remove_stage(parent, &stage);
-    // the exchange landed, so this carries the applied state forward and takes
-    // the same constructor as any other post-publish commit.
+    remove_verified_displaced(parent, &stage, destination)?;
+    let prior = prior.restore();
     let owned = owned_record(
         identity,
         entry,
         "update",
-        Some(record),
+        Some(&prior),
         &sha256_hex(entry.retained_artifact_target.as_bytes()),
     );
     ledger.commit(canonical, owned)?;
@@ -2355,7 +2747,7 @@ fn transition_representation(
         stage_writable(setpriv, &parent, &stage, entry, &intended)?;
         fault_point("stage-synced");
         if let Err(errno) = renameat_with(&parent, &stage, &parent, name, RenameFlags::EXCHANGE) {
-            remove_stage(&parent, &stage);
+            remove_unpublished_stage(&parent, &stage);
             return Err(Failure::syscall(
                 CodeKey::TransitionRefused,
                 destination,
@@ -2367,7 +2759,7 @@ fn transition_representation(
         sync_parent(&parent, destination)?;
         verify_writable_destination(&parent, &name, destination, &intended)?;
         fault_point("verified");
-        remove_stage(&parent, &stage);
+        remove_unpublished_stage(&parent, &stage);
         ledger.commit(
             canonical,
             owned_record(identity, entry, "update", Some(record), &intended),
@@ -2414,7 +2806,7 @@ fn transition_representation(
     stage_symlink(setpriv, &parent, &stage, entry, expected)?;
     fault_point("stage-synced");
     if let Err(errno) = renameat_with(&parent, &stage, &parent, name, RenameFlags::EXCHANGE) {
-        remove_stage(&parent, &stage);
+        remove_unpublished_stage(&parent, &stage);
         return Err(Failure::syscall(
             CodeKey::TransitionRefused,
             destination,
@@ -2442,7 +2834,7 @@ fn transition_representation(
     fault_point("verified");
     // the displaced object is the pristine regular file, proven equal to its
     // baseline above, so removing it destroys no work.
-    remove_stage(&parent, &stage);
+    remove_unpublished_stage(&parent, &stage);
     let owned = owned_record(
         identity,
         entry,
@@ -2802,8 +3194,23 @@ fn reconcile_entry(
 
             let stage = stage_name(index);
             let intended = sha256_hex(entry.retained_artifact_target.as_bytes());
+            fault_point("pre-pending");
+            ledger.commit(
+                canonical,
+                pending_record(
+                    identity,
+                    entry,
+                    applied_by,
+                    Some(&record),
+                    &stage,
+                    &intended,
+                ),
+            )?;
+            fault_point("pending-committed");
             stage_symlink(setpriv, &parent, &stage, entry, expected)?;
+            fault_point("stage-synced");
             publish_exchange(&parent, &name, &stage, destination, expected, recorded)?;
+            fault_point("verified");
             ledger.commit(
                 canonical,
                 owned_record(identity, entry, applied_by, Some(&record), &intended),
@@ -3913,6 +4320,63 @@ mod tests {
             .expect("plant record");
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn plant_pending_with_prior(
+        ledger: &mut LedgerState,
+        entry: &Entry,
+        applied_by: &str,
+        prior_target: &str,
+        prior_baseline: &str,
+        intended: &str,
+        stage: &str,
+    ) {
+        let identity = RunIdentity::observe();
+        let mut prior = identity.record(entry, "new");
+        prior.representation = WRITABLE_REPRESENTATION.to_owned();
+        prior.applied_artifact_target = prior_target.to_owned();
+        prior.baseline_hash = Some(prior_baseline.to_owned());
+        prior.intended_witness_hash = Some(prior_baseline.to_owned());
+        let pending = pending_record(
+            &identity,
+            entry,
+            applied_by,
+            Some(&prior),
+            OsStr::new(stage),
+            intended,
+        );
+        ledger
+            .commit(&entry.filesystem_identity.canonical, pending)
+            .expect("plant pending record");
+    }
+
+    fn plant_transition_with_prior(
+        ledger: &mut LedgerState,
+        entry: &Entry,
+        prior_representation: &str,
+        prior_target: &str,
+        prior_baseline: Option<&str>,
+        intended: &str,
+        stage: &str,
+    ) {
+        let identity = RunIdentity::observe();
+        let mut prior = identity.record(entry, "new");
+        prior.representation = prior_representation.to_owned();
+        prior.applied_artifact_target = prior_target.to_owned();
+        prior.baseline_hash = prior_baseline.map(str::to_owned);
+        prior.intended_witness_hash = prior_baseline.map(str::to_owned);
+        let pending = pending_record(
+            &identity,
+            entry,
+            TRANSITION_MARKER,
+            Some(&prior),
+            OsStr::new(stage),
+            intended,
+        );
+        ledger
+            .commit(&entry.filesystem_identity.canonical, pending)
+            .expect("plant pending transition");
+    }
+
     const PLANTED_GENERATION: u64 = 7;
 
     // the counter cannot be planted through plant_record, which starts every
@@ -4074,7 +4538,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_refuses_a_destination_the_pending_record_did_not_author() {
+    fn legacy_pending_preserves_an_occupied_destination_and_fails_loud() {
         let dir = TestDir::new();
         let source = write_source(&dir, "source", "payload\n");
         let destination = dir.path().join("value");
@@ -4097,14 +4561,12 @@ mod tests {
             Some(&intended),
             Some(".furnish.test.stage"),
         );
-        recover_pending(&entry, &mut ledger, &RunIdentity::observe()).expect("recovery converges");
-        // content that does not match the intent is not authorship, so the
-        // record is cleared and the file is left exactly as found.
-        assert!(
-            ledger
-                .record(&entry.filesystem_identity.canonical)
-                .is_none()
-        );
+
+        let failure = recover_pending(&entry, &mut ledger, &RunIdentity::observe())
+            .expect_err("legacy pending cannot invent a backward state");
+
+        assert!(matches!(failure.key, CodeKey::PendingRecovery));
+        assert_eq!(committed(&ledger, &entry).state, STATE_PENDING);
         assert_eq!(
             fs::read_to_string(&destination).unwrap(),
             "somebody elses bytes\n"
@@ -4167,7 +4629,7 @@ mod tests {
             "new",
             WRITABLE_REPRESENTATION,
             &source,
-            // Opaque planted mismatch token: it names no file content and is
+            // opaque planted mismatch token names no file content and is
             // replaced when reconciliation advances the stale baseline.
             Some("0000000000000000000000000000000000000000000000000000000000000000"),
             None,
@@ -4242,16 +4704,14 @@ mod tests {
         );
         let intended = sha256_hex(b"payload\n");
         let mut ledger = test_ledger(&dir);
-        plant_record(
+        plant_transition_with_prior(
             &mut ledger,
             &entry,
-            STATE_PENDING,
-            TRANSITION_MARKER,
-            WRITABLE_REPRESENTATION,
+            NATIVE_REPRESENTATION,
             "/old/target",
             None,
-            Some(&intended),
-            Some(stage),
+            &intended,
+            stage,
         );
         recover_pending(&entry, &mut ledger, &RunIdentity::observe())
             .expect("transition recovery converges forward");
@@ -4283,16 +4743,14 @@ mod tests {
         );
         entry.representation = NATIVE_REPRESENTATION.to_owned();
         let mut ledger = test_ledger(&dir);
-        plant_record(
+        plant_transition_with_prior(
             &mut ledger,
             &entry,
-            STATE_PENDING,
-            TRANSITION_MARKER,
-            NATIVE_REPRESENTATION,
+            WRITABLE_REPRESENTATION,
             &source,
             Some(&sha256_hex(b"payload\n")),
-            Some(&sha256_hex(source.as_bytes())),
-            Some(stage),
+            &sha256_hex(source.as_bytes()),
+            stage,
         );
         let failure = recover_pending(&entry, &mut ledger, &RunIdentity::observe())
             .expect_err("an edited displaced file refuses the transfer");
@@ -4324,16 +4782,14 @@ mod tests {
         );
         entry.representation = NATIVE_REPRESENTATION.to_owned();
         let mut ledger = test_ledger(&dir);
-        plant_record(
+        plant_transition_with_prior(
             &mut ledger,
             &entry,
-            STATE_PENDING,
-            TRANSITION_MARKER,
-            NATIVE_REPRESENTATION,
+            WRITABLE_REPRESENTATION,
             &source,
             Some(&sha256_hex(b"payload\n")),
-            Some(&sha256_hex(source.as_bytes())),
-            Some(stage),
+            &sha256_hex(source.as_bytes()),
+            stage,
         );
         recover_pending(&entry, &mut ledger, &RunIdentity::observe())
             .expect("a pristine displaced file completes the transfer");
@@ -4441,7 +4897,7 @@ mod tests {
     // new furnish-applied content, and eligibility is read off the committed
     // record rather than off anything this coordinator does at the destination.
     // staging cannot run inside the test process, since run_executor re-executes
-    // env::current_exe and inside these tests that is the test binary, so each
+    // env current_exe resolves to the test binary here, so each
     // publishing cause is proven in two halves. the dispatch half proves which
     // route the reconciliation chose and that the pending record carried the
     // prior counter unchanged into it. the recovery half proves what that route
@@ -5044,9 +5500,7 @@ mod tests {
         let target = dir.path().join("target");
         fs::write(&target, b"linked").expect("create link target");
 
-        // written by a reconciliation: the backward transition restatement, which
-        // sets the representation and therefore owes the reading that
-        // representation fixes.
+        // written by recovery from the exact prior-owned snapshot.
         let restored_destination = dir.path().join("restored-value");
         symlink(&target, &restored_destination).expect("plant symlink destination");
         let restored = sample_writable_entry(
@@ -5054,18 +5508,24 @@ mod tests {
             restored_destination.to_str().unwrap(),
             target.to_str().unwrap(),
         );
-        plant_record(
-            &mut ledger,
+        let identity = RunIdentity::observe();
+        let mut prior = identity.record(&restored, "new");
+        prior.representation = NATIVE_REPRESENTATION.to_owned();
+        prior.applied_artifact_target = target.to_str().unwrap().to_owned();
+        prior.intended_witness_hash = Some(sha256_hex(target.to_str().unwrap().as_bytes()));
+        let mut pending = pending_record(
+            &identity,
             &restored,
-            STATE_PENDING,
             TRANSITION_MARKER,
-            WRITABLE_REPRESENTATION,
-            target.to_str().unwrap(),
-            Some(&sha256_hex(b"linked")),
-            Some(&sha256_hex(b"linked")),
-            Some(".furnish.test.stage"),
+            Some(&prior),
+            OsStr::new(".furnish.test.stage"),
+            &sha256_hex(b"linked"),
         );
-        recover_pending(&restored, &mut ledger, &RunIdentity::observe())
+        pending.representation = WRITABLE_REPRESENTATION.to_owned();
+        ledger
+            .commit(&restored.filesystem_identity.canonical, pending)
+            .expect("plant pending transition");
+        recover_pending(&restored, &mut ledger, &identity)
             .expect("the transition converges backward");
         let record = committed(&ledger, &restored);
         assert_eq!(record.representation, NATIVE_REPRESENTATION);
@@ -5074,8 +5534,8 @@ mod tests {
             Some(sha256_hex(target.to_str().unwrap().as_bytes()).as_str())
         );
 
-        // not written by a reconciliation: a record planted the way the v1
-        // migration and RunIdentity::record leave one, with both fields at their
+        // not written by a reconciliation. a record planted the way the v1
+        // migration and run identity record leave one, with both fields at their
         // defaults.
         let planted_destination = dir.path().join("planted-value");
         let planted = sample_entry(
@@ -5333,6 +5793,12 @@ mod tests {
             );
             assert_eq!(pending.baseline_hash, prior.baseline_hash);
             assert_eq!(pending.applied_operation_generation, 5);
+            let captured = pending.prior_owned.expect("capture prior ownership");
+            assert_eq!(
+                captured.applied_artifact_target,
+                prior.applied_artifact_target
+            );
+            assert_eq!(captured.baseline_hash, prior.baseline_hash);
         }
 
         #[test]
@@ -5435,7 +5901,7 @@ mod tests {
         }
     }
 
-    // ledger characterization: the encoded bytes are pinned exactly where
+    // the encoded ledger bytes are pinned exactly where
     // every stamp can be fixed, and the load-time behavior is pinned as it
     // actually behaves rather than as the error arms read.
     mod ledger_pins {
@@ -5502,6 +5968,7 @@ mod tests {
             assert_eq!(encoded["baselineHash"], serde_json::Value::Null);
             assert_eq!(encoded["intendedWitnessHash"], serde_json::Value::Null);
             assert_eq!(encoded["stageName"], serde_json::Value::Null);
+            assert!(encoded.get("priorOwned").is_none());
             assert_eq!(encoded["unresolvedRetirement"], serde_json::Value::Null);
             assert_eq!(encoded["state"], "owned");
             assert_eq!(encoded["representation"], "symlink");
@@ -5511,7 +5978,7 @@ mod tests {
         #[test]
         fn the_ledger_write_produces_exact_bytes() {
             // every stamp that varies from run to run is fixed here, so the
-            // file is pinned byte for byte: schema first, records second,
+            // the file is pinned byte for byte with schema first, records second,
             // canonical keys sorted, record fields in declaration order, nulls
             // emitted rather than omitted.
             let dir = TestDir::new();
@@ -5531,12 +5998,13 @@ mod tests {
                 boot_id: None,
                 state: STATE_OWNED.to_owned(),
                 representation: WRITABLE_REPRESENTATION.to_owned(),
-                // Opaque serialization token, not a claimed content digest;
+                // opaque serialization token, not a claimed content digest;
                 // production writes it unchanged into both JSON fields.
                 baseline_hash: Some("a".repeat(64)),
                 intended_witness_hash: Some("a".repeat(64)),
                 applied_operation_generation: 0,
                 stage_name: None,
+                prior_owned: None,
                 unresolved_retirement: None,
             };
             ledger
@@ -5596,7 +6064,7 @@ mod tests {
         }
     }
 
-    // publish_exchange verifies both sides after the rename: the destination
+    // publish_exchange verifies both sides after the rename. the destination
     // must hold the expected link and the stage must hold the recorded one.
     // the crash rows downstream turn on exactly this, so each refusal gets
     // its own pin here.
@@ -5672,6 +6140,32 @@ mod tests {
             // now sits at the stage name.
             assert_eq!(fs::read_link(dir.path().join("stage")).unwrap(), recorded);
         }
+
+        #[test]
+        fn a_verified_exchange_cleanup_failure_preserves_the_displaced_link() {
+            let dir = TestDir::new();
+            let (parent, name) = dir.entry_parent("value");
+            let recorded = dir.path().join("recorded-target");
+            symlink(&recorded, dir.path().join("value")).expect("plant recorded destination");
+            let expected = dir.path().join("expected-target");
+            symlink(&expected, dir.path().join("stage")).expect("plant staged link");
+            FAIL_VERIFIED_DISPLACED_CLEANUP.with(|fault| fault.set(true));
+
+            let failure = publish_exchange(
+                &parent,
+                &name,
+                OsStr::new("stage"),
+                "/dest",
+                expected.as_os_str(),
+                recorded.as_os_str(),
+            )
+            .expect_err("verified displaced cleanup failure is returned");
+
+            assert!(matches!(failure.key, CodeKey::FinalVerification));
+            assert_eq!(failure.operation, Some("unlinkat-verified-displaced"));
+            assert_eq!(fs::read_link(dir.path().join("value")).unwrap(), expected);
+            assert_eq!(fs::read_link(dir.path().join("stage")).unwrap(), recorded);
+        }
     }
 
     // a backward restatement owes the witness reading of the representation it
@@ -5681,7 +6175,7 @@ mod tests {
         use super::*;
 
         #[test]
-        fn a_writable_backward_restatement_requires_a_recorded_baseline() {
+        fn a_backward_transition_without_prior_snapshot_is_refused() {
             let dir = TestDir::new();
             fs::write(dir.path().join("value"), b"writable bytes\n")
                 .expect("plant writable destination");
@@ -5703,11 +6197,11 @@ mod tests {
                 Some(".furnish.test.stage"),
             );
             let failure = recover_pending(&entry, &mut ledger, &RunIdentity::observe())
-                .expect_err("restating writable without a baseline is refused");
+                .expect_err("legacy transition cannot invent prior ownership");
             assert!(matches!(failure.key, CodeKey::TransitionRefused));
             assert_eq!(
                 failure.message,
-                "refusing to restate a writable destination with no recorded baseline"
+                "pending transition has no prior owned snapshot; both names are preserved"
             );
             assert_eq!(committed(&ledger, &entry).state, STATE_PENDING);
         }
@@ -5854,7 +6348,7 @@ mod tests {
             .expect_err("staging cannot run inside the test process");
             assert!(matches!(failure.key, CodeKey::ExecutorFailed));
             let record = committed(&ledger, &entry);
-            // recovery and reconciliation are two recorded steps: the recovery
+            // recovery and reconciliation are two recorded steps. the recovery
             // landed owned at the old source, and the ordinary path is now
             // pending an update toward the current one.
             assert_eq!(record.state, STATE_PENDING);
@@ -5869,10 +6363,12 @@ mod tests {
         }
 
         #[test]
-        fn an_update_death_before_publication_retires_the_pending_record_and_keeps_the_bytes() {
+        fn an_update_death_before_publication_without_prior_evidence_preserves_both_names() {
             let dir = TestDir::new();
             let source = write_source(&dir, "source", "new payload\n");
             let destination = plant_destination(&dir, "value", "old payload\n");
+            let stage = ".furnish.test.stage";
+            fs::write(dir.path().join(stage), "new payload\n").expect("plant stage");
             let entry = sample_writable_entry(
                 dir.path().to_str().unwrap(),
                 destination.to_str().unwrap(),
@@ -5888,22 +6384,23 @@ mod tests {
                 &source,
                 Some(&sha256_hex(b"old payload\n")),
                 Some(&sha256_hex(b"new payload\n")),
-                Some(".furnish.test.stage"),
+                Some(stage),
             );
-            recover_pending(&entry, &mut ledger, &RunIdentity::observe())
-                .expect("recovery converges");
-            // the destination was not authored by the pending record, so the
-            // record is cleared and the bytes are left exactly as found.
-            assert!(
-                ledger
-                    .record(&entry.filesystem_identity.canonical)
-                    .is_none()
-            );
+
+            let failure = recover_pending(&entry, &mut ledger, &RunIdentity::observe())
+                .expect_err("legacy pending cannot invent prior ownership");
+
+            assert!(matches!(failure.key, CodeKey::PendingRecovery));
             assert_eq!(fs::read_to_string(&destination).unwrap(), "old payload\n");
+            assert_eq!(
+                fs::read_to_string(dir.path().join(stage)).unwrap(),
+                "new payload\n"
+            );
+            assert_eq!(committed(&ledger, &entry).state, STATE_PENDING);
         }
     }
 
-    // the writable rows whose route choice is the behavior: the ordinary
+    // the writable rows whose route choice is the behavior include the ordinary
     // update that never consults the policy, and the two refusals that fire
     // before any policy could matter.
     mod update_route_pins {
@@ -5913,7 +6410,7 @@ mod tests {
         fn an_ordinary_update_publishes_without_consulting_the_conflict_policy() {
             // the destination is still exactly the baseline and only the
             // source moved, so the policy is never read. setting it to error
-            // is what proves that: the route still publishes.
+            // is what proves that the route still publishes.
             let dir = TestDir::new();
             let source = write_source(&dir, "source", "second\n");
             let destination = plant_destination(&dir, "value", "first\n");
@@ -6039,6 +6536,113 @@ mod tests {
         }
     }
 
+    mod transaction_pins {
+        use super::*;
+
+        #[test]
+        fn a_prepublication_death_restores_the_exact_prior_owned_record() {
+            let dir = TestDir::new();
+            let old_source = write_source(&dir, "old-source", "old payload\n");
+            let new_source = write_source(&dir, "new-source", "new payload\n");
+            let destination = plant_destination(&dir, "value", "old payload\n");
+            let old_entry = sample_writable_entry(
+                dir.path().to_str().unwrap(),
+                destination.to_str().unwrap(),
+                &old_source,
+            );
+            let entry = sample_writable_entry(
+                dir.path().to_str().unwrap(),
+                destination.to_str().unwrap(),
+                &new_source,
+            );
+            let identity = RunIdentity::observe();
+            let prior = owned_record(
+                &identity,
+                &old_entry,
+                "new",
+                None,
+                &sha256_hex(b"old payload\n"),
+            );
+            let pending = pending_record(
+                &identity,
+                &entry,
+                "update",
+                Some(&prior),
+                OsStr::new(".furnish.test.stage"),
+                &sha256_hex(b"new payload\n"),
+            );
+            let mut ledger = test_ledger(&dir);
+            ledger
+                .commit(&entry.filesystem_identity.canonical, pending)
+                .expect("commit pending");
+
+            recover_pending(&entry, &mut ledger, &identity).expect("restore prior owned");
+
+            let restored = committed(&ledger, &entry);
+            assert_eq!(restored.state, STATE_OWNED);
+            assert_eq!(restored.applied_artifact_target, old_source);
+            assert_eq!(restored.representation, WRITABLE_REPRESENTATION);
+            assert_eq!(
+                restored.baseline_hash.as_deref(),
+                Some(sha256_hex(b"old payload\n").as_str())
+            );
+            assert!(restored.prior_owned.is_none());
+            assert_eq!(fs::read(&destination).unwrap(), b"old payload\n");
+        }
+
+        #[test]
+        fn an_undeclared_pending_record_is_not_retired() {
+            let dir = TestDir::new();
+            let source = write_source(&dir, "source", "payload\n");
+            let destination = plant_destination(&dir, "value", "payload\n");
+            let entry = sample_writable_entry(
+                dir.path().to_str().unwrap(),
+                destination.to_str().unwrap(),
+                &source,
+            );
+            let identity = RunIdentity::observe();
+            let owned = owned_record(&identity, &entry, "new", None, &sha256_hex(b"payload\n"));
+            let pending = pending_record(
+                &identity,
+                &entry,
+                "update",
+                Some(&owned),
+                OsStr::new(".furnish.test.stage"),
+                &sha256_hex(b"next\n"),
+            );
+
+            let failure = retire_record(&pending).expect_err("pending retirement is refused");
+
+            assert!(matches!(failure.key, CodeKey::PendingRecovery));
+            assert_eq!(fs::read(&destination).unwrap(), b"payload\n");
+        }
+
+        #[test]
+        fn rollback_verification_failure_preserves_both_objects() {
+            let dir = TestDir::new();
+            let (parent, name) = dir.entry_parent("value");
+            fs::write(dir.path().join("value"), "intended\n").expect("plant destination");
+            fs::write(dir.path().join("stage"), "unexpected prior\n").expect("plant stage");
+
+            let failure = rollback_exchange(
+                &parent,
+                &name,
+                OsStr::new("stage"),
+                "/dest",
+                &sha256_hex(b"recorded prior\n"),
+                &sha256_hex(b"intended\n"),
+            )
+            .expect_err("restored destination must match prior evidence");
+
+            assert!(matches!(failure.key, CodeKey::PendingRecovery));
+            assert_eq!(
+                fs::read(dir.path().join("value")).unwrap(),
+                b"unexpected prior\n"
+            );
+            assert_eq!(fs::read(dir.path().join("stage")).unwrap(), b"intended\n");
+        }
+    }
+
     // the crash boundaries the binary fault rows reproduce with real process
     // deaths, planted here directly so the convergence is pinned even where
     // no fault point exists.
@@ -6059,16 +6663,14 @@ mod tests {
                 &source,
             );
             let mut ledger = test_ledger(&dir);
-            plant_record(
+            plant_pending_with_prior(
                 &mut ledger,
                 &entry,
-                STATE_PENDING,
                 "update",
-                WRITABLE_REPRESENTATION,
                 &source,
-                Some(&sha256_hex(b"old payload\n")),
-                Some(&sha256_hex(b"new payload\n")),
-                Some(stage),
+                &sha256_hex(b"old payload\n"),
+                &sha256_hex(b"new payload\n"),
+                stage,
             );
             let failure = recover_pending(&entry, &mut ledger, &RunIdentity::observe())
                 .expect_err("edited displaced bytes reverse the exchange");
@@ -6093,20 +6695,17 @@ mod tests {
         }
 
         #[test]
-        fn a_retired_pending_record_turns_ownership_into_a_conflict() {
-            // the full arc of a writable update death before publication:
-            // recovery retires the unauthored pending record, and the same
-            // run's ordinary path then sees an occupied destination with no
-            // record and refuses to adopt it.
+        fn an_unrecoverable_pending_record_blocks_ordinary_reconciliation() {
             let dir = TestDir::new();
             let source = write_source(&dir, "source", "new payload\n");
             let destination = plant_destination(&dir, "value", "old payload\n");
-            let mut entry = sample_writable_entry(
+            let stage = ".furnish.test.stage";
+            fs::write(dir.path().join(stage), "new payload\n").expect("plant stage");
+            let entry = sample_writable_entry(
                 dir.path().to_str().unwrap(),
                 destination.to_str().unwrap(),
                 &source,
             );
-            entry.authority.scope = "user".to_owned();
             let mut ledger = test_ledger(&dir);
             plant_record(
                 &mut ledger,
@@ -6117,8 +6716,9 @@ mod tests {
                 &source,
                 Some(&sha256_hex(b"old payload\n")),
                 Some(&sha256_hex(b"new payload\n")),
-                Some(".furnish.test.stage"),
+                Some(stage),
             );
+
             let failure = reconcile_entry(
                 &entry,
                 Path::new("/nonexistent/setpriv"),
@@ -6126,24 +6726,19 @@ mod tests {
                 &mut ledger,
                 &RunIdentity::observe(),
             )
-            .expect_err("a retired pending record leaves no ownership to publish over");
-            assert!(matches!(failure.key, CodeKey::ConflictingDestination));
-            assert!(
-                ledger
-                    .record(&entry.filesystem_identity.canonical)
-                    .is_none()
-            );
+            .expect_err("pending recovery fails before ordinary reconciliation");
+
+            assert!(matches!(failure.key, CodeKey::PendingRecovery));
             assert_eq!(fs::read_to_string(&destination).unwrap(), "old payload\n");
+            assert_eq!(
+                fs::read_to_string(dir.path().join(stage)).unwrap(),
+                "new payload\n"
+            );
+            assert_eq!(committed(&ledger, &entry).state, STATE_PENDING);
         }
 
         #[test]
-        fn a_landed_exchange_converges_as_a_steady_state_and_restamps_the_record() {
-            // the owned-symlink death that no fault point can reach: the
-            // exchange has landed, the ledger still records the old target,
-            // and the next ordinary run sees a destination equal to the
-            // declaration, so it takes the steady-state branch and refreshes
-            // the record rather than refusing. nothing was ever pending, so
-            // the displaced link at the stage name is nobody's to clean.
+        fn a_landed_owned_symlink_exchange_removes_the_verified_displaced_link() {
             let dir = TestDir::new();
             let recorded_target = dir.path().join("recorded-target");
             fs::write(&recorded_target, b"live").expect("create recorded target");
@@ -6151,42 +6746,52 @@ mod tests {
             fs::write(&desired_target, b"desired").expect("create desired target");
             let destination = dir.path().join("value");
             symlink(&desired_target, &destination).expect("plant exchanged destination");
-            let orphan = dir.path().join(".furnish.9999.0.stage");
-            symlink(&recorded_target, &orphan).expect("plant orphaned displaced link");
+            let stage = ".furnish.9999.0.stage";
+            symlink(&recorded_target, dir.path().join(stage))
+                .expect("plant displaced recorded link");
             let entry = sample_entry(
                 dir.path().to_str().unwrap(),
                 destination.to_str().unwrap(),
                 desired_target.to_str().unwrap(),
             );
             let mut ledger = test_ledger(&dir);
-            record_ownership(&mut ledger, &entry, recorded_target.to_str().unwrap());
-            reconcile_entry(
+            let identity = RunIdentity::observe();
+            let mut prior = identity.record(&entry, "new");
+            prior.applied_artifact_target = recorded_target.to_string_lossy().into_owned();
+            prior.intended_witness_hash =
+                Some(sha256_hex(recorded_target.as_os_str().as_encoded_bytes()));
+            let pending = pending_record(
+                &identity,
                 &entry,
-                Path::new("/nonexistent/setpriv"),
-                0,
-                &mut ledger,
-                &RunIdentity::observe(),
-            )
-            .expect("a destination equal to the declaration is a steady state");
+                "update",
+                Some(&prior),
+                OsStr::new(stage),
+                &sha256_hex(desired_target.as_os_str().as_encoded_bytes()),
+            );
+            ledger
+                .commit(&entry.filesystem_identity.canonical, pending)
+                .expect("plant pending exchange");
+
+            recover_pending(&entry, &mut ledger, &identity)
+                .expect("recover the landed owned-symlink exchange");
+
             assert_eq!(fs::read_link(&destination).unwrap(), desired_target);
             let record = committed(&ledger, &entry);
-            // the record now names the target the crashed run published, while
-            // still crediting the branch the prior record carried.
             assert_eq!(
                 record.applied_artifact_target,
                 desired_target.to_str().unwrap()
             );
-            assert_eq!(record.applied_by, "new");
+            assert_eq!(record.applied_by, "update");
             assert_eq!(record.state, STATE_OWNED);
-            assert!(fs::symlink_metadata(&orphan).is_ok());
+            assert!(record.prior_owned.is_none());
+            assert!(fs::symlink_metadata(dir.path().join(stage)).is_err());
         }
 
         #[test]
         fn a_mismatched_displaced_hash_reverses_the_exchange() {
             // the displaced bytes are re-hashed after the exchange and a
-            // mismatch reverses it, returning both sides to their pre-exchange
-            // state before the race is reported. the reverse's own result is
-            // discarded, so only the successful reverse is observable here.
+            // mismatch reverses it, verifies both restored sides, and reports
+            // the race only after the intended stage has been removed.
             let dir = TestDir::new();
             let (parent, name) = dir.entry_parent("value");
             fs::write(dir.path().join("value"), "original\n").expect("plant destination");
@@ -6207,6 +6812,38 @@ mod tests {
             );
             assert_eq!(fs::read(dir.path().join("value")).unwrap(), b"original\n");
             assert!(!dir.path().join("stage").exists());
+        }
+
+        #[cfg(feature = "fault-injection")]
+        #[test]
+        fn a_failed_reverse_exchange_preserves_both_objects() {
+            let dir = TestDir::new();
+            let (parent, name) = dir.entry_parent("value");
+            fs::write(dir.path().join("value"), "intended\n").expect("plant destination");
+            fs::write(dir.path().join("stage"), "displaced\n").expect("plant stage");
+            unsafe {
+                env::set_var("FURNISH_FAULT_POINT", "reverse-exchange-restore-failed");
+            }
+            let failure = rollback_exchange(
+                &parent,
+                &name,
+                OsStr::new("stage"),
+                "/dest",
+                &sha256_hex(b"displaced\n"),
+                &sha256_hex(b"intended\n"),
+            )
+            .expect_err("reverse exchange is injected to fail");
+            unsafe {
+                env::remove_var("FURNISH_FAULT_POINT");
+            }
+
+            assert!(matches!(failure.key, CodeKey::PendingRecovery));
+            assert_eq!(
+                failure.operation,
+                Some("renameat2-exchange-restore-pending")
+            );
+            assert_eq!(fs::read(dir.path().join("value")).unwrap(), b"intended\n");
+            assert_eq!(fs::read(dir.path().join("stage")).unwrap(), b"displaced\n");
         }
     }
 }

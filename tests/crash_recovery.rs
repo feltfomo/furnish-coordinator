@@ -97,9 +97,13 @@ fn record_json(
     witness: Option<&str>,
     generation: u64,
     stage: Option<&str>,
+    prior_owned: Option<&str>,
 ) -> String {
+    let prior_owned = prior_owned
+        .map(|value| format!(",\"priorOwned\":{value}"))
+        .unwrap_or_default();
     format!(
-        "{{\"destination\":{dest},\"appliedArtifactTarget\":{artifact},\"managedRoot\":{root},\"appliedBy\":\"{applied_by}\",\"appliedGeneration\":null,\"lastSuccessfulReload\":{{\"invocationId\":null,\"monotonicSeconds\":0.0}},\"reloadActionIdentity\":null,\"bootId\":null,\"state\":\"{state}\",\"representation\":\"{representation}\",\"baselineHash\":{baseline},\"intendedWitnessHash\":{witness},\"appliedOperationGeneration\":{generation},\"stageName\":{stage},\"unresolvedRetirement\":null}}",
+        "{{\"destination\":{dest},\"appliedArtifactTarget\":{artifact},\"managedRoot\":{root},\"appliedBy\":\"{applied_by}\",\"appliedGeneration\":null,\"lastSuccessfulReload\":{{\"invocationId\":null,\"monotonicSeconds\":0.0}},\"reloadActionIdentity\":null,\"bootId\":null,\"state\":\"{state}\",\"representation\":\"{representation}\",\"baselineHash\":{baseline},\"intendedWitnessHash\":{witness},\"appliedOperationGeneration\":{generation},\"stageName\":{stage}{prior_owned},\"unresolvedRetirement\":null}}",
         dest = serde_json::to_string(destination.to_str().unwrap()).unwrap(),
         artifact = serde_json::to_string(artifact.to_str().unwrap()).unwrap(),
         root = serde_json::to_string(managed_root.to_str().unwrap()).unwrap(),
@@ -107,6 +111,38 @@ fn record_json(
         witness = opt(witness),
         stage = opt(stage),
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prior_owned_json(
+    destination: &Path,
+    artifact: &Path,
+    managed_root: &Path,
+    applied_by: &str,
+    representation: &str,
+    baseline: Option<&str>,
+    witness: Option<&str>,
+    generation: u64,
+) -> String {
+    serde_json::json!({
+        "destination": destination,
+        "appliedArtifactTarget": artifact,
+        "managedRoot": managed_root,
+        "appliedBy": applied_by,
+        "appliedGeneration": serde_json::Value::Null,
+        "lastSuccessfulReload": {
+            "invocationId": serde_json::Value::Null,
+            "monotonicSeconds": 0.0
+        },
+        "reloadActionIdentity": serde_json::Value::Null,
+        "bootId": serde_json::Value::Null,
+        "representation": representation,
+        "baselineHash": baseline,
+        "intendedWitnessHash": witness,
+        "appliedOperationGeneration": generation,
+        "unresolvedRetirement": serde_json::Value::Null
+    })
+    .to_string()
 }
 
 fn plant_ledger(dir: &Path, canonical: &str, record: &str) {
@@ -166,11 +202,9 @@ fn stderr_line(output: &Output) -> serde_json::Value {
 }
 
 #[test]
-fn a_writable_update_death_after_the_pending_commit_converges_through_recovery() {
-    // a death with the pending record committed and nothing staged: recovery
-    // finds the destination not authored by the pending record, retires it,
-    // and the same run then refuses the occupied destination for want of a
-    // record.
+fn a_writable_update_death_after_the_pending_commit_restores_prior_ownership() {
+    // a death with the pending record committed and nothing staged restores
+    // the exact prior-owned snapshot before ordinary reconciliation resumes.
     let dir = unique_dir("update-death");
     let source = dir.join("source");
     fs::write(&source, "first\n").expect("write source");
@@ -194,23 +228,28 @@ fn a_writable_update_death_after_the_pending_commit_converges_through_recovery()
     assert_eq!(pending["baselineHash"], FIRST_HASH);
     assert_eq!(pending["intendedWitnessHash"], SECOND_HASH);
     assert!(pending["stageName"].is_string());
+    assert!(pending["priorOwned"].is_object());
     assert_eq!(fs::read(&destination).unwrap(), b"first\n");
+    fs::write(&source, "first\n").expect("restore declared source");
     let recovered = run_reconcile(&dir, None);
-    assert_eq!(recovered.status.code(), Some(1));
-    let diagnostic = stderr_line(&recovered);
-    assert_eq!(diagnostic["code"], "runtime/conflicting-destination");
+    assert_eq!(recovered.status.code(), Some(0));
+    assert!(recovered.stderr.is_empty());
     assert_eq!(fs::read(&destination).unwrap(), b"first\n");
-    let ledger = read_ledger(&dir);
-    assert!(
-        ledger["records"]
-            .get(format!("test:{}", destination.to_str().unwrap()))
-            .is_none()
-    );
+    let record = record_at(&dir, &destination);
+    assert_eq!(record["state"], "owned");
+    assert_eq!(record["appliedBy"], "new");
+    assert_eq!(record["baselineHash"], FIRST_HASH);
+    assert_eq!(record["intendedWitnessHash"], FIRST_HASH);
+    assert_eq!(record["appliedOperationGeneration"], 1);
+    assert_eq!(record["stageName"], serde_json::Value::Null);
+    assert!(record.get("priorOwned").is_none());
 }
 
 #[test]
-fn recovery_promotes_a_pending_record_when_a_prior_owned_record_exists() {
-    let dir = unique_dir("prior-owned");
+fn recovery_promotes_a_legacy_pending_record_after_forward_completion() {
+    // prior-owned is absent in this planted legacy record, but exact forward
+    // completion is sufficient to promote it without reconstructing the past.
+    let dir = unique_dir("legacy-forward");
     let source = dir.join("source");
     fs::write(&source, "new payload\n").expect("write source");
     let destination = dir.join("value");
@@ -238,6 +277,7 @@ fn recovery_promotes_a_pending_record_when_a_prior_owned_record_exists() {
             Some(NEW_PAYLOAD_HASH),
             7,
             Some(".furnish.dead.0.stage"),
+            None,
         ),
     );
     let output = run_reconcile(&dir, None);
@@ -255,7 +295,7 @@ fn recovery_promotes_a_pending_record_when_a_prior_owned_record_exists() {
 #[test]
 fn a_death_after_the_exchange_with_edited_displaced_bytes_restores_and_refuses() {
     // the stage may hold displaced user bytes, so recovery hashes it before
-    // anything unlinks it: an edited file goes back to the destination and
+    // anything unlinks it. an edited file goes back to the destination and
     // the update is refused.
     let dir = unique_dir("exchange-edited");
     let source = dir.join("source");
@@ -346,20 +386,23 @@ fn symlink_entry_json(root: &Path, name: &str, target: &Path) -> String {
 }
 
 #[test]
-fn a_landed_exchange_converges_as_a_steady_state_and_restamps_the_record() {
-    // the owned-symlink death that no fault point can reach: the exchange has
-    // landed, the ledger still records the old target, and the next ordinary
-    // run sees a destination equal to the declaration and refreshes the
-    // record rather than refusing. the displaced link is nobody's to clean.
-    let dir = unique_dir("landed-exchange");
+fn an_owned_symlink_update_death_after_the_pending_commit_restores_prior_ownership() {
+    let dir = unique_dir("symlink-pending");
     let recorded_target = dir.join("recorded-target");
-    fs::write(&recorded_target, b"live").expect("create recorded target");
+    fs::write(&recorded_target, b"recorded").expect("create recorded target");
     let desired_target = dir.join("desired-target");
     fs::write(&desired_target, b"desired").expect("create desired target");
     let destination = dir.join("value");
-    std::os::unix::fs::symlink(&desired_target, &destination).expect("plant exchanged destination");
-    let orphan = dir.join(".furnish.9999.0.stage");
-    std::os::unix::fs::symlink(&recorded_target, &orphan).expect("plant orphaned displaced link");
+    fs::write(
+        dir.join("manifest.json"),
+        manifest_json(&format!(
+            "[{}]",
+            symlink_entry_json(&dir, "value", &recorded_target)
+        )),
+    )
+    .expect("write recorded manifest");
+    let established = run_reconcile(&dir, None);
+    assert_eq!(established.status.code(), Some(0));
     fs::write(
         dir.join("manifest.json"),
         manifest_json(&format!(
@@ -367,21 +410,135 @@ fn a_landed_exchange_converges_as_a_steady_state_and_restamps_the_record() {
             symlink_entry_json(&dir, "value", &desired_target)
         )),
     )
+    .expect("write desired manifest");
+
+    let crashed = run_reconcile(&dir, Some("pending-committed"));
+
+    assert!(!crashed.status.success());
+    let pending = record_at(&dir, &destination);
+    assert_eq!(pending["state"], "pending");
+    assert_eq!(pending["appliedBy"], "update");
+    assert_eq!(
+        pending["priorOwned"]["appliedArtifactTarget"],
+        recorded_target.to_str().unwrap()
+    );
+    assert_eq!(fs::read_link(&destination).unwrap(), recorded_target);
+    fs::write(
+        dir.join("manifest.json"),
+        manifest_json(&format!(
+            "[{}]",
+            symlink_entry_json(&dir, "value", &recorded_target)
+        )),
+    )
+    .expect("restore recorded manifest");
+
+    let recovered = run_reconcile(&dir, None);
+
+    assert_eq!(recovered.status.code(), Some(0));
+    assert_eq!(fs::read_link(&destination).unwrap(), recorded_target);
+    let record = record_at(&dir, &destination);
+    assert_eq!(record["state"], "owned");
+    assert_eq!(record["appliedBy"], "new");
+    assert!(record.get("priorOwned").is_none());
+}
+
+#[test]
+fn a_death_after_an_owned_symlink_exchange_removes_the_displaced_link_on_recovery() {
+    let dir = unique_dir("symlink-exchange");
+    let recorded_target = dir.join("recorded-target");
+    fs::write(&recorded_target, b"recorded").expect("create recorded target");
+    let desired_target = dir.join("desired-target");
+    fs::write(&desired_target, b"desired").expect("create desired target");
+    let destination = dir.join("value");
+    fs::write(
+        dir.join("manifest.json"),
+        manifest_json(&format!(
+            "[{}]",
+            symlink_entry_json(&dir, "value", &recorded_target)
+        )),
+    )
+    .expect("write recorded manifest");
+    let established = run_reconcile(&dir, None);
+    assert_eq!(established.status.code(), Some(0));
+    fs::write(
+        dir.join("manifest.json"),
+        manifest_json(&format!(
+            "[{}]",
+            symlink_entry_json(&dir, "value", &desired_target)
+        )),
+    )
+    .expect("write desired manifest");
+
+    let crashed = run_reconcile(&dir, Some("exchange-published"));
+
+    assert!(!crashed.status.success());
+    assert_eq!(fs::read_link(&destination).unwrap(), desired_target);
+    let pending = record_at(&dir, &destination);
+    assert_eq!(pending["state"], "pending");
+    assert_eq!(pending["appliedBy"], "update");
+    assert!(pending["priorOwned"].is_object());
+    let stage = fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .find(|name| name.starts_with(".furnish.") && name.ends_with(".stage"))
+        .expect("the displaced link survived the crash");
+    assert_eq!(fs::read_link(dir.join(&stage)).unwrap(), recorded_target);
+
+    let recovered = run_reconcile(&dir, None);
+
+    assert_eq!(recovered.status.code(), Some(0));
+    assert_eq!(fs::read_link(&destination).unwrap(), desired_target);
+    assert!(fs::symlink_metadata(dir.join(&stage)).is_err());
+    let record = record_at(&dir, &destination);
+    assert_eq!(record["state"], "owned");
+    assert_eq!(record["appliedBy"], "update");
+    assert!(record.get("priorOwned").is_none());
+}
+
+#[test]
+fn a_landed_owned_symlink_exchange_removes_the_verified_displaced_link() {
+    let dir = unique_dir("landed-exchange");
+    // the literal target path strings hash to FIRST_HASH and SECOND_HASH by construction.
+    let recorded_target = Path::new("first\n");
+    let desired_target = Path::new("second\n");
+    let destination = dir.join("value");
+    std::os::unix::fs::symlink(desired_target, &destination).expect("plant exchanged destination");
+    let stage = ".furnish.9999.0.stage";
+    std::os::unix::fs::symlink(recorded_target, dir.join(stage))
+        .expect("plant displaced recorded link");
+    fs::write(
+        dir.join("manifest.json"),
+        manifest_json(&format!(
+            "[{}]",
+            symlink_entry_json(&dir, "value", desired_target)
+        )),
+    )
     .expect("write manifest");
+    let prior_owned = prior_owned_json(
+        &destination,
+        recorded_target,
+        &dir,
+        "new",
+        "symlink",
+        None,
+        Some(FIRST_HASH),
+        0,
+    );
     plant_ledger(
         &dir,
         &format!("test:{}", destination.to_str().unwrap()),
         &record_json(
             &destination,
-            &recorded_target,
+            desired_target,
             &dir,
-            "new",
-            "owned",
+            "update",
+            "pending",
             "symlink",
             None,
-            None,
+            Some(SECOND_HASH),
             0,
-            None,
+            Some(stage),
+            Some(&prior_owned),
         ),
     );
     let output = run_reconcile(&dir, None);
@@ -393,15 +550,17 @@ fn a_landed_exchange_converges_as_a_steady_state_and_restamps_the_record() {
         record["appliedArtifactTarget"],
         desired_target.to_str().unwrap()
     );
-    assert_eq!(record["appliedBy"], "new");
+    assert_eq!(record["appliedBy"], "update");
     assert_eq!(record["state"], "owned");
-    assert!(fs::symlink_metadata(&orphan).is_ok());
+    assert_eq!(record["intendedWitnessHash"], SECOND_HASH);
+    assert!(record.get("priorOwned").is_none());
+    assert!(fs::symlink_metadata(dir.join(stage)).is_err());
 }
 
 #[test]
 fn a_death_after_the_exchange_with_edited_displaced_bytes_discards_under_source_wins() {
     // the same displaced-edit state, but the declaration authorizes
-    // discarding it: the stage is removed without a restore and the update
+    // discarding it. the stage is removed without a restore and the update
     // completes.
     let dir = unique_dir("exchange-source-wins");
     let source = dir.join("source");
