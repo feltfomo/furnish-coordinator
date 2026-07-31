@@ -7,6 +7,30 @@ pub(crate) const DIAGNOSTIC_SCHEMA_VERSION: u64 = 1;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct BootstrapDiagnostic<'a> {
+    schema_version: u64,
+    severity: &'static str,
+    code: &'static str,
+    message: &'a str,
+    primary: Primary<'a>,
+}
+
+pub(crate) fn emit_bootstrap(message: &str, label: &str) {
+    let envelope = BootstrapDiagnostic {
+        schema_version: DIAGNOSTIC_SCHEMA_VERSION,
+        severity: "error",
+        code: "furnish/runtime-bootstrap",
+        message,
+        primary: Primary { label },
+    };
+    match serde_json::to_string(&envelope) {
+        Ok(line) => eprintln!("{line}"),
+        Err(_) => eprintln!("furnish: failed to serialize bootstrap diagnostic"),
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct Diagnostic<'a> {
     pub(crate) schema_version: u64,
     pub(crate) severity: &'a str,
@@ -68,11 +92,11 @@ pub(crate) struct Failure {
     pub(crate) key: CodeKey,
     pub(crate) message: String,
     pub(crate) label: String,
-    pub(crate) operation: Option<&'static str>,
-    pub(crate) errno: Option<i32>,
+    pub(crate) cause: Option<Cause<'static>>,
     // set only on conflict diagnostics; carries b, s, d so the caller does
     // not have to thread them through a separate code path.
-    pub(crate) observed: Option<(Option<String>, String, String)>,
+    pub(crate) observed: Option<Box<(Option<String>, String, String)>>,
+    pub(crate) cleanup_warning: Option<Box<Failure>>,
 }
 
 pub(crate) type Result<T> = std::result::Result<T, Failure>;
@@ -83,9 +107,9 @@ impl Failure {
             key,
             message: message.into(),
             label: label.into(),
-            operation: None,
-            errno: None,
+            cause: None,
             observed: None,
+            cleanup_warning: None,
         }
     }
 
@@ -99,13 +123,13 @@ impl Failure {
             key: CodeKey::ConflictingDestination,
             message: "destination and source have both diverged from the baseline and this declaration's policy is to refuse".to_owned(),
             label: label.into(),
-            operation: None,
-            errno: None,
-            observed: Some((
+            cause: None,
+            observed: Some(Box::new((
                 baseline.map(str::to_owned),
                 source.to_owned(),
                 destination.to_owned(),
-            )),
+            ))),
+            cleanup_warning: None,
         }
     }
 
@@ -119,9 +143,12 @@ impl Failure {
             key,
             message: format!("{operation} failed"),
             label: label.into(),
-            operation: Some(operation),
-            errno: Some(errno.raw_os_error()),
+            cause: Some(Cause {
+                operation,
+                errno: errno.raw_os_error(),
+            }),
             observed: None,
+            cleanup_warning: None,
         }
     }
 
@@ -135,9 +162,9 @@ impl Failure {
             key,
             message: format!("{operation} failed: {error}"),
             label: label.into(),
-            operation: Some(operation),
-            errno: error.raw_os_error(),
+            cause: error.raw_os_error().map(|errno| Cause { operation, errno }),
             observed: None,
+            cleanup_warning: None,
         }
     }
 }
@@ -188,11 +215,11 @@ pub(crate) fn serialize_diagnostic(
             label: &failure.label,
         },
         provenance,
-        cause: failure
-            .operation
-            .zip(failure.errno)
-            .map(|(operation, errno)| Cause { operation, errno }),
-        observed: failure.observed.as_ref().map(|(b, s, d)| ObservedHashes {
+        cause: failure.cause.as_ref().map(|cause| Cause {
+            operation: cause.operation,
+            errno: cause.errno,
+        }),
+        observed: failure.observed.as_deref().map(|(b, s, d)| ObservedHashes {
             baseline: b.as_deref(),
             source: s,
             destination: d,
@@ -208,6 +235,9 @@ pub(crate) fn emit_failure(
     match serialize_failure(codes, failure, provenance) {
         Ok(line) => eprintln!("{line}"),
         Err(_) => eprintln!("furnish: failed to serialize runtime diagnostic"),
+    }
+    if let Some(cleanup) = failure.cleanup_warning.as_deref() {
+        emit_warning(codes, cleanup, provenance);
     }
 }
 
@@ -250,5 +280,15 @@ mod tests {
         let diagnostic: serde_json::Value = serde_json::from_str(&encoded).expect("decode");
         assert!(diagnostic["observed"].get("baseline").is_some());
         assert!(diagnostic["observed"]["baseline"].is_null());
+    }
+}
+
+#[cfg(test)]
+mod sp3_size_tests {
+    use super::*;
+
+    #[test]
+    fn failure_keeps_cold_payloads_behind_pointers() {
+        assert!(std::mem::size_of::<Failure>() <= 96);
     }
 }

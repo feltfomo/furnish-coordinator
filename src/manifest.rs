@@ -1,4 +1,5 @@
 use crate::diagnostic::{CodeKey, DIAGNOSTIC_SCHEMA_VERSION, Failure, Result};
+use crate::executor::WorkerKind;
 use serde::{Deserialize, Serialize};
 
 pub(crate) const MANIFEST_SCHEMA_VERSION: u64 = 2;
@@ -16,8 +17,7 @@ pub(crate) struct ExecutorProfile {
     pub(crate) protocol_version: u64,
     pub(crate) representation: &'static str,
     pub(crate) lifecycle_strategy: &'static str,
-    pub(crate) worker_subcommand: &'static str,
-    pub(crate) worker_value_flag: &'static str,
+    pub(crate) worker_kind: WorkerKind,
 }
 
 pub(crate) const EXECUTOR_PROFILES: [ExecutorProfile; 2] = [
@@ -26,16 +26,14 @@ pub(crate) const EXECUTOR_PROFILES: [ExecutorProfile; 2] = [
         protocol_version: NATIVE_EXECUTOR_PROTOCOL,
         representation: NATIVE_REPRESENTATION,
         lifecycle_strategy: "exact-symlink-target",
-        worker_subcommand: "stage-native-symlink",
-        worker_value_flag: "--target",
+        worker_kind: WorkerKind::Symlink,
     },
     ExecutorProfile {
         identity: NATIVE_WRITABLE_IDENTITY,
         protocol_version: NATIVE_WRITABLE_PROTOCOL,
         representation: WRITABLE_REPRESENTATION,
         lifecycle_strategy: "exact-source-content",
-        worker_subcommand: "stage-native-writable",
-        worker_value_flag: "--source",
+        worker_kind: WorkerKind::Writable,
     },
 ];
 

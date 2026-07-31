@@ -128,8 +128,14 @@ mod tests {
         symlink("elsewhere", root.0.join(lock_name)).expect("plant lock symlink");
         let failure =
             acquire_lock(&root.open(), &root.0, lock_name).expect_err("refuse lock symlink");
-        assert_eq!(failure.operation, Some("openat-lock"));
-        assert_eq!(failure.errno, Some(Errno::LOOP.raw_os_error()));
+        assert_eq!(
+            failure.cause.as_ref().map(|cause| cause.operation),
+            Some("openat-lock")
+        );
+        assert_eq!(
+            failure.cause.as_ref().map(|cause| cause.errno),
+            Some(Errno::LOOP.raw_os_error())
+        );
         let codes = DiagnosticCodes {
             invalid_manifest: "runtime/invalid-manifest".to_owned(),
             ..DiagnosticCodes::default()

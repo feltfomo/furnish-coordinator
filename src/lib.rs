@@ -1,14 +1,17 @@
 mod cli;
 mod diagnostic;
+mod executor;
 mod fault;
+#[path = "fs/mod.rs"]
+mod filesystem;
 mod hash;
 mod identity;
 mod lock;
 mod manifest;
 
-use cli::DIRECTORY_ACTION;
 use diagnostic::*;
 use fault::*;
+use filesystem::*;
 use hash::*;
 use identity::*;
 use lock::*;
@@ -21,15 +24,16 @@ use rustix::fs::{
 use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 
 pub fn run(args: Vec<OsString>) -> ExitCode {
     cli::run(&args)
@@ -47,180 +51,9 @@ const LEDGER_ROLLBACK_FILE_NAME: &str = "applied-state.v1.json";
 
 const LEDGER_STAGE_PREFIX: &str = ".applied-state";
 
-// how the walk treats a parent component that is not there. the traversal is
-// identical either way, so a component that exists as a symlink or as a
-// non-directory refuses in both modes for the same reason.
-enum ParentMode<'a> {
-    Refuse,
-    Create {
-        setpriv: &'a Path,
-        authority: &'a Authority,
-    },
-}
-
-// the no-create walk. every caller that must not create keeps this one.
-fn open_parent(destination: &str, managed_root: &str) -> Result<(OwnedFd, OsString)> {
-    walk_parent(destination, managed_root, &ParentMode::Refuse)
-}
-
-fn walk_parent(
-    destination: &str,
-    managed_root: &str,
-    mode: &ParentMode<'_>,
-) -> Result<(OwnedFd, OsString)> {
-    let destination_path = Path::new(destination);
-    let managed_root_path = Path::new(managed_root);
-    if !destination_path.is_absolute()
-        || !managed_root_path.is_absolute()
-        || destination_path == managed_root_path
-        || !destination_path.starts_with(managed_root_path)
-    {
-        return Err(Failure::new(
-            CodeKey::InvalidDestination,
-            destination,
-            "destination must be an absolute descendant of managedRoot",
-        ));
-    }
-    let name = destination_path
-        .file_name()
-        .ok_or_else(|| {
-            Failure::new(
-                CodeKey::InvalidDestination,
-                destination,
-                "destination has no final component",
-            )
-        })?
-        .to_os_string();
-    let parent = destination_path.parent().ok_or_else(|| {
-        Failure::new(
-            CodeKey::InvalidDestination,
-            destination,
-            "destination has no parent",
-        )
-    })?;
-
-    let mut current = open(
-        "/",
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
-        Mode::empty(),
-    )
-    .map_err(|errno| Failure::syscall(CodeKey::ParentTraversal, destination, "open-root", errno))?;
-
-    // creation is bounded by the managed root, so the components at and above it
-    // are traversed and never made. the bound is counted on the walk itself
-    // rather than matched on the string, because the walk is where a component is
-    // opened and so is the only place the bound can hold.
-    let boundary = managed_root_path.components().count();
-    let mut depth = 0;
-    for component in parent.components() {
-        depth += 1;
-        match component {
-            Component::RootDir => {}
-            Component::Normal(part) => {
-                current =
-                    open_parent_component(&current, part, destination, mode, depth > boundary)?;
-            }
-            _ => {
-                return Err(Failure::new(
-                    CodeKey::InvalidDestination,
-                    destination,
-                    "destination contains a non-normal path component",
-                ));
-            }
-        }
-    }
-    Ok((current, name))
-}
-
-// one component of the walk. a component that is absent below the managed root
-// is delegated to the authority that will own it and then reopened through this
-// same refusing openat, so a symlink that appears in the gap loses to the reopen
-// rather than to a check that ran before it. an existing component is opened and
-// never touched, because its mode and ownership are somebody else's.
-fn open_parent_component(
-    parent: &OwnedFd,
-    part: &OsStr,
-    destination: &str,
-    mode: &ParentMode<'_>,
-    creatable: bool,
-) -> Result<OwnedFd> {
-    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW;
-    let refusal = |errno: Errno| {
-        Failure::syscall(
-            CodeKey::ParentTraversal,
-            destination,
-            "openat-parent-component",
-            errno,
-        )
-    };
-    match openat(parent, part, flags, Mode::empty()) {
-        Ok(opened) => Ok(opened),
-        Err(Errno::NOENT) => match mode {
-            ParentMode::Create { setpriv, authority } if creatable => {
-                run_directory_executor(setpriv, parent, part, destination, authority)?;
-                openat(parent, part, flags, Mode::empty()).map_err(|errno| {
-                    Failure::syscall(
-                        CodeKey::ParentTraversal,
-                        destination,
-                        "openat-created-parent-component",
-                        errno,
-                    )
-                })
-            }
-            _ => Err(refusal(Errno::NOENT)),
-        },
-        Err(errno) => Err(refusal(errno)),
-    }
-}
-
-fn symlink_target<Fd: std::os::fd::AsFd>(
-    dir: Fd,
-    name: &OsStr,
-) -> std::result::Result<Option<OsString>, Errno> {
-    match statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(stat) => {
-            if stat.st_mode & FILE_TYPE_MASK != SYMLINK_MODE {
-                return Ok(Some(OsString::new()));
-            }
-            let target = readlinkat(dir, name, Vec::new())?;
-            Ok(Some(OsString::from_vec(target.into_bytes())))
-        }
-        Err(Errno::NOENT) => Ok(None),
-        Err(errno) => Err(errno),
-    }
-}
-
-fn remove_unpublished_stage<Fd: std::os::fd::AsFd>(parent: Fd, stage: &OsStr) {
-    let _ = unlinkat(parent, stage, AtFlags::empty());
-}
-
 #[cfg(test)]
 thread_local! {
     static FAIL_VERIFIED_DISPLACED_CLEANUP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-fn remove_verified_displaced<Fd: std::os::fd::AsFd>(
-    parent: Fd,
-    stage: &OsStr,
-    destination: &str,
-) -> Result<()> {
-    #[cfg(test)]
-    if FAIL_VERIFIED_DISPLACED_CLEANUP.with(|fault| fault.replace(false)) {
-        return Err(Failure::syscall(
-            CodeKey::FinalVerification,
-            destination,
-            "unlinkat-verified-displaced",
-            Errno::IO,
-        ));
-    }
-    unlinkat(parent, stage, AtFlags::empty()).map_err(|errno| {
-        Failure::syscall(
-            CodeKey::FinalVerification,
-            destination,
-            "unlinkat-verified-displaced",
-            errno,
-        )
-    })
 }
 
 fn stage_name(index: usize) -> OsString {
@@ -235,51 +68,15 @@ fn run_executor(
     authority: &Authority,
     profile: &ExecutorProfile,
 ) -> Result<()> {
-    let executable = env::current_exe().map_err(|error| {
-        Failure::new(
-            CodeKey::ExecutorFailed,
-            target,
-            format!("cannot resolve coordinator executable: {error}"),
-        )
-    })?;
-    let mut command = if authority.scope == "user" {
-        let mut command = Command::new(setpriv);
-        command
-            .arg("--reuid")
-            .arg(&authority.identity)
-            .arg("--regid")
-            .arg(&authority.identity)
-            .arg("--init-groups")
-            .arg("--")
-            .arg(&executable);
-        command
-    } else {
-        Command::new(&executable)
-    };
-    let status = command
-        .arg(profile.worker_subcommand)
-        .arg("--parent-fd")
-        .arg(parent.as_raw_fd().to_string())
-        .arg("--name")
-        .arg(stage)
-        .arg(profile.worker_value_flag)
-        .arg(target)
-        .status()
-        .map_err(|error| {
-            Failure::new(
-                CodeKey::ExecutorFailed,
-                target,
-                format!("failed to launch native executor: {error}"),
-            )
-        })?;
-    if !status.success() {
-        return Err(Failure::new(
-            CodeKey::ExecutorFailed,
-            target,
-            format!("native executor exited with {status}"),
-        ));
-    }
-    Ok(())
+    executor::launch(
+        setpriv,
+        parent,
+        stage,
+        Some(OsStr::new(target)),
+        target,
+        authority,
+        profile.worker_kind,
+    )
 }
 
 // creating a directory under a user's home is the user's write, so it goes
@@ -292,49 +89,15 @@ fn run_directory_executor(
     destination: &str,
     authority: &Authority,
 ) -> Result<()> {
-    let executable = env::current_exe().map_err(|error| {
-        Failure::new(
-            CodeKey::ExecutorFailed,
-            destination,
-            format!("cannot resolve coordinator executable: {error}"),
-        )
-    })?;
-    let mut command = if authority.scope == "user" {
-        let mut command = Command::new(setpriv);
-        command
-            .arg("--reuid")
-            .arg(&authority.identity)
-            .arg("--regid")
-            .arg(&authority.identity)
-            .arg("--init-groups")
-            .arg("--")
-            .arg(&executable);
-        command
-    } else {
-        Command::new(&executable)
-    };
-    let status = command
-        .arg(DIRECTORY_ACTION.subcommand)
-        .arg("--parent-fd")
-        .arg(parent.as_raw_fd().to_string())
-        .arg("--name")
-        .arg(name)
-        .status()
-        .map_err(|error| {
-            Failure::new(
-                CodeKey::ExecutorFailed,
-                destination,
-                format!("failed to launch parent creation: {error}"),
-            )
-        })?;
-    if !status.success() {
-        return Err(Failure::new(
-            CodeKey::ExecutorFailed,
-            destination,
-            format!("parent creation exited with {status}"),
-        ));
-    }
-    Ok(())
+    executor::launch(
+        setpriv,
+        parent,
+        name,
+        None,
+        destination,
+        authority,
+        executor::WorkerKind::Directory,
+    )
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -671,7 +434,7 @@ fn stage_symlink(
     expected: &OsStr,
 ) -> Result<()> {
     let destination = &entry.filesystem_identity.destination;
-    remove_unpublished_stage(parent, stage);
+    remove_unpublished_stage(parent, stage, destination)?;
     let profile = profile_for(
         &entry.executor.identity,
         entry.executor.protocol_version,
@@ -700,132 +463,18 @@ fn stage_symlink(
             errno,
         )
     })?;
-    if staged.as_deref() != Some(expected) {
-        remove_unpublished_stage(parent, stage);
-        return Err(Failure::new(
-            CodeKey::StagingVerification,
+    if staged.target() != Some(expected) {
+        return Err(cleanup_unpublished_after_failure(
+            parent,
+            stage,
             destination,
-            "native executor produced an unexpected staging object",
-        ));
-    }
-    Ok(())
-}
-
-fn publish_new(
-    parent: &OwnedFd,
-    name: &OsStr,
-    stage: &OsStr,
-    destination: &str,
-    expected: &OsStr,
-) -> Result<()> {
-    if symlink_target(parent, name)
-        .map_err(|errno| {
-            Failure::syscall(
-                CodeKey::PublishRace,
+            Failure::new(
+                CodeKey::StagingVerification,
                 destination,
-                "fstatat-before-publish",
-                errno,
-            )
-        })?
-        .is_some()
-    {
-        remove_unpublished_stage(parent, stage);
-        return Err(Failure::new(
-            CodeKey::PublishRace,
-            destination,
-            "destination appeared before atomic publish; refusing replacement",
+                "native executor produced an unexpected staging object",
+            ),
         ));
     }
-
-    if let Err(errno) = renameat_with(parent, stage, parent, name, RenameFlags::NOREPLACE) {
-        remove_unpublished_stage(parent, stage);
-        return Err(Failure::syscall(
-            CodeKey::PublishRace,
-            destination,
-            "renameat2-noreplace-publish",
-            errno,
-        ));
-    }
-
-    let final_target = symlink_target(parent, name).map_err(|errno| {
-        Failure::syscall(
-            CodeKey::FinalVerification,
-            destination,
-            "readlinkat-final",
-            errno,
-        )
-    })?;
-    if final_target.as_deref() != Some(expected) {
-        return Err(Failure::new(
-            CodeKey::FinalVerification,
-            destination,
-            "published destination failed exact-target verification",
-        ));
-    }
-    Ok(())
-}
-
-// both owned branches land here, and neither is reachable without a LedgerRecord
-// in hand. the recorded target is a parameter rather than something re-read here
-// so that the thing being exchanged away has to have been proven, not assumed, by
-// the caller.
-fn publish_exchange(
-    parent: &OwnedFd,
-    name: &OsStr,
-    stage: &OsStr,
-    destination: &str,
-    expected: &OsStr,
-    recorded: &OsStr,
-) -> Result<()> {
-    if let Err(errno) = renameat_with(parent, stage, parent, name, RenameFlags::EXCHANGE) {
-        remove_unpublished_stage(parent, stage);
-        // enoent means the destination proved ownership of is no longer the thing
-        // on disk. the proof is stale, so the next reconcile decides again from
-        // observation. falling back to a create here would be publishing on
-        // evidence already known to be out of date.
-        return Err(Failure::syscall(
-            CodeKey::PublishRace,
-            destination,
-            "renameat2-exchange-publish",
-            errno,
-        ));
-    }
-    fault_point("exchange-published");
-
-    // both sides, because an exchange that put the right link at the destination
-    // while displacing something unidentified is not an accountable repair.
-    let published = symlink_target(parent, name).map_err(|errno| {
-        Failure::syscall(
-            CodeKey::RepairVerification,
-            destination,
-            "readlinkat-published",
-            errno,
-        )
-    })?;
-    let displaced = symlink_target(parent, stage).map_err(|errno| {
-        Failure::syscall(
-            CodeKey::RepairVerification,
-            destination,
-            "readlinkat-displaced",
-            errno,
-        )
-    })?;
-    if published.as_deref() != Some(expected) || displaced.as_deref() != Some(recorded) {
-        return Err(Failure::new(
-            CodeKey::RepairVerification,
-            destination,
-            "post-exchange verification did not observe the recorded link on both sides",
-        ));
-    }
-
-    // only the displaced symlink is unlinked. under repair it pointed at a target
-    // that was already reaped; under update it points at one that is still live
-    // and still referenced by the generation that declared it. unlinking a
-    // symlink never touches its pointee, so neither case destroys anything.
-    remove_verified_displaced(parent, stage, destination)?;
-    fault_point("published");
-    sync_parent(parent, destination)?;
-    fault_point("published-synced");
     Ok(())
 }
 
@@ -904,8 +553,8 @@ fn retire_record(record: &LedgerRecord) -> Result<RetireOutcome> {
     match observed {
         // already gone. there is nothing to unlink, and the record is the only
         // thing left to remove.
-        None => Ok(RetireOutcome::Removed),
-        Some(actual) if !actual.is_empty() && actual == recorded => {
+        DestinationObservation::Missing => Ok(RetireOutcome::Removed),
+        DestinationObservation::Symlink(actual) if actual == recorded => {
             unlinkat(&parent, name.as_os_str(), AtFlags::empty()).map_err(|errno| {
                 Failure::syscall(
                     CodeKey::ExecutorFailed,
@@ -916,78 +565,12 @@ fn retire_record(record: &LedgerRecord) -> Result<RetireOutcome> {
             })?;
             Ok(RetireOutcome::Removed)
         }
-        Some(_) => Err(Failure::new(
+        _ => Err(Failure::new(
             CodeKey::ConflictingDestination,
             destination,
             "refusing to retire a destination that is no longer the link recorded as furnish-owned",
         )),
     }
-}
-
-// observation is by file type, not by a link read, because writable has to tell
-// a regular file from a directory or a device before it will touch anything.
-fn observe_kind(parent: &OwnedFd, name: &OsStr, destination: &str) -> Result<Option<u32>> {
-    match statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(stat) => Ok(Some(stat.st_mode as u32 & FILE_TYPE_MASK)),
-        Err(Errno::NOENT) => Ok(None),
-        Err(errno) => Err(Failure::syscall(
-            CodeKey::ConflictingDestination,
-            destination,
-            "fstatat-destination-kind",
-            errno,
-        )),
-    }
-}
-
-fn observe_mode(parent: &OwnedFd, name: &OsStr, destination: &str) -> Result<u32> {
-    match statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(stat) => Ok(stat.st_mode as u32 & 0o7777),
-        Err(errno) => Err(Failure::syscall(
-            CodeKey::ConflictingDestination,
-            destination,
-            "fstatat-destination-mode",
-            errno,
-        )),
-    }
-}
-
-// nofollow throughout, so a symlink at the destination is never followed and
-// never written through, and reading one is refused rather than resolved.
-fn read_regular(
-    parent: &OwnedFd,
-    name: &OsStr,
-    destination: &str,
-    key: CodeKey,
-    operation: &'static str,
-) -> Result<Vec<u8>> {
-    let opened = openat(
-        parent,
-        name,
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::empty(),
-    )
-    .map_err(|errno| Failure::syscall(key, destination, operation, errno))?;
-    let mut file = fs::File::from(opened);
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .map_err(|error| Failure::io(key, destination, operation, &error))?;
-    Ok(bytes)
-}
-
-fn hash_regular(
-    parent: &OwnedFd,
-    name: &OsStr,
-    destination: &str,
-    key: CodeKey,
-    operation: &'static str,
-) -> Result<String> {
-    Ok(sha256_hex(&read_regular(
-        parent,
-        name,
-        destination,
-        key,
-        operation,
-    )?))
 }
 
 fn hash_source(source: &str, destination: &str) -> Result<String> {
@@ -1000,19 +583,6 @@ fn hash_source(source: &str, destination: &str) -> Result<String> {
         )
     })?;
     Ok(sha256_hex(&bytes))
-}
-
-// the rename is only durable once the directory entry is, so the parent is
-// synced before anything is verified or recorded as published.
-fn sync_parent(parent: &OwnedFd, destination: &str) -> Result<()> {
-    fsync(parent).map_err(|errno| {
-        Failure::syscall(
-            CodeKey::FinalVerification,
-            destination,
-            "fsync-parent",
-            errno,
-        )
-    })
 }
 
 // nothing has been applied yet, so the prior record's applied state is carried
@@ -1097,7 +667,7 @@ fn stage_writable(
     intended_hash: &str,
 ) -> Result<()> {
     let destination = &entry.filesystem_identity.destination;
-    remove_unpublished_stage(parent, stage);
+    remove_unpublished_stage(parent, stage, destination)?;
     let profile = profile_for(
         &entry.executor.identity,
         entry.executor.protocol_version,
@@ -1120,11 +690,15 @@ fn stage_writable(
     )?;
     fault_point("stage-written");
     if observe_kind(parent, stage, destination)? != Some(REGULAR_MODE) {
-        remove_unpublished_stage(parent, stage);
-        return Err(Failure::new(
-            CodeKey::StagingVerification,
+        return Err(cleanup_unpublished_after_failure(
+            parent,
+            stage,
             destination,
-            "native executor produced an unexpected staging object",
+            Failure::new(
+                CodeKey::StagingVerification,
+                destination,
+                "native executor produced an unexpected staging object",
+            ),
         ));
     }
     let staged_hash = hash_regular(
@@ -1135,63 +709,33 @@ fn stage_writable(
         "read-staging",
     )?;
     if staged_hash != intended_hash {
-        remove_unpublished_stage(parent, stage);
-        return Err(Failure::new(
-            CodeKey::StagingVerification,
+        return Err(cleanup_unpublished_after_failure(
+            parent,
+            stage,
             destination,
-            "staged content does not hash to the intended source content",
+            Failure::new(
+                CodeKey::StagingVerification,
+                destination,
+                "staged content does not hash to the intended source content",
+            ),
         ));
     }
     let mode = observe_mode(parent, stage, destination)?;
     if mode != WRITABLE_FILE_MODE {
-        remove_unpublished_stage(parent, stage);
-        return Err(Failure::new(
-            CodeKey::StagingVerification,
+        return Err(cleanup_unpublished_after_failure(
+            parent,
+            stage,
             destination,
-            format!("staged file mode is {mode:04o}; expected {WRITABLE_FILE_MODE:04o}"),
+            Failure::new(
+                CodeKey::StagingVerification,
+                destination,
+                format!("staged file mode is {mode:04o}; expected {WRITABLE_FILE_MODE:04o}"),
+            ),
         ));
     }
     Ok(())
 }
 
-// publication into an absent name. NOREPLACE is what makes this refuse rather
-// than displace, so a destination that appeared during staging is never
-// overwritten and never adopted.
-fn publish_writable_new(
-    parent: &OwnedFd,
-    name: &OsStr,
-    stage: &OsStr,
-    destination: &str,
-    intended_hash: &str,
-) -> Result<()> {
-    fault_point("stage-synced");
-    if observe_kind(parent, name, destination)?.is_some() {
-        remove_unpublished_stage(parent, stage);
-        return Err(Failure::new(
-            CodeKey::PublishRace,
-            destination,
-            "destination appeared before atomic publish; refusing replacement",
-        ));
-    }
-    if let Err(errno) = renameat_with(parent, stage, parent, name, RenameFlags::NOREPLACE) {
-        remove_unpublished_stage(parent, stage);
-        return Err(Failure::syscall(
-            CodeKey::PublishRace,
-            destination,
-            "renameat2-noreplace-publish",
-            errno,
-        ));
-    }
-    fault_point("published");
-    sync_parent(parent, destination)?;
-    fault_point("published-synced");
-    verify_writable_destination(parent, name, destination, intended_hash)?;
-    fault_point("verified");
-    Ok(())
-}
-
-// ownership commits only after this returns. observation of the published
-// object, not the executor's exit status, is what makes the claim.
 fn verify_writable_destination(
     parent: &OwnedFd,
     name: &OsStr,
@@ -1232,151 +776,8 @@ fn verify_writable_destination(
 
 const TRANSITION_MARKER: &str = "transition";
 
-// materialize a new source version over an owned destination. the existing
-// destination is displaced to the stage path by an atomic exchange. after the
-// exchange the displaced bytes are hashed and compared to expected_displaced,
-// which is what was observed before staging; if they differ, a concurrent write
-// raced us and we exchange back to restore the original destination, then
-// report the race without leaving either side in an intermediate state.
-//
-// publish_exchange, the symlink route, runs the same exchange but rechecks a
-// target string, because what it guards is a representation swap. this one
-// rechecks content, because what it guards is bytes a user may have edited.
-#[allow(clippy::result_large_err)]
-fn verify_writable_hash(
-    parent: &OwnedFd,
-    name: &OsStr,
-    destination: &str,
-    expected: &str,
-    operation: &'static str,
-) -> Result<()> {
-    if observe_kind(parent, name, destination)? != Some(REGULAR_MODE) {
-        return Err(Failure::new(
-            CodeKey::PendingRecovery,
-            destination,
-            "transaction side is not the recorded regular file",
-        ));
-    }
-    let observed = hash_regular(
-        parent,
-        name,
-        destination,
-        CodeKey::PendingRecovery,
-        operation,
-    )?;
-    if observed != expected {
-        return Err(Failure::new(
-            CodeKey::PendingRecovery,
-            destination,
-            "transaction side does not match its recorded witness",
-        ));
-    }
-    Ok(())
-}
-
-#[allow(clippy::result_large_err)]
-fn rollback_exchange(
-    parent: &OwnedFd,
-    name: &OsStr,
-    stage: &OsStr,
-    destination: &str,
-    prior_hash: &str,
-    intended_hash: &str,
-) -> Result<()> {
-    reverse_exchange_restore_fault().map_err(|errno| {
-        Failure::syscall(
-            CodeKey::PendingRecovery,
-            destination,
-            "renameat2-exchange-restore-pending",
-            errno,
-        )
-    })?;
-    renameat_with(parent, stage, parent, name, RenameFlags::EXCHANGE).map_err(|errno| {
-        Failure::syscall(
-            CodeKey::PendingRecovery,
-            destination,
-            "renameat2-exchange-restore-pending",
-            errno,
-        )
-    })?;
-    sync_parent(parent, destination)?;
-    verify_writable_hash(
-        parent,
-        name,
-        destination,
-        prior_hash,
-        "read-restored-destination",
-    )?;
-    verify_writable_hash(
-        parent,
-        stage,
-        destination,
-        intended_hash,
-        "read-restored-stage",
-    )?;
-    remove_unpublished_stage(parent, stage);
-    Ok(())
-}
-
-fn publish_writable_exchange(
-    parent: &OwnedFd,
-    name: &OsStr,
-    stage: &OsStr,
-    destination: &str,
-    expected_displaced: &str,
-    intended_hash: &str,
-) -> Result<()> {
-    fault_point("stage-synced");
-    if let Err(errno) = renameat_with(parent, stage, parent, name, RenameFlags::EXCHANGE) {
-        remove_unpublished_stage(parent, stage);
-        return Err(Failure::syscall(
-            CodeKey::PublishRace,
-            destination,
-            "renameat2-exchange-publish",
-            errno,
-        ));
-    }
-    fault_point("exchange-published");
-    // the displaced content now sits at the stage path. hash it and compare
-    // to what was observed before staging; a mismatch means a concurrent
-    // writer modified the destination between our read and the exchange.
-    let displaced_hash = hash_regular(
-        parent,
-        stage,
-        destination,
-        CodeKey::PublishRace,
-        "read-displaced",
-    )?;
-    if displaced_hash != expected_displaced {
-        rollback_exchange(
-            parent,
-            name,
-            stage,
-            destination,
-            &displaced_hash,
-            intended_hash,
-        )?;
-        return Err(Failure::new(
-            CodeKey::PublishRace,
-            destination,
-            "destination changed between observation and publication; exchange reversed",
-        ));
-    }
-    // displaced content matched; the exchange is clean. remove the displaced
-    // bytes from the stage path and sync the directory.
-    remove_verified_displaced(parent, stage, destination)?;
-    fault_point("published");
-    sync_parent(parent, destination)?;
-    fault_point("published-synced");
-    verify_writable_destination(parent, name, destination, intended_hash)?;
-    fault_point("verified");
-    Ok(())
-}
-
-// row three and source-wins publish identically and differ only in why they
-// were reached, so the pending-record bracket is written once here instead of
-// twice at the call sites. the caller has already decided that publishing is
-// the right answer; this only carries it out durably.
+// Row three and source-wins share one pending-record bracket after the caller
+// selects publication.
 #[allow(clippy::too_many_arguments)]
 fn publish_writable_update(
     entry: &Entry,
@@ -1407,6 +808,13 @@ fn publish_writable_update(
         destination,
         expected_displaced,
         intended,
+        if entry.on_conflict == ConflictPolicy::SourceWins
+            && record.baseline_hash.as_deref() != Some(expected_displaced)
+        {
+            DisplacedCleanup::PolicyDisplaced
+        } else {
+            DisplacedCleanup::VerifiedOwned
+        },
     )?;
     ledger.commit(
         canonical,
@@ -1485,8 +893,7 @@ fn recover_pending(entry: &Entry, ledger: &mut LedgerState, identity: &RunIdenti
                     errno,
                 )
             })?;
-            artifact_matches
-                && target.as_deref() == Some(OsStr::new(&record.applied_artifact_target))
+            artifact_matches && target.target() == Some(OsStr::new(&record.applied_artifact_target))
         }
     };
 
@@ -1543,13 +950,24 @@ fn recover_pending(entry: &Entry, ledger: &mut LedgerState, identity: &RunIdenti
                             ));
                         };
                         ledger.commit(canonical, prior.restore())?;
-                        return Err(Failure::new(
-                            CodeKey::PendingRecovery,
+                        return Err(cleanup_unpublished_after_failure(
+                            &parent,
+                            stage,
                             destination,
-                            "destination was edited while a writable update was publishing; the edited content was restored and the update was not recorded",
+                            Failure::new(
+                                CodeKey::PendingRecovery,
+                                destination,
+                                "destination was edited while a writable update was publishing; the edited content was restored and the update was not recorded",
+                            ),
                         ));
                     }
-                    remove_verified_displaced(&parent, stage, destination)?;
+                    if entry.on_conflict == ConflictPolicy::SourceWins
+                        && record.baseline_hash.as_deref() != Some(displaced_hash.as_str())
+                    {
+                        discard_displaced_under_policy(&parent, stage, destination)?;
+                    } else {
+                        remove_verified_displaced(&parent, stage, destination)?;
+                    }
                 }
                 Some(SYMLINK_MODE) => {
                     let Some(prior) = record.prior_owned.as_ref() else {
@@ -1574,7 +992,7 @@ fn recover_pending(entry: &Entry, ledger: &mut LedgerState, identity: &RunIdenti
                             errno,
                         )
                     })?;
-                    if displaced.as_deref() != Some(OsStr::new(&prior.applied_artifact_target)) {
+                    if displaced.target() != Some(OsStr::new(&prior.applied_artifact_target)) {
                         return Err(Failure::new(
                             CodeKey::PendingRecovery,
                             destination,
@@ -1614,7 +1032,7 @@ fn recover_pending(entry: &Entry, ledger: &mut LedgerState, identity: &RunIdenti
                     errno,
                 )
             })?;
-            if target.as_deref() != Some(OsStr::new(&prior.applied_artifact_target)) {
+            if target.target() != Some(OsStr::new(&prior.applied_artifact_target)) {
                 return Err(Failure::new(
                     CodeKey::PendingRecovery,
                     destination,
@@ -1650,7 +1068,7 @@ fn recover_pending(entry: &Entry, ledger: &mut LedgerState, identity: &RunIdenti
                     "read-unpublished-pending",
                 )?;
             }
-            remove_unpublished_stage(&parent, stage);
+            remove_unpublished_stage(&parent, stage, destination)?;
         }
         ledger.commit(canonical, prior.restore())?;
         return Ok(());
@@ -1676,7 +1094,7 @@ fn recover_pending(entry: &Entry, ledger: &mut LedgerState, identity: &RunIdenti
                     "read-unpublished-acquisition",
                 )?;
             }
-            remove_unpublished_stage(&parent, stage);
+            remove_unpublished_stage(&parent, stage, destination)?;
         }
         ledger.retire(canonical)?;
         return Ok(());
@@ -1694,7 +1112,7 @@ fn recover_pending(entry: &Entry, ledger: &mut LedgerState, identity: &RunIdenti
 // sits at the stage name; for a writable source that displaced object may hold
 // edited user bytes, so it is never unlinked without being hashed against the
 // baseline first.
-#[allow(clippy::result_large_err, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn recover_transition(
     entry: &Entry,
     ledger: &mut LedgerState,
@@ -1765,7 +1183,7 @@ fn recover_transition(
                     errno,
                 )
             })?;
-            if target.as_deref() != Some(OsStr::new(&prior.applied_artifact_target)) {
+            if target.target() != Some(OsStr::new(&prior.applied_artifact_target)) {
                 return Err(Failure::new(
                     CodeKey::TransitionRefused,
                     destination,
@@ -1798,7 +1216,7 @@ fn recover_transition(
                         errno,
                     )
                 })?;
-                if target.as_deref() != Some(OsStr::new(&record.applied_artifact_target)) {
+                if target.target() != Some(OsStr::new(&record.applied_artifact_target)) {
                     return Err(Failure::new(
                         CodeKey::TransitionRefused,
                         destination,
@@ -1806,7 +1224,7 @@ fn recover_transition(
                     ));
                 }
             }
-            remove_unpublished_stage(parent, &stage);
+            remove_unpublished_stage(parent, &stage, destination)?;
         }
         ledger.commit(canonical, prior.restore())?;
         return Ok(());
@@ -1846,7 +1264,7 @@ fn recover_transition(
                 errno,
             )
         })?;
-        if displaced.as_deref() != Some(OsStr::new(&prior.applied_artifact_target)) {
+        if displaced.target() != Some(OsStr::new(&prior.applied_artifact_target)) {
             return Err(Failure::new(
                 CodeKey::TransitionRefused,
                 destination,
@@ -1880,14 +1298,14 @@ fn recover_transition(
     )?;
     let pristine = prior.baseline_hash.as_deref() == Some(displaced_hash.as_str());
     if !pristine {
-        renameat_with(parent, &stage, parent, name, RenameFlags::EXCHANGE).map_err(|errno| {
-            Failure::syscall(
-                CodeKey::TransitionRefused,
-                destination,
-                "renameat2-exchange-restore",
-                errno,
-            )
-        })?;
+        exchange_names(
+            parent,
+            name,
+            &stage,
+            destination,
+            CodeKey::TransitionRefused,
+            "renameat2-exchange-restore",
+        )?;
         sync_parent(parent, destination)?;
         verify_writable_hash(
             parent,
@@ -1904,19 +1322,23 @@ fn recover_transition(
                 errno,
             )
         })?;
-        if restored_stage.as_deref() != Some(OsStr::new(&record.applied_artifact_target)) {
+        if restored_stage.target() != Some(OsStr::new(&record.applied_artifact_target)) {
             return Err(Failure::new(
                 CodeKey::TransitionRefused,
                 destination,
                 "restored transition stage does not match the intended symlink; both names are preserved",
             ));
         }
-        remove_unpublished_stage(parent, &stage);
         ledger.commit(canonical, prior.restore())?;
-        return Err(Failure::new(
-            CodeKey::TransitionRefused,
+        return Err(cleanup_unpublished_after_failure(
+            parent,
+            &stage,
             destination,
-            "refusing to retire a writable destination that no longer matches its baseline; edited content was restored",
+            Failure::new(
+                CodeKey::TransitionRefused,
+                destination,
+                "refusing to retire a writable destination that no longer matches its baseline; edited content was restored",
+            ),
         ));
     }
     remove_verified_displaced(parent, &stage, destination)?;
@@ -1968,7 +1390,7 @@ fn transition_representation(
                 errno,
             )
         })?;
-        if observed.as_deref() != Some(recorded) {
+        if observed.target() != Some(recorded) {
             return Err(Failure::new(
                 CodeKey::TransitionRefused,
                 destination,
@@ -1991,20 +1413,26 @@ fn transition_representation(
         fault_point("pending-committed");
         stage_writable(setpriv, &parent, &stage, entry, &intended)?;
         fault_point("stage-synced");
-        if let Err(errno) = renameat_with(&parent, &stage, &parent, name, RenameFlags::EXCHANGE) {
-            remove_unpublished_stage(&parent, &stage);
-            return Err(Failure::syscall(
-                CodeKey::TransitionRefused,
+        if let Err(failure) = exchange_names(
+            &parent,
+            name,
+            &stage,
+            destination,
+            CodeKey::TransitionRefused,
+            "renameat2-exchange-transition",
+        ) {
+            return Err(cleanup_unpublished_after_failure(
+                &parent,
+                &stage,
                 destination,
-                "renameat2-exchange-transition",
-                errno,
+                failure,
             ));
         }
         fault_point("exchange-published");
         sync_parent(&parent, destination)?;
         verify_writable_destination(&parent, &name, destination, &intended)?;
         fault_point("verified");
-        remove_unpublished_stage(&parent, &stage);
+        remove_unpublished_stage(&parent, &stage, destination)?;
         ledger.commit(
             canonical,
             owned_record(identity, entry, "update", Some(record), &intended),
@@ -2050,13 +1478,19 @@ fn transition_representation(
     fault_point("pending-committed");
     stage_symlink(setpriv, &parent, &stage, entry, expected)?;
     fault_point("stage-synced");
-    if let Err(errno) = renameat_with(&parent, &stage, &parent, name, RenameFlags::EXCHANGE) {
-        remove_unpublished_stage(&parent, &stage);
-        return Err(Failure::syscall(
-            CodeKey::TransitionRefused,
+    if let Err(failure) = exchange_names(
+        &parent,
+        name,
+        &stage,
+        destination,
+        CodeKey::TransitionRefused,
+        "renameat2-exchange-transition",
+    ) {
+        return Err(cleanup_unpublished_after_failure(
+            &parent,
+            &stage,
             destination,
-            "renameat2-exchange-transition",
-            errno,
+            failure,
         ));
     }
     fault_point("exchange-published");
@@ -2069,7 +1503,7 @@ fn transition_representation(
             errno,
         )
     })?;
-    if published.as_deref() != Some(expected) {
+    if published.target() != Some(expected) {
         return Err(Failure::new(
             CodeKey::TransitionRefused,
             destination,
@@ -2079,7 +1513,7 @@ fn transition_representation(
     fault_point("verified");
     // the displaced object is the pristine regular file, proven equal to its
     // baseline above, so removing it destroys no work.
-    remove_unpublished_stage(&parent, &stage);
+    remove_unpublished_stage(&parent, &stage, destination)?;
     let owned = owned_record(
         identity,
         entry,
@@ -2331,7 +1765,7 @@ fn reconcile_entry(
     })?;
 
     match observed {
-        None => {
+        DestinationObservation::Missing => {
             let stage = stage_name(index);
             let intended = sha256_hex(entry.retained_artifact_target.as_bytes());
             let prior = ledger.record(canonical).cloned();
@@ -2351,7 +1785,7 @@ fn reconcile_entry(
             )?;
             Ok(())
         }
-        Some(actual) if actual == expected => {
+        DestinationObservation::Symlink(actual) if actual == expected => {
             // ownership is never inferred from a matching target, because a
             // destination furnish never published is indistinguishable from one
             // it did. a host whose link predates the ledger stays unrecorded
@@ -2367,12 +1801,9 @@ fn reconcile_entry(
             }
             Ok(())
         }
-        Some(actual) => {
-            let observed_label = if actual.is_empty() {
-                "non-symlink filesystem object".to_owned()
-            } else {
-                format!("symlink to {}", actual.to_string_lossy())
-            };
+        observation => {
+            let observed_label = observation.label();
+            let actual = observation.target();
             let Some(record) = ledger.record(canonical).cloned() else {
                 return Err(Failure::new(
                     CodeKey::ConflictingDestination,
@@ -2387,7 +1818,7 @@ fn reconcile_entry(
             // read against desired this condition could never be satisfied by
             // any repairable state, because a destination already equal to
             // desired needs no repair.
-            if actual.is_empty() || actual != recorded {
+            if actual != Some(recorded) {
                 return Err(Failure::new(
                     CodeKey::ConflictingDestination,
                     destination,
@@ -2475,15 +1906,9 @@ fn reconcile(
     let bytes = match fs::read(manifest_path) {
         Ok(bytes) => bytes,
         Err(error) => {
-            eprintln!(
-                "{}",
-                serde_json::json!({
-                    "schemaVersion": DIAGNOSTIC_SCHEMA_VERSION,
-                    "severity": "error",
-                    "code": "furnish/runtime-bootstrap",
-                    "message": format!("cannot read manifest: {error}"),
-                    "primary": {"label": manifest_path}
-                })
+            emit_bootstrap(
+                &format!("cannot read manifest: {error}"),
+                &manifest_path.to_string_lossy(),
             );
             return ExitCode::FAILURE;
         }
@@ -2491,15 +1916,9 @@ fn reconcile(
     let manifest: Manifest = match serde_json::from_slice(&bytes) {
         Ok(manifest) => manifest,
         Err(error) => {
-            eprintln!(
-                "{}",
-                serde_json::json!({
-                    "schemaVersion": DIAGNOSTIC_SCHEMA_VERSION,
-                    "severity": "error",
-                    "code": "furnish/runtime-bootstrap",
-                    "message": format!("cannot decode manifest: {error}"),
-                    "primary": {"label": manifest_path}
-                })
+            emit_bootstrap(
+                &format!("cannot decode manifest: {error}"),
+                &manifest_path.to_string_lossy(),
             );
             return ExitCode::FAILURE;
         }
@@ -3064,8 +2483,14 @@ mod tests {
         )
         .expect_err("refuse symlinked path component while creating");
         assert!(matches!(failure.key, CodeKey::ParentTraversal));
-        assert_eq!(failure.operation, Some("openat-parent-component"));
-        assert_eq!(failure.errno, Some(Errno::NOTDIR.raw_os_error()));
+        assert_eq!(
+            failure.cause.as_ref().map(|cause| cause.operation),
+            Some("openat-parent-component")
+        );
+        assert_eq!(
+            failure.cause.as_ref().map(|cause| cause.errno),
+            Some(Errno::NOTDIR.raw_os_error())
+        );
         // the symlink is left as it was found and nothing was made behind it.
         assert_eq!(fs::read_link(&link).unwrap(), real);
         assert!(!real.join("nested").exists());
@@ -3091,8 +2516,14 @@ mod tests {
         )
         .expect_err("refuse non-directory path component while creating");
         assert!(matches!(failure.key, CodeKey::ParentTraversal));
-        assert_eq!(failure.operation, Some("openat-parent-component"));
-        assert_eq!(failure.errno, Some(Errno::NOTDIR.raw_os_error()));
+        assert_eq!(
+            failure.cause.as_ref().map(|cause| cause.operation),
+            Some("openat-parent-component")
+        );
+        assert_eq!(
+            failure.cause.as_ref().map(|cause| cause.errno),
+            Some(Errno::NOTDIR.raw_os_error())
+        );
         // the foreign file keeps its bytes; nothing replaced it to make room.
         assert_eq!(fs::read(&occupied).unwrap(), b"foreign");
     }
@@ -3114,8 +2545,14 @@ mod tests {
         )
         .expect_err("refuse a managed root that does not exist");
         assert!(matches!(failure.key, CodeKey::ParentTraversal));
-        assert_eq!(failure.operation, Some("openat-parent-component"));
-        assert_eq!(failure.errno, Some(Errno::NOENT.raw_os_error()));
+        assert_eq!(
+            failure.cause.as_ref().map(|cause| cause.operation),
+            Some("openat-parent-component")
+        );
+        assert_eq!(
+            failure.cause.as_ref().map(|cause| cause.errno),
+            Some(Errno::NOENT.raw_os_error())
+        );
         assert!(!managed_root.exists());
     }
 
@@ -3130,12 +2567,18 @@ mod tests {
         let failure = open_parent(destination.to_str().unwrap(), link.to_str().unwrap())
             .expect_err("refuse symlinked path component");
         assert!(matches!(failure.key, CodeKey::ParentTraversal));
-        assert_eq!(failure.operation, Some("openat-parent-component"));
+        assert_eq!(
+            failure.cause.as_ref().map(|cause| cause.operation),
+            Some("openat-parent-component")
+        );
         // directory components are opened O_DIRECTORY|O_NOFOLLOW, so a symlinked
         // component is refused with ENOTDIR (the unfollowed symlink is not a
         // directory); ELOOP only applies to the O_NOFOLLOW-without-O_DIRECTORY
         // lock-file open. either way the symlink is refused without being followed.
-        assert_eq!(failure.errno, Some(Errno::NOTDIR.raw_os_error()));
+        assert_eq!(
+            failure.cause.as_ref().map(|cause| cause.errno),
+            Some(Errno::NOTDIR.raw_os_error())
+        );
     }
 
     // crash-boundary coverage. a unit test cannot kill the process mid-apply,
@@ -4895,8 +4338,14 @@ mod tests {
             )
             .expect_err("a nameless destination cannot be exchanged");
             assert!(matches!(failure.key, CodeKey::PublishRace));
-            assert_eq!(failure.operation, Some("renameat2-exchange-publish"));
-            assert_eq!(failure.errno, Some(Errno::NOENT.raw_os_error()));
+            assert_eq!(
+                failure.cause.as_ref().map(|cause| cause.operation),
+                Some("renameat2-exchange-publish")
+            );
+            assert_eq!(
+                failure.cause.as_ref().map(|cause| cause.errno),
+                Some(Errno::NOENT.raw_os_error())
+            );
             // a failed exchange removes the unpublished stage and orphans
             // nothing; only a landed exchange followed by a crash can leave
             // the displaced link behind forever.
@@ -4970,7 +4419,10 @@ mod tests {
             .expect_err("verified displaced cleanup failure is returned");
 
             assert!(matches!(failure.key, CodeKey::FinalVerification));
-            assert_eq!(failure.operation, Some("unlinkat-verified-displaced"));
+            assert_eq!(
+                failure.cause.as_ref().map(|cause| cause.operation),
+                Some("unlinkat-verified-displaced")
+            );
             assert_eq!(fs::read_link(dir.path().join("value")).unwrap(), expected);
             assert_eq!(fs::read_link(dir.path().join("stage")).unwrap(), recorded);
         }
@@ -5611,6 +5063,7 @@ mod tests {
                 "/dest",
                 sha256_hex(b"different\n").as_str(),
                 sha256_hex(b"staged\n").as_str(),
+                DisplacedCleanup::VerifiedOwned,
             )
             .expect_err("a displaced mismatch reverses the exchange");
             assert!(matches!(failure.key, CodeKey::PublishRace));
@@ -5647,7 +5100,7 @@ mod tests {
 
             assert!(matches!(failure.key, CodeKey::PendingRecovery));
             assert_eq!(
-                failure.operation,
+                failure.cause.as_ref().map(|cause| cause.operation),
                 Some("renameat2-exchange-restore-pending")
             );
             assert_eq!(fs::read(dir.path().join("value")).unwrap(), b"intended\n");
