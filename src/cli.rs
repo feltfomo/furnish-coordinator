@@ -1,4 +1,4 @@
-use crate::executor::{self, WorkerCommand, WorkerKind};
+use crate::executor::{self, WorkerCommand, WorkerKind, WorkerProgram};
 use crate::lock::DEFAULT_LOCK_DIR;
 use crate::{WRITABLE_FILE_MODE, reconcile};
 use rustix::fs::{Mode, OFlags, mkdirat, open, openat, symlinkat};
@@ -33,8 +33,8 @@ impl Command {
         if subcommand == "reconcile" {
             return Self::parse_reconcile(&args[1..]);
         }
-        let kind = WorkerKind::from_subcommand(subcommand)?;
-        Self::parse_worker(kind, &args[1..]).map(Self::Worker)
+        let program = WorkerProgram::from_subcommand(subcommand)?;
+        Self::parse_worker(program, &args[1..]).map(Self::Worker)
     }
 
     // this permissive grammar is compatibility. overlapping pairs preserve
@@ -49,7 +49,7 @@ impl Command {
         })
     }
 
-    fn parse_worker(kind: WorkerKind, args: &[OsString]) -> Option<WorkerCommand> {
+    fn parse_worker(program: WorkerProgram, args: &[OsString]) -> Option<WorkerCommand> {
         let mut parent_fd = None;
         let mut name = None;
         let mut value = None;
@@ -62,23 +62,23 @@ impl Command {
                     parent_fd = argument.to_string_lossy().parse::<i32>().ok();
                 }
                 "--name" if name.is_none() => name = Some(argument.clone()),
-                _ if kind.value_flag() == Some(flag) && value.is_none() => {
+                _ if program.value_flag() == Some(flag) && value.is_none() => {
                     value = Some(argument.clone());
                 }
                 _ => return None,
             }
             index += 2;
         }
-        let value = match kind.value_flag() {
-            Some(_) => Some(value?),
-            None if value.is_none() => None,
-            None => return None,
+        let kind = match program {
+            WorkerProgram::Symlink => WorkerKind::Symlink { target: value? },
+            WorkerProgram::Writable => WorkerKind::Writable { source: value? },
+            WorkerProgram::Directory if value.is_none() => WorkerKind::Directory,
+            WorkerProgram::Directory => return None,
         };
         Some(WorkerCommand {
             kind,
             parent_fd: parent_fd?,
             name: name?,
-            value,
         })
     }
 }
@@ -108,7 +108,7 @@ fn run_worker(command: WorkerCommand) -> ExitCode {
         return ExitCode::FAILURE;
     }
     let inherited = PathBuf::from(format!("/proc/self/fd/{}", command.parent_fd));
-    // The coordinator intentionally hands the parent descriptor through exec.
+    // the coordinator intentionally hands the parent descriptor through exec.
     let parent = match open(
         &inherited,
         OFlags::RDONLY | OFlags::DIRECTORY,
@@ -118,19 +118,13 @@ fn run_worker(command: WorkerCommand) -> ExitCode {
         Err(errno) => return executor::worker_failure("open-worker-parent", errno.raw_os_error()),
     };
     match command.kind {
-        WorkerKind::Symlink => match symlinkat(
-            command.value.as_deref().expect("typed worker value"),
-            &parent,
-            &command.name,
-        ) {
+        WorkerKind::Symlink { target } => match symlinkat(&target, &parent, &command.name) {
             Ok(()) => ExitCode::SUCCESS,
             Err(errno) => executor::worker_failure("symlinkat-stage", errno.raw_os_error()),
         },
-        WorkerKind::Writable => stage_writable_content(
-            &parent,
-            &command.name,
-            Path::new(command.value.as_deref().expect("typed worker value")),
-        ),
+        WorkerKind::Writable { source } => {
+            stage_writable_content(&parent, &command.name, Path::new(&source))
+        }
         WorkerKind::Directory => create_directory_component_parsed(&parent, &command.name),
     }
 }

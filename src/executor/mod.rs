@@ -1,4 +1,5 @@
 use crate::diagnostic::{Cause, CodeKey, Failure, Result};
+use crate::ledger::AuthorityScope;
 use crate::manifest::Authority;
 use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
@@ -12,13 +13,13 @@ const EVIDENCE_ENV: &str = "FURNISH_WORKER_EVIDENCE";
 const EVIDENCE_LIMIT: usize = 512;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum WorkerKind {
+pub(crate) enum WorkerProgram {
     Symlink,
     Writable,
     Directory,
 }
 
-impl WorkerKind {
+impl WorkerProgram {
     pub(crate) fn from_subcommand(value: &str) -> Option<Self> {
         match value {
             "stage-native-symlink" => Some(Self::Symlink),
@@ -46,11 +47,17 @@ impl WorkerKind {
 }
 
 #[derive(Debug)]
+pub(crate) enum WorkerKind {
+    Symlink { target: OsString },
+    Writable { source: OsString },
+    Directory,
+}
+
+#[derive(Debug)]
 pub(crate) struct WorkerCommand {
     pub(crate) kind: WorkerKind,
     pub(crate) parent_fd: i32,
     pub(crate) name: OsString,
-    pub(crate) value: Option<OsString>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -109,7 +116,7 @@ pub(crate) fn launch(
     value: Option<&OsStr>,
     target: &str,
     authority: &Authority,
-    kind: WorkerKind,
+    kind: WorkerProgram,
 ) -> Result<()> {
     let executable = env::current_exe().map_err(|error| {
         Failure::new(
@@ -118,7 +125,7 @@ pub(crate) fn launch(
             format!("cannot resolve coordinator executable: {error}"),
         )
     })?;
-    let mut command = if authority.scope == "user" {
+    let mut command = if authority.scope == AuthorityScope::User {
         let mut command = Command::new(setpriv);
         command
             .arg("--reuid")
@@ -143,7 +150,7 @@ pub(crate) fn launch(
     if let (Some(flag), Some(value)) = (kind.value_flag(), value) {
         command.arg(flag).arg(value);
     }
-    let directory = kind == WorkerKind::Directory;
+    let directory = kind == WorkerProgram::Directory;
     let output = command.output().map_err(|error| {
         Failure::new(
             CodeKey::ExecutorFailed,
