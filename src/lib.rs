@@ -2,7 +2,6 @@ mod cli;
 mod diagnostic;
 mod executor;
 mod fault;
-#[path = "fs/mod.rs"]
 mod filesystem;
 mod hash;
 mod identity;
