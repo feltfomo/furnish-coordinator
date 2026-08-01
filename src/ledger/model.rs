@@ -142,6 +142,12 @@ pub(crate) struct LedgerRecord {
     pub(crate) status: RecordStatus,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OwnedRecord<'a> {
+    pub(crate) record: &'a LedgerRecord,
+    pub(crate) applied_by: AppliedOperation,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum RecordStatus {
     Owned {
@@ -156,6 +162,16 @@ pub(crate) enum RecordStatus {
 }
 
 impl LedgerRecord {
+    pub(crate) fn owned(&self) -> Option<OwnedRecord<'_>> {
+        match self.status {
+            RecordStatus::Owned { applied_by, .. } => Some(OwnedRecord {
+                record: self,
+                applied_by,
+            }),
+            RecordStatus::Pending { .. } => None,
+        }
+    }
+
     pub(crate) fn is_owned(&self) -> bool {
         matches!(self.status, RecordStatus::Owned { .. })
     }
@@ -164,6 +180,7 @@ impl LedgerRecord {
         matches!(self.status, RecordStatus::Pending { .. })
     }
 
+    #[cfg(test)]
     pub(crate) fn applied_by(&self) -> Option<AppliedOperation> {
         match self.status {
             RecordStatus::Owned { applied_by, .. } => Some(applied_by),
@@ -270,6 +287,33 @@ impl std::error::Error for ModelError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_record_has_no_owned_view() {
+        let record = LedgerRecord {
+            destination: "/tmp/value".to_owned(),
+            applied_artifact_target: "/tmp/source".to_owned(),
+            managed_root: "/tmp".to_owned(),
+            applied_generation: None,
+            last_successful_reload: ReloadEvidence {
+                invocation_id: None,
+                monotonic_seconds: 0.0,
+            },
+            reload_action_identity: None,
+            boot_id: None,
+            representation: Representation::Symlink,
+            baseline_hash: None,
+            intended_witness_hash: None,
+            applied_operation_generation: 0,
+            status: RecordStatus::Pending {
+                intent: PendingIntent::Apply(AppliedOperation::New),
+                stage_name: Some(".furnish.test.stage".to_owned()),
+                prior_owned: None,
+            },
+        };
+
+        assert!(record.owned().is_none());
+    }
 
     #[test]
     fn every_representation_pair_has_exact_gating_result() {

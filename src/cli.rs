@@ -1,6 +1,7 @@
 use crate::executor::{self, WorkerCommand, WorkerKind, WorkerProgram};
+use crate::filesystem::WRITABLE_FILE_MODE;
 use crate::lock::DEFAULT_LOCK_DIR;
-use crate::{WRITABLE_FILE_MODE, reconcile};
+use crate::reconcile::reconcile;
 use rustix::fs::{Mode, OFlags, mkdirat, open, openat, symlinkat};
 use rustix::io::Errno;
 use std::ffi::{OsStr, OsString};
@@ -72,8 +73,7 @@ impl Command {
         let kind = match program {
             WorkerProgram::Symlink => WorkerKind::Symlink { target: value? },
             WorkerProgram::Writable => WorkerKind::Writable { source: value? },
-            WorkerProgram::Directory if value.is_none() => WorkerKind::Directory,
-            WorkerProgram::Directory => return None,
+            WorkerProgram::Directory => WorkerKind::Directory,
         };
         Some(WorkerCommand {
             kind,

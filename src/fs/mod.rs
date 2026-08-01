@@ -1,4 +1,54 @@
-use super::*;
+use crate::diagnostic::{CodeKey, Failure, Result};
+use crate::executor::{self, WorkerProgram};
+use crate::fault::{fault_point, reverse_exchange_restore_fault};
+use crate::hash::sha256_hex;
+use crate::manifest::Authority;
+use rustix::fs::{
+    AtFlags, Mode, OFlags, RenameFlags, fsync, open, openat, readlinkat, renameat_with, statat,
+    unlinkat,
+};
+use rustix::io::Errno;
+use std::ffi::{OsStr, OsString};
+use std::fs;
+use std::io::Read;
+use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStringExt;
+#[cfg(test)]
+use std::path::PathBuf;
+use std::path::{Component, Path};
+
+pub(crate) const SYMLINK_MODE: u32 = 0o120000;
+pub(crate) const REGULAR_MODE: u32 = 0o100000;
+const FILE_TYPE_MASK: u32 = 0o170000;
+// one mode for both authority scopes. a mode that varies by scope is the
+// deferred permissions feature arriving early under another name.
+pub(crate) const WRITABLE_FILE_MODE: u32 = 0o644;
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FAIL_VERIFIED_DISPLACED_CLEANUP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+// creating a directory under a user's home is the user's write, so it goes
+// through the same setpriv door a staged artifact does. the name handed over is
+// a single component and the worker does no walking of its own.
+fn run_directory_executor(
+    setpriv: &Path,
+    parent: &OwnedFd,
+    name: &OsStr,
+    destination: &str,
+    authority: &Authority,
+) -> Result<()> {
+    executor::launch(
+        setpriv,
+        parent,
+        name,
+        None,
+        destination,
+        authority,
+        WorkerProgram::Directory,
+    )
+}
 
 // non-directory refuses in both modes for the same reason.
 pub(super) enum ParentMode<'a> {
@@ -534,6 +584,44 @@ pub(super) fn rollback_exchange(
         intended_hash,
         "read-restored-stage",
     )?;
+    Ok(())
+}
+
+pub(super) fn verify_writable_destination(
+    parent: &OwnedFd,
+    name: &OsStr,
+    destination: &str,
+    intended_hash: &str,
+) -> Result<()> {
+    if observe_kind(parent, name, destination)? != Some(REGULAR_MODE) {
+        return Err(Failure::new(
+            CodeKey::FinalVerification,
+            destination,
+            "published destination is not a regular file",
+        ));
+    }
+    let observed = hash_regular(
+        parent,
+        name,
+        destination,
+        CodeKey::ContentVerification,
+        "read-published",
+    )?;
+    if observed != intended_hash {
+        return Err(Failure::new(
+            CodeKey::ContentVerification,
+            destination,
+            "published destination failed exact-content verification",
+        ));
+    }
+    let mode = observe_mode(parent, name, destination)?;
+    if mode != WRITABLE_FILE_MODE {
+        return Err(Failure::new(
+            CodeKey::FinalVerification,
+            destination,
+            format!("published file mode is {mode:04o}; expected {WRITABLE_FILE_MODE:04o}"),
+        ));
+    }
     Ok(())
 }
 

@@ -1,5 +1,6 @@
 use super::model::{
-    AppliedOperation, LedgerRecord, PendingIntent, PriorOwned, RecordStatus, Representation,
+    AppliedOperation, LedgerRecord, OwnedRecord, PendingIntent, PriorOwned, RecordStatus,
+    Representation,
 };
 use crate::identity::RunIdentity;
 use crate::manifest::Entry;
@@ -15,7 +16,7 @@ pub(crate) fn pending_record(
     identity: &RunIdentity,
     entry: &Entry,
     intent: PendingIntent,
-    prior: Option<&LedgerRecord>,
+    prior: Option<OwnedRecord<'_>>,
     stage: &OsStr,
     witness_hash: &str,
 ) -> LedgerRecord {
@@ -29,8 +30,8 @@ pub(crate) fn pending_record(
     );
     record.intended_witness_hash = Some(witness_hash.to_owned());
     if let Some(prior) = prior {
-        record.baseline_hash = prior.baseline_hash.clone();
-        record.applied_operation_generation = prior.applied_operation_generation;
+        record.baseline_hash = prior.record.baseline_hash.clone();
+        record.applied_operation_generation = prior.record.applied_operation_generation;
     }
     record
 }
@@ -49,7 +50,7 @@ pub(crate) fn owned_record(
     identity: &RunIdentity,
     entry: &Entry,
     applied_by: AppliedOperation,
-    prior: Option<&LedgerRecord>,
+    prior: Option<OwnedRecord<'_>>,
     witness_hash: &str,
 ) -> LedgerRecord {
     let mut record = identity.record(
@@ -62,7 +63,7 @@ pub(crate) fn owned_record(
     record.intended_witness_hash = Some(witness_hash.to_owned());
     record.baseline_hash = baseline_for(entry.representation, witness_hash);
     record.applied_operation_generation = prior
-        .map_or(0, |prior| prior.applied_operation_generation)
+        .map_or(0, |prior| prior.record.applied_operation_generation)
         .saturating_add(1);
     record
 }
@@ -86,14 +87,13 @@ pub(crate) fn carry_applied_state(prior: &LedgerRecord, record: &mut LedgerRecor
 }
 
 impl PriorOwned {
-    pub(crate) fn capture(record: &LedgerRecord) -> Self {
+    pub(crate) fn capture(owned: OwnedRecord<'_>) -> Self {
+        let record = owned.record;
         Self {
             destination: record.destination.clone(),
             applied_artifact_target: record.applied_artifact_target.clone(),
             managed_root: record.managed_root.clone(),
-            applied_by: record
-                .applied_by()
-                .expect("prior ownership carries an applied operation"),
+            applied_by: owned.applied_by,
             applied_generation: record.applied_generation.clone(),
             last_successful_reload: record.last_successful_reload.clone(),
             reload_action_identity: record.reload_action_identity.clone(),
