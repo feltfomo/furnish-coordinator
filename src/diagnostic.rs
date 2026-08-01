@@ -54,9 +54,7 @@ pub(crate) struct Cause<'a> {
     pub(crate) errno: i32,
 }
 
-// b, s, and d are the three hashes reported when onConflict is error. they
-// travel in the diagnostic so a reader can reconstruct what the coordinator
-// saw without re-reading either the manifest or the destination.
+// b, s, and d are the three hashes reported when onConflict is error.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ObservedHashes<'a> {
@@ -169,7 +167,7 @@ impl Failure {
     }
 }
 
-pub(crate) fn code<'a>(codes: &'a DiagnosticCodes, key: CodeKey) -> &'a str {
+pub(crate) fn code(codes: &DiagnosticCodes, key: CodeKey) -> &str {
     match key {
         CodeKey::InvalidManifest => &codes.invalid_manifest,
         CodeKey::UnsupportedExecutor => &codes.unsupported_executor,
@@ -284,7 +282,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod sp3_size_tests {
+mod failure_layout_tests {
     use super::*;
 
     #[test]

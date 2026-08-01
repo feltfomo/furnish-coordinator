@@ -4,7 +4,7 @@ pub(super) const OWNED_STATE: &str = "owned";
 pub(super) const PENDING_STATE: &str = "pending";
 pub(super) const TRANSITION_MARKER: &str = "transition";
 pub(super) const SYMLINK_REPRESENTATION: &str = "symlink";
-pub(super) const WRITABLE_REPRESENTATION: &str = "writable";
+pub(super) const WRITABLE_REPRESENTATION_TAG: &str = "writable";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AuthorityScope {
@@ -32,7 +32,7 @@ impl Representation {
     pub(crate) fn parse(value: &str) -> Result<Self, ModelError> {
         match value {
             SYMLINK_REPRESENTATION => Ok(Self::Symlink),
-            WRITABLE_REPRESENTATION => Ok(Self::Writable),
+            WRITABLE_REPRESENTATION_TAG => Ok(Self::Writable),
             _ => Err(ModelError::new(format!(
                 "record representation {value} is unsupported"
             ))),
@@ -42,7 +42,7 @@ impl Representation {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Symlink => SYMLINK_REPRESENTATION,
-            Self::Writable => WRITABLE_REPRESENTATION,
+            Self::Writable => WRITABLE_REPRESENTATION_TAG,
         }
     }
 }
@@ -157,7 +157,7 @@ pub(crate) enum RecordStatus {
     Pending {
         intent: PendingIntent,
         stage_name: Option<String>,
-        prior_owned: Option<PriorOwned>,
+        prior_owned: Option<Box<PriorOwned>>,
     },
 }
 
@@ -211,7 +211,7 @@ impl LedgerRecord {
 
     pub(crate) fn prior_owned(&self) -> Option<&PriorOwned> {
         match &self.status {
-            RecordStatus::Pending { prior_owned, .. } => prior_owned.as_ref(),
+            RecordStatus::Pending { prior_owned, .. } => prior_owned.as_deref(),
             RecordStatus::Owned { .. } => None,
         }
     }

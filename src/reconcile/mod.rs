@@ -7,19 +7,13 @@ mod writable;
 
 use context::{OpenDestination, ReconcileContext, run_executor, stage_name};
 use recovery::recover_pending;
-#[cfg(test)]
-use recovery::representation_of_kind;
 use retirement::{RetireOutcome, retire_record};
 use symlink::stage_symlink;
 use transition::transition_representation;
 use writable::{hash_source, reconcile_writable_entry, stage_writable};
 
-#[cfg(test)]
-use crate::diagnostic::DIAGNOSTIC_SCHEMA_VERSION;
 use crate::diagnostic::{CodeKey, Failure, Result, emit_bootstrap, emit_failure, emit_warning};
 use crate::fault::fault_point;
-#[cfg(test)]
-use crate::filesystem::FAIL_VERIFIED_DISPLACED_CLEANUP;
 use crate::filesystem::{
     DestinationObservation, DisplacedCleanup, ParentMode, REGULAR_MODE, SYMLINK_MODE,
     WRITABLE_FILE_MODE, cleanup_unpublished_after_failure, discard_displaced_under_policy,
@@ -35,34 +29,17 @@ use crate::ledger::{
     TransitionPair, UnresolvedRetirement, baseline_for, carry_applied_state, owned_record,
     pending_record,
 };
-#[cfg(test)]
-use crate::ledger::{AuthorityScope, LEDGER_FILE_NAME, LEDGER_ROLLBACK_FILE_NAME};
 use crate::lock::open_host_lock;
 use crate::manifest::{
     Authority, ConflictPolicy, Entry, ExecutorProfile, FilesystemIdentity, NATIVE_REPRESENTATION,
     WRITABLE_REPRESENTATION, decode_manifest, profile_for, validate_manifest,
 };
-#[cfg(test)]
-use crate::manifest::{
-    EXECUTOR_PROFILES, Executor, MANIFEST_SCHEMA_VERSION, NATIVE_EXECUTOR_IDENTITY,
-    NATIVE_EXECUTOR_PROTOCOL, NATIVE_WRITABLE_IDENTITY, NATIVE_WRITABLE_PROTOCOL, Provenance,
-};
 use rustix::fs::{AtFlags, statat};
 use rustix::io::Errno;
 use std::collections::BTreeSet;
-#[cfg(test)]
-use std::env;
 use std::ffi::OsStr;
-#[cfg(test)]
-use std::ffi::OsString;
 use std::fs;
-#[cfg(test)]
-use std::os::fd::OwnedFd;
-#[cfg(test)]
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-#[cfg(test)]
-use std::path::PathBuf;
 use std::process::ExitCode;
 
 pub(super) fn reconcile_entry(
@@ -97,16 +74,7 @@ pub(super) fn reconcile_entry(
         && record.is_owned()
         && record.representation != entry.representation
     {
-        return transition_representation(
-            entry,
-            setpriv,
-            index,
-            ledger,
-            identity,
-            &record,
-            &open.parent,
-            name,
-        );
+        return transition_representation(entry, setpriv, index, ledger, identity, &record, &open);
     }
 
     if entry.representation == WRITABLE_REPRESENTATION {
@@ -149,7 +117,7 @@ pub(super) fn reconcile_entry(
             fault_point("pending-committed");
             stage_symlink(setpriv, &open.parent, &stage, entry, expected)?;
             fault_point("stage-synced");
-            publish_new(&open.parent, &name, &stage, destination, expected)?;
+            publish_new(&open.parent, name, &stage, destination, expected)?;
             fault_point("verified");
             ledger.commit(
                 canonical,
@@ -271,7 +239,7 @@ pub(super) fn reconcile_entry(
             fault_point("pending-committed");
             stage_symlink(setpriv, &open.parent, &stage, entry, expected)?;
             fault_point("stage-synced");
-            publish_exchange(&open.parent, &name, &stage, destination, expected, recorded)?;
+            publish_exchange(&open.parent, name, &stage, destination, expected, recorded)?;
             fault_point("verified");
             ledger.commit(
                 canonical,
@@ -407,8 +375,20 @@ pub(crate) fn reconcile(
 
 #[cfg(test)]
 mod tests {
+    use super::recovery::representation_of_kind;
     use super::*;
-    use std::os::unix::fs::{MetadataExt, symlink};
+    use crate::diagnostic::DIAGNOSTIC_SCHEMA_VERSION;
+    use crate::filesystem::FAIL_VERIFIED_DISPLACED_CLEANUP;
+    use crate::ledger::{AuthorityScope, LEDGER_FILE_NAME, LEDGER_ROLLBACK_FILE_NAME};
+    use crate::manifest::{
+        EXECUTOR_PROFILES, Executor, MANIFEST_SCHEMA_VERSION, NATIVE_EXECUTOR_IDENTITY,
+        NATIVE_EXECUTOR_PROTOCOL, NATIVE_WRITABLE_IDENTITY, NATIVE_WRITABLE_PROTOCOL, Provenance,
+    };
+    use std::env;
+    use std::ffi::OsString;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -432,12 +412,6 @@ mod tests {
         };
         reconcile_writable_entry(entry, setpriv, index, ledger, identity, &open)
     }
-
-    // pinned to published vectors rather than to this implementation. every
-    // other assertion here computes its expectation with the same function it
-    // is checking, so a wrong compression function would be self-consistent and
-    // green, and content ownership decisions ride on these digests. the third
-    // vector spans two blocks, where the padding is easiest to get wrong.
 
     #[test]
     fn stage_names_are_hidden_and_process_scoped() {
@@ -1661,9 +1635,8 @@ mod tests {
     // the causes that make a destination reload-eligible are the ones that commit
     // new furnish-applied content, and eligibility is read off the committed
     // record rather than off anything this coordinator does at the destination.
-    // staging cannot run inside the test process, since run_executor re-executes
-    // env current_exe resolves to the test binary here, so each
-    // publishing cause is proven in two halves. the dispatch half proves which
+    // the executor re-enters the current test binary, so each publishing cause
+    // is proven in two halves without staging inside this process. the dispatch half proves which
     // route the reconciliation chose and that the pending record carried the
     // prior counter unchanged into it. the recovery half proves what that route
     // commits when it completes, advancing the same planted prior by exactly one.

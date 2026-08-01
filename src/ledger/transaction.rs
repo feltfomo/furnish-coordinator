@@ -25,7 +25,7 @@ pub(crate) fn pending_record(
         RecordStatus::Pending {
             intent,
             stage_name: Some(stage.to_string_lossy().into_owned()),
-            prior_owned: prior.map(PriorOwned::capture),
+            prior_owned: prior.map(PriorOwned::capture).map(Box::new),
         },
     );
     record.intended_witness_hash = Some(witness_hash.to_owned());
@@ -36,16 +36,8 @@ pub(crate) fn pending_record(
     record
 }
 
-// every commit that carries the applied state forward after a publish goes
-// through here, whatever the representation, so no path can write a record that
-// carries less than the one it replaces. the operation generation counts applies
-// that reached the destination, so it advances from the prior record instead of
-// restarting. the one exemption is a recovery branch that converges BACKWARD to
-// the state the ledger already describes, which restates that record rather than
-// constructing a new one, because nothing was carried forward to count. what it
-// is exempt from is advancing the generation, not the meanings of the fields, so
-// a restatement that sets the representation owes the witness reading that
-// representation demands.
+// the operation generation counts applies that reached the destination and
+// advances from the prior record.
 pub(crate) fn owned_record(
     identity: &RunIdentity,
     entry: &Entry,

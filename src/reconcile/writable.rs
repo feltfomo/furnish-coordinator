@@ -103,7 +103,7 @@ pub(super) fn stage_writable(
     Ok(())
 }
 
-// Row three and source-wins share one pending-record bracket after the caller
+// row three and source-wins share one pending-record bracket after the caller
 // selects publication.
 pub(super) struct WritableUpdate<'a> {
     pub(super) entry: &'a Entry,
@@ -194,7 +194,7 @@ pub(super) fn reconcile_writable_entry(
     let name = open.name.as_os_str();
     let intended = hash_source(&entry.retained_artifact_target, destination)?;
     let record = ledger.record(canonical).cloned();
-    let observed = observe_kind(&parent, &name, destination)?;
+    let observed = observe_kind(parent, name, destination)?;
 
     match (observed, record) {
         // first ownership, and the self-heal for an owned destination that has
@@ -220,8 +220,8 @@ pub(super) fn reconcile_writable_entry(
                 ),
             )?;
             fault_point("pending-committed");
-            stage_writable(setpriv, &parent, &stage, entry, &intended)?;
-            publish_writable_new(&parent, &name, &stage, destination, &intended)?;
+            stage_writable(setpriv, parent, &stage, entry, &intended)?;
+            publish_writable_new(parent, name, &stage, destination, &intended)?;
             ledger.commit(
                 canonical,
                 owned_record(
@@ -250,8 +250,8 @@ pub(super) fn reconcile_writable_entry(
                 ));
             }
             let observed_hash = hash_regular(
-                &parent,
-                &name,
+                parent,
+                name,
                 destination,
                 CodeKey::ContentVerification,
                 "read-destination",
@@ -295,7 +295,7 @@ pub(super) fn reconcile_writable_entry(
                 // representation is verified and the baseline advances under
                 // the applied_by this record already carries rather than
                 // being reported as a conflict.
-                verify_writable_destination(&parent, &name, destination, &intended)?;
+                verify_writable_destination(parent, name, destination, &intended)?;
                 ledger.commit(
                     canonical,
                     owned_record(

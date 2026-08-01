@@ -1,12 +1,11 @@
 use super::{
-    AppliedOperation, CodeKey, Entry, Failure, LedgerRecord, LedgerState, PendingIntent, Result,
-    RunIdentity, TransitionPair, WRITABLE_REPRESENTATION, cleanup_unpublished_after_failure,
-    exchange_names, fault_point, hash_regular, hash_source, owned_record, pending_record,
-    remove_unpublished_stage, sha256_hex, stage_name, stage_symlink, stage_writable,
-    symlink_target, sync_parent, verify_writable_destination,
+    AppliedOperation, CodeKey, Entry, Failure, LedgerRecord, LedgerState, OpenDestination,
+    PendingIntent, Result, RunIdentity, TransitionPair, WRITABLE_REPRESENTATION,
+    cleanup_unpublished_after_failure, exchange_names, fault_point, hash_regular, hash_source,
+    owned_record, pending_record, remove_unpublished_stage, sha256_hex, stage_name, stage_symlink,
+    stage_writable, symlink_target, sync_parent, verify_writable_destination,
 };
 use std::ffi::OsStr;
-use std::os::fd::OwnedFd;
 use std::path::Path;
 
 // transfer between representations. post-write verification completes before
@@ -18,9 +17,10 @@ pub(super) fn transition_representation(
     ledger: &mut LedgerState,
     identity: &RunIdentity,
     record: &LedgerRecord,
-    parent: &OwnedFd,
-    name: &OsStr,
+    open: &OpenDestination<'_>,
 ) -> Result<()> {
+    let parent = &open.parent;
+    let name = open.name.as_os_str();
     let canonical = &entry.filesystem_identity.canonical;
     let destination = &entry.filesystem_identity.destination;
     let from = record.representation;
@@ -33,7 +33,7 @@ pub(super) fn transition_representation(
 
     if to == WRITABLE_REPRESENTATION {
         // only sound when the current symlink is exactly the recorded one.
-        let observed = symlink_target(&parent, &name).map_err(|errno| {
+        let observed = symlink_target(parent, name).map_err(|errno| {
             Failure::syscall(
                 CodeKey::TransitionRefused,
                 destination,
@@ -61,10 +61,10 @@ pub(super) fn transition_representation(
         pending.applied_artifact_target = record.applied_artifact_target.clone();
         ledger.commit(canonical, pending)?;
         fault_point("pending-committed");
-        stage_writable(setpriv, &parent, &stage, entry, &intended)?;
+        stage_writable(setpriv, parent, &stage, entry, &intended)?;
         fault_point("stage-synced");
         if let Err(failure) = exchange_names(
-            &parent,
+            parent,
             name,
             &stage,
             destination,
@@ -72,17 +72,17 @@ pub(super) fn transition_representation(
             "renameat2-exchange-transition",
         ) {
             return Err(cleanup_unpublished_after_failure(
-                &parent,
+                parent,
                 &stage,
                 destination,
                 failure,
             ));
         }
         fault_point("exchange-published");
-        sync_parent(&parent, destination)?;
-        verify_writable_destination(&parent, &name, destination, &intended)?;
+        sync_parent(parent, destination)?;
+        verify_writable_destination(parent, name, destination, &intended)?;
         fault_point("verified");
-        remove_unpublished_stage(&parent, &stage, destination)?;
+        remove_unpublished_stage(parent, &stage, destination)?;
         ledger.commit(
             canonical,
             owned_record(
@@ -106,8 +106,8 @@ pub(super) fn transition_representation(
         ));
     };
     let observed_hash = hash_regular(
-        &parent,
-        &name,
+        parent,
+        name,
         destination,
         CodeKey::TransitionRefused,
         "read-writable-transition",
@@ -131,10 +131,10 @@ pub(super) fn transition_representation(
     );
     ledger.commit(canonical, pending)?;
     fault_point("pending-committed");
-    stage_symlink(setpriv, &parent, &stage, entry, expected)?;
+    stage_symlink(setpriv, parent, &stage, entry, expected)?;
     fault_point("stage-synced");
     if let Err(failure) = exchange_names(
-        &parent,
+        parent,
         name,
         &stage,
         destination,
@@ -142,15 +142,15 @@ pub(super) fn transition_representation(
         "renameat2-exchange-transition",
     ) {
         return Err(cleanup_unpublished_after_failure(
-            &parent,
+            parent,
             &stage,
             destination,
             failure,
         ));
     }
     fault_point("exchange-published");
-    sync_parent(&parent, destination)?;
-    let published = symlink_target(&parent, &name).map_err(|errno| {
+    sync_parent(parent, destination)?;
+    let published = symlink_target(parent, name).map_err(|errno| {
         Failure::syscall(
             CodeKey::TransitionRefused,
             destination,
@@ -168,7 +168,7 @@ pub(super) fn transition_representation(
     fault_point("verified");
     // the displaced object is the pristine regular file, proven equal to its
     // baseline above, so removing it destroys no work.
-    remove_unpublished_stage(&parent, &stage, destination)?;
+    remove_unpublished_stage(parent, &stage, destination)?;
     let owned = owned_record(
         identity,
         entry,

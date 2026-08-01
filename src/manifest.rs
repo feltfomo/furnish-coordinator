@@ -2,6 +2,8 @@ use crate::diagnostic::{CodeKey, DIAGNOSTIC_SCHEMA_VERSION, Failure, Result};
 use crate::executor::WorkerProgram;
 use crate::ledger::{AuthorityScope, Representation};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+use std::path::{Component, Path};
 
 pub(crate) const MANIFEST_SCHEMA_VERSION: u64 = 2;
 pub(crate) const NATIVE_EXECUTOR_IDENTITY: &str = "furnish/native-symlink";
@@ -48,16 +50,36 @@ pub(crate) fn profile_for(
     })
 }
 
+fn unique_profile_for_wire<'a>(
+    profiles: &'a [ExecutorProfile],
+    identity: &str,
+    protocol_version: u64,
+    representation: &str,
+) -> std::result::Result<Option<&'a ExecutorProfile>, ()> {
+    let mut matches = profiles.iter().filter(|profile| {
+        profile.identity == identity
+            && profile.protocol_version == protocol_version
+            && profile.representation.as_str() == representation
+    });
+    let profile = matches.next();
+    if matches.next().is_some() {
+        Err(())
+    } else {
+        Ok(profile)
+    }
+}
+
 fn profile_for_wire(
     identity: &str,
     protocol_version: u64,
     representation: &str,
-) -> Option<&'static ExecutorProfile> {
-    EXECUTOR_PROFILES.iter().find(|profile| {
-        profile.identity == identity
-            && profile.protocol_version == protocol_version
-            && profile.representation.as_str() == representation
-    })
+) -> std::result::Result<Option<&'static ExecutorProfile>, ()> {
+    unique_profile_for_wire(
+        &EXECUTOR_PROFILES,
+        identity,
+        protocol_version,
+        representation,
+    )
 }
 
 #[derive(Debug)]
@@ -231,6 +253,8 @@ pub(crate) fn validate_manifest(decoded: DecodedManifest) -> Result<Manifest> {
         ));
     }
     let mut entries = Vec::with_capacity(raw.entries.len());
+    let mut canonicals = BTreeSet::new();
+    let mut destinations = BTreeSet::new();
     for entry in raw.entries {
         if entry.schema_version != MANIFEST_SCHEMA_VERSION {
             return Err(Failure::new(
@@ -239,19 +263,31 @@ pub(crate) fn validate_manifest(decoded: DecodedManifest) -> Result<Manifest> {
                 "entry schema does not match the manifest schema",
             ));
         }
-        let Some(profile) = profile_for_wire(
+        let profile = match profile_for_wire(
             &entry.executor.identity,
             entry.executor.protocol_version,
             &entry.representation,
-        ) else {
-            return Err(Failure::new(
-                CodeKey::UnsupportedExecutor,
-                &entry.filesystem_identity.canonical,
-                format!(
-                    "unsupported executor tuple ({}, {}, {})",
-                    entry.executor.identity, entry.executor.protocol_version, entry.representation
-                ),
-            ));
+        ) {
+            Ok(Some(profile)) => profile,
+            Ok(None) => {
+                return Err(Failure::new(
+                    CodeKey::UnsupportedExecutor,
+                    &entry.filesystem_identity.canonical,
+                    format!(
+                        "unsupported executor tuple ({}, {}, {})",
+                        entry.executor.identity,
+                        entry.executor.protocol_version,
+                        entry.representation
+                    ),
+                ));
+            }
+            Err(()) => {
+                return Err(Failure::new(
+                    CodeKey::InvalidManifest,
+                    &entry.filesystem_identity.canonical,
+                    "executor tuple matches more than one qualified profile",
+                ));
+            }
         };
         if entry.cleanup_strategy != profile.lifecycle_strategy
             || entry.self_heal_strategy != profile.lifecycle_strategy
@@ -263,6 +299,19 @@ pub(crate) fn validate_manifest(decoded: DecodedManifest) -> Result<Manifest> {
                     "{} reconciliation requires {} lifecycle strategies",
                     entry.representation, profile.lifecycle_strategy
                 ),
+            ));
+        }
+        let managed_root = Path::new(&entry.managed_root);
+        let mut root_components = managed_root.components();
+        if !managed_root.is_absolute()
+            || !matches!(root_components.next(), Some(Component::RootDir))
+            || root_components.clone().next().is_none()
+            || root_components.any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(Failure::new(
+                CodeKey::InvalidManifest,
+                &entry.filesystem_identity.canonical,
+                "managedRoot must be an absolute path with only normal components",
             ));
         }
         let scope = AuthorityScope::parse(&entry.authority.scope).map_err(|error| {
@@ -281,6 +330,20 @@ pub(crate) fn validate_manifest(decoded: DecodedManifest) -> Result<Manifest> {
                 CodeKey::InvalidManifest,
                 &entry.filesystem_identity.canonical,
                 "filesystem identity is not canonical",
+            ));
+        }
+        if !canonicals.insert(entry.filesystem_identity.canonical.clone()) {
+            return Err(Failure::new(
+                CodeKey::InvalidManifest,
+                &entry.filesystem_identity.canonical,
+                "filesystem identity canonical is duplicated",
+            ));
+        }
+        if !destinations.insert(entry.filesystem_identity.destination.clone()) {
+            return Err(Failure::new(
+                CodeKey::InvalidDestination,
+                &entry.filesystem_identity.destination,
+                "physical destination is declared more than once",
             ));
         }
         entries.push(Entry {
@@ -326,5 +389,133 @@ mod tests {
         assert_eq!(NATIVE_EXECUTOR_IDENTITY, "furnish/native-symlink");
         assert_eq!(NATIVE_EXECUTOR_PROTOCOL, 1);
         assert_eq!(NATIVE_REPRESENTATION.as_str(), "symlink");
+    }
+
+    #[test]
+    fn an_ambiguous_executor_profile_table_is_refused() {
+        let profiles = [
+            ExecutorProfile {
+                identity: NATIVE_EXECUTOR_IDENTITY,
+                protocol_version: NATIVE_EXECUTOR_PROTOCOL,
+                representation: NATIVE_REPRESENTATION,
+                lifecycle_strategy: "exact-symlink-target",
+                worker_kind: WorkerProgram::Symlink,
+            },
+            ExecutorProfile {
+                identity: NATIVE_EXECUTOR_IDENTITY,
+                protocol_version: NATIVE_EXECUTOR_PROTOCOL,
+                representation: NATIVE_REPRESENTATION,
+                lifecycle_strategy: "exact-symlink-target",
+                worker_kind: WorkerProgram::Symlink,
+            },
+        ];
+        assert!(matches!(
+            unique_profile_for_wire(
+                &profiles,
+                NATIVE_EXECUTOR_IDENTITY,
+                NATIVE_EXECUTOR_PROTOCOL,
+                NATIVE_REPRESENTATION.as_str(),
+            ),
+            Err(())
+        ));
+    }
+
+    fn manifest_with_entries(entries: serde_json::Value) -> DecodedManifest {
+        decode_manifest(
+            serde_json::json!({
+                "schemaVersion": MANIFEST_SCHEMA_VERSION,
+                "diagnosticContract": {
+                    "schemaVersion": DIAGNOSTIC_SCHEMA_VERSION,
+                    "codes": {
+                        "invalidManifest": "invalid-manifest",
+                        "unsupportedExecutor": "unsupported-executor",
+                        "invalidDestination": "invalid-destination",
+                        "parentTraversal": "parent-traversal",
+                        "conflictingDestination": "conflicting-destination",
+                        "executorFailed": "executor-failed",
+                        "stagingVerification": "staging-verification",
+                        "publishRace": "publish-race",
+                        "finalVerification": "final-verification",
+                        "ledgerUnreadable": "ledger-unreadable",
+                        "ledgerInvalid": "ledger-invalid",
+                        "ledgerWriteFailed": "ledger-write-failed",
+                        "repairVerification": "repair-verification",
+                        "unresolvableDesiredTarget": "unresolvable-desired-target",
+                        "contentVerification": "content-verification",
+                        "transitionRefused": "transition-refused",
+                        "unresolvedRetirement": "unresolved-retirement",
+                        "pendingRecovery": "pending-recovery"
+                    }
+                },
+                "entries": entries
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap()
+    }
+
+    fn entry(destination: &str, canonical: &str, managed_root: &str) -> serde_json::Value {
+        serde_json::json!({
+            "schemaVersion": MANIFEST_SCHEMA_VERSION,
+            "filesystemIdentity": {
+                "namespace": "test",
+                "destination": destination,
+                "canonical": canonical
+            },
+            "authority": {"scope": "system", "identity": "test/system"},
+            "managedRoot": managed_root,
+            "onConflict": "error",
+            "representation": "symlink",
+            "retainedArtifactTarget": "/nix/store/target",
+            "executor": {
+                "identity": NATIVE_EXECUTOR_IDENTITY,
+                "protocolVersion": NATIVE_EXECUTOR_PROTOCOL
+            },
+            "cleanupStrategy": "exact-symlink-target",
+            "selfHealStrategy": "exact-symlink-target",
+            "provenance": {"declaration": "test", "source": "manifest tests"}
+        })
+    }
+
+    #[test]
+    fn duplicate_canonicals_are_refused_before_reconciliation() {
+        let entries = serde_json::json!([
+            entry("/managed/a", "test:/managed/a", "/managed"),
+            entry("/managed/a", "test:/managed/a", "/managed")
+        ]);
+        let failure = validate_manifest(manifest_with_entries(entries)).unwrap_err();
+        assert!(matches!(failure.key, CodeKey::InvalidManifest));
+        assert_eq!(
+            failure.message,
+            "filesystem identity canonical is duplicated"
+        );
+    }
+
+    #[test]
+    fn duplicate_physical_destinations_are_refused_before_reconciliation() {
+        let first = entry("/managed/a", "test:/managed/a", "/managed");
+        let mut second = entry("/managed/a", "other:/managed/a", "/managed");
+        second["filesystemIdentity"]["namespace"] = serde_json::json!("other");
+        let entries = serde_json::json!([first, second]);
+        let failure = validate_manifest(manifest_with_entries(entries)).unwrap_err();
+        assert!(matches!(failure.key, CodeKey::InvalidDestination));
+        assert_eq!(
+            failure.message,
+            "physical destination is declared more than once"
+        );
+    }
+
+    #[test]
+    fn non_normal_managed_roots_are_refused_before_reconciliation() {
+        for managed_root in ["relative", "/", "/managed/../other"] {
+            let entries = serde_json::json!([entry("/managed/a", "test:/managed/a", managed_root)]);
+            let failure = validate_manifest(manifest_with_entries(entries)).unwrap_err();
+            assert!(matches!(failure.key, CodeKey::InvalidManifest));
+            assert_eq!(
+                failure.message,
+                "managedRoot must be an absolute path with only normal components"
+            );
+        }
     }
 }

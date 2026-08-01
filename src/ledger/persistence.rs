@@ -447,7 +447,11 @@ impl TryFrom<RawLedgerRecord> for LedgerRecord {
                 RecordStatus::Pending {
                     intent,
                     stage_name: raw.stage_name,
-                    prior_owned: raw.prior_owned.map(TryInto::try_into).transpose()?,
+                    prior_owned: raw
+                        .prior_owned
+                        .map(TryInto::try_into)
+                        .transpose()?
+                        .map(Box::new),
                 }
             }
             value => {
@@ -500,7 +504,7 @@ impl From<LedgerRecord> for RawLedgerRecord {
                         PENDING_STATE.to_owned(),
                         applied_by.to_owned(),
                         stage_name,
-                        prior_owned.map(Into::into),
+                        prior_owned.map(|record| (*record).into()),
                         None,
                     )
                 }
@@ -757,10 +761,7 @@ mod tests {
 
     #[test]
     fn the_ledger_write_produces_exact_bytes() {
-        // every stamp that varies from run to run is fixed here, so the
-        // the file is pinned byte for byte with schema first, records second,
-        // canonical keys sorted, record fields in declaration order, nulls
-        // emitted rather than omitted.
+        // fixed stamps pin field order, canonical ordering, and explicit nulls.
         let directory = state_directory("exact-bytes");
         let mut ledger = empty_ledger(&directory);
         let mut record = sample_record(Representation::Writable);
