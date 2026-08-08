@@ -13,8 +13,18 @@
 pkgs.rustPlatform.buildRustPackage {
   pname = "furnish-coordinator${suffix}";
   version = "0.1.0";
-  src = ./coordinator;
-  cargoLock.lockFile = ./coordinator/Cargo.lock;
+  # the crate only. with the crate at the repo root, a plain ./. source would
+  # rebuild rust on every flake.nix or formatter.nix edit.
+  src = pkgs.lib.fileset.toSource {
+    root = ./.;
+    fileset = pkgs.lib.fileset.unions [
+      ./Cargo.toml
+      ./Cargo.lock
+      ./src
+      ./tests
+    ];
+  };
+  cargoLock.lockFile = ./Cargo.lock;
   # set even when it is empty, because an absent buildFeatures and an empty one
   # are the same cargo invocation but not the same derivation. two callers
   # disagreeing about which form to use is what built the shipped coordinator
