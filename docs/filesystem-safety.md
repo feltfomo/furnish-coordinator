@@ -45,7 +45,7 @@ Workers reopen an inherited parent descriptor through `/proc/self/fd/<n>`, valid
 - exclusive `openat` plus exact write, `chmod`, and `fsync` for a writable stage;
 - `mkdirat` plus exact-mode verification for a directory component.
 
-User-scoped workers are launched through `setpriv`; system-scoped workers execute directly. The inherited parent descriptor intentionally crosses `exec`, while unrelated descriptors use close-on-exec behavior.
+User-scoped workers are launched through `setpriv` with the account's resolved primary group; system-scoped workers execute directly. The inherited parent descriptor intentionally crosses `exec`, while unrelated descriptors use close-on-exec behavior.
 
 Worker stderr may contain a small strict JSON errno envelope. The parent accepts only known operation names and at most 512 bytes, so worker output cannot become an unbounded or invented diagnostic cause.
 

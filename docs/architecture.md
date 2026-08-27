@@ -113,6 +113,6 @@ Atomic rename protects one destination publication; the run is not an all-or-not
 
 ## Authority model
 
-System-scoped workers run directly. User-scoped workers are launched through `setpriv` with matching real/effective user and group identity plus initialized supplementary groups. The coordinator still owns traversal, observation, policy decisions, publication, verification, and ledger writes.
+System-scoped workers run directly. User-scoped workers are launched through `setpriv` with the declared real/effective user identity, that account's primary group resolved through the system user database, and initialized supplementary groups. The coordinator still owns traversal, observation, policy decisions, publication, verification, and ledger writes.
 
 The authority boundary therefore changes who performs the narrow write, not who controls the transaction.

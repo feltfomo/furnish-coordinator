@@ -4,7 +4,7 @@ use crate::manifest::Authority;
 use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 use std::env;
-use std::ffi::{OsStr, OsString};
+use std::ffi::{CString, OsStr, OsString};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
@@ -109,6 +109,25 @@ fn parse_evidence(bytes: &[u8]) -> Option<Cause<'static>> {
     })
 }
 
+fn primary_group_id(identity: &str, target: &str) -> Result<u32> {
+    let name = CString::new(identity).map_err(|_| {
+        Failure::new(
+            CodeKey::ExecutorFailed,
+            target,
+            "user authority identity contains a null byte",
+        )
+    })?;
+    let passwd = unsafe { libc::getpwnam(name.as_ptr()) };
+    if passwd.is_null() {
+        return Err(Failure::new(
+            CodeKey::ExecutorFailed,
+            target,
+            format!("cannot resolve primary group for user authority {identity}"),
+        ));
+    }
+    Ok(unsafe { (*passwd).pw_gid })
+}
+
 pub(crate) fn launch(
     setpriv: &Path,
     parent: &OwnedFd,
@@ -126,12 +145,13 @@ pub(crate) fn launch(
         )
     })?;
     let mut command = if authority.scope == AuthorityScope::User {
+        let primary_group = primary_group_id(&authority.identity, target)?;
         let mut command = Command::new(setpriv);
         command
             .arg("--reuid")
             .arg(&authority.identity)
             .arg("--regid")
-            .arg(&authority.identity)
+            .arg(primary_group.to_string())
             .arg("--init-groups")
             .arg("--")
             .arg(&executable);
@@ -185,6 +205,14 @@ pub(crate) fn io_errno(error: &std::io::Error) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn primary_group_comes_from_the_user_database() {
+        assert_eq!(primary_group_id("root", "/target").unwrap(), 0);
+        let failure = primary_group_id("furnish-no-such-user", "/target").unwrap_err();
+        assert!(matches!(failure.key, CodeKey::ExecutorFailed));
+        assert_eq!(failure.label, "/target");
+    }
 
     #[test]
     fn evidence_is_bounded_and_strict() {
