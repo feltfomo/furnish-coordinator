@@ -5,7 +5,7 @@ use super::stage::{
     DisplacedCleanup, cleanup_unpublished_after_failure, discard_displaced_under_policy,
     remove_verified_displaced,
 };
-use crate::diagnostic::{CodeKey, Failure, Result};
+use crate::diagnostic::{CodeKey, Context, Failure, Result};
 use crate::fault::{fault_point, reverse_exchange_restore_fault};
 use rustix::fs::{RenameFlags, fsync, renameat_with};
 use std::ffi::OsStr;
@@ -19,8 +19,11 @@ pub(crate) fn exchange_names(
     key: CodeKey,
     operation: &'static str,
 ) -> Result<()> {
-    renameat_with(parent, stage, parent, name, RenameFlags::EXCHANGE)
-        .map_err(|errno| Failure::syscall(key, destination, operation, errno))
+    renameat_with(parent, stage, parent, name, RenameFlags::EXCHANGE).at(
+        key,
+        destination,
+        operation,
+    )
 }
 
 pub(crate) fn publish_new(
@@ -31,14 +34,7 @@ pub(crate) fn publish_new(
     expected: &OsStr,
 ) -> Result<()> {
     if symlink_target(parent, name)
-        .map_err(|errno| {
-            Failure::syscall(
-                CodeKey::PublishRace,
-                destination,
-                "fstatat-before-publish",
-                errno,
-            )
-        })?
+        .at(CodeKey::PublishRace, destination, "fstatat-before-publish")?
         .exists()
     {
         return Err(cleanup_unpublished_after_failure(
@@ -71,14 +67,11 @@ pub(crate) fn publish_new(
     sync_parent(parent, destination)?;
     fault_point("published-synced");
 
-    let final_target = symlink_target(parent, name).map_err(|errno| {
-        Failure::syscall(
-            CodeKey::FinalVerification,
-            destination,
-            "readlinkat-final",
-            errno,
-        )
-    })?;
+    let final_target = symlink_target(parent, name).at(
+        CodeKey::FinalVerification,
+        destination,
+        "readlinkat-final",
+    )?;
     if final_target.target() != Some(expected) {
         return Err(Failure::new(
             CodeKey::FinalVerification,
@@ -112,22 +105,16 @@ pub(crate) fn publish_exchange(
     }
     fault_point("exchange-published");
 
-    let published = symlink_target(parent, name).map_err(|errno| {
-        Failure::syscall(
-            CodeKey::RepairVerification,
-            destination,
-            "readlinkat-published",
-            errno,
-        )
-    })?;
-    let displaced = symlink_target(parent, stage).map_err(|errno| {
-        Failure::syscall(
-            CodeKey::RepairVerification,
-            destination,
-            "readlinkat-displaced",
-            errno,
-        )
-    })?;
+    let published = symlink_target(parent, name).at(
+        CodeKey::RepairVerification,
+        destination,
+        "readlinkat-published",
+    )?;
+    let displaced = symlink_target(parent, stage).at(
+        CodeKey::RepairVerification,
+        destination,
+        "readlinkat-displaced",
+    )?;
     if published.target() != Some(expected) || displaced.target() != Some(recorded) {
         return Err(Failure::new(
             CodeKey::RepairVerification,
@@ -144,14 +131,7 @@ pub(crate) fn publish_exchange(
 }
 
 pub(crate) fn sync_parent(parent: &OwnedFd, destination: &str) -> Result<()> {
-    fsync(parent).map_err(|errno| {
-        Failure::syscall(
-            CodeKey::FinalVerification,
-            destination,
-            "fsync-parent",
-            errno,
-        )
-    })
+    fsync(parent).at(CodeKey::FinalVerification, destination, "fsync-parent")
 }
 
 pub(crate) fn rollback_exchange(
@@ -162,22 +142,13 @@ pub(crate) fn rollback_exchange(
     prior_hash: &str,
     intended_hash: &str,
 ) -> Result<()> {
-    reverse_exchange_restore_fault().map_err(|errno| {
-        Failure::syscall(
-            CodeKey::PendingRecovery,
-            destination,
-            "renameat2-exchange-restore-pending",
-            errno,
-        )
-    })?;
-    renameat_with(parent, stage, parent, name, RenameFlags::EXCHANGE).map_err(|errno| {
-        Failure::syscall(
-            CodeKey::PendingRecovery,
-            destination,
-            "renameat2-exchange-restore-pending",
-            errno,
-        )
-    })?;
+    const RESTORE: &str = "renameat2-exchange-restore-pending";
+    reverse_exchange_restore_fault().at(CodeKey::PendingRecovery, destination, RESTORE)?;
+    renameat_with(parent, stage, parent, name, RenameFlags::EXCHANGE).at(
+        CodeKey::PendingRecovery,
+        destination,
+        RESTORE,
+    )?;
     sync_parent(parent, destination)?;
     verify_writable_hash(
         parent,

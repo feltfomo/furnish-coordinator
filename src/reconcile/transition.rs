@@ -1,5 +1,5 @@
 use super::{
-    AppliedOperation, CodeKey, Entry, Failure, LedgerRecord, LedgerState, OpenDestination,
+    AppliedOperation, CodeKey, Context, Entry, Failure, LedgerRecord, LedgerState, OpenDestination,
     PendingIntent, Result, RunIdentity, TransitionPair, WRITABLE_REPRESENTATION,
     cleanup_unpublished_after_failure, exchange_names, fault_point, hash_regular, hash_source,
     owned_record, pending_record, remove_unpublished_stage, sha256_hex, stage_name, stage_symlink,
@@ -33,14 +33,11 @@ pub(super) fn transition_representation(
 
     if to == WRITABLE_REPRESENTATION {
         // only sound when the current symlink is exactly the recorded one.
-        let observed = symlink_target(parent, name).map_err(|errno| {
-            Failure::syscall(
-                CodeKey::TransitionRefused,
-                destination,
-                "readlinkat-transition",
-                errno,
-            )
-        })?;
+        let observed = symlink_target(parent, name).at(
+            CodeKey::TransitionRefused,
+            destination,
+            "readlinkat-transition",
+        )?;
         if observed.target() != Some(recorded) {
             return Err(Failure::new(
                 CodeKey::TransitionRefused,
@@ -150,14 +147,11 @@ pub(super) fn transition_representation(
     }
     fault_point("exchange-published");
     sync_parent(parent, destination)?;
-    let published = symlink_target(parent, name).map_err(|errno| {
-        Failure::syscall(
-            CodeKey::TransitionRefused,
-            destination,
-            "readlinkat-transition-published",
-            errno,
-        )
-    })?;
+    let published = symlink_target(parent, name).at(
+        CodeKey::TransitionRefused,
+        destination,
+        "readlinkat-transition-published",
+    )?;
     if published.target() != Some(expected) {
         return Err(Failure::new(
             CodeKey::TransitionRefused,

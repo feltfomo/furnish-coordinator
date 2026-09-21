@@ -1,4 +1,4 @@
-use crate::diagnostic::{CodeKey, Failure, Result};
+use crate::diagnostic::{CodeKey, Context, Failure, Result};
 use rustix::fs::{AtFlags, unlinkat};
 use rustix::io::Errno;
 use std::ffi::OsStr;
@@ -47,14 +47,11 @@ pub(crate) fn discard_displaced_under_policy<Fd: std::os::fd::AsFd>(
     stage: &OsStr,
     destination: &str,
 ) -> Result<()> {
-    unlinkat(parent, stage, AtFlags::empty()).map_err(|errno| {
-        Failure::syscall(
-            CodeKey::FinalVerification,
-            destination,
-            "unlinkat-policy-displaced",
-            errno,
-        )
-    })
+    unlinkat(parent, stage, AtFlags::empty()).at(
+        CodeKey::FinalVerification,
+        destination,
+        "unlinkat-policy-displaced",
+    )
 }
 
 pub(crate) fn remove_verified_displaced<Fd: std::os::fd::AsFd>(
@@ -71,14 +68,11 @@ pub(crate) fn remove_verified_displaced<Fd: std::os::fd::AsFd>(
             Errno::IO,
         ));
     }
-    unlinkat(parent, stage, AtFlags::empty()).map_err(|errno| {
-        Failure::syscall(
-            CodeKey::FinalVerification,
-            destination,
-            "unlinkat-verified-displaced",
-            errno,
-        )
-    })
+    unlinkat(parent, stage, AtFlags::empty()).at(
+        CodeKey::FinalVerification,
+        destination,
+        "unlinkat-verified-displaced",
+    )
 }
 
 #[cfg(test)]

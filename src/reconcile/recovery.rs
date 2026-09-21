@@ -1,5 +1,5 @@
 use super::{
-    AppliedOperation, CodeKey, ConflictPolicy, Entry, Failure, LedgerRecord, LedgerState,
+    AppliedOperation, CodeKey, ConflictPolicy, Context, Entry, Failure, LedgerRecord, LedgerState,
     NATIVE_REPRESENTATION, OpenDestination, PendingIntent, REGULAR_MODE, ReconcileContext,
     RecordStatus, Representation, Result, RunIdentity, SYMLINK_MODE, TransitionPair,
     WRITABLE_REPRESENTATION, baseline_for, cleanup_unpublished_after_failure,
@@ -79,14 +79,11 @@ pub(super) fn recover_pending(
             }
         }
         Some(_) => {
-            let target = symlink_target(&parent, &name).map_err(|errno| {
-                Failure::syscall(
-                    CodeKey::PendingRecovery,
-                    destination,
-                    "readlinkat-pending-recovery",
-                    errno,
-                )
-            })?;
+            let target = symlink_target(&parent, &name).at(
+                CodeKey::PendingRecovery,
+                destination,
+                "readlinkat-pending-recovery",
+            )?;
             artifact_matches && target.target() == Some(OsStr::new(&record.applied_artifact_target))
         }
     };
@@ -186,14 +183,11 @@ pub(super) fn recover_pending(
                             "displaced symlink does not match the prior representation; both names are preserved",
                         ));
                     }
-                    let displaced = symlink_target(&parent, stage).map_err(|errno| {
-                        Failure::syscall(
-                            CodeKey::PendingRecovery,
-                            destination,
-                            "readlinkat-displaced-pending",
-                            errno,
-                        )
-                    })?;
+                    let displaced = symlink_target(&parent, stage).at(
+                        CodeKey::PendingRecovery,
+                        destination,
+                        "readlinkat-displaced-pending",
+                    )?;
                     if displaced.target() != Some(OsStr::new(&prior.applied_artifact_target)) {
                         return Err(Failure::new(
                             CodeKey::PendingRecovery,
@@ -226,14 +220,11 @@ pub(super) fn recover_pending(
             ));
         }
         if prior.representation == NATIVE_REPRESENTATION {
-            let target = symlink_target(&parent, &name).map_err(|errno| {
-                Failure::syscall(
-                    CodeKey::PendingRecovery,
-                    destination,
-                    "readlinkat-prior-owned",
-                    errno,
-                )
-            })?;
+            let target = symlink_target(&parent, &name).at(
+                CodeKey::PendingRecovery,
+                destination,
+                "readlinkat-prior-owned",
+            )?;
             if target.target() != Some(OsStr::new(&prior.applied_artifact_target)) {
                 return Err(Failure::new(
                     CodeKey::PendingRecovery,
@@ -385,14 +376,11 @@ pub(super) fn recover_transition(
                 "read-prior-owned-transition",
             )?;
         } else {
-            let target = symlink_target(parent, name).map_err(|errno| {
-                Failure::syscall(
-                    CodeKey::TransitionRefused,
-                    destination,
-                    "readlinkat-prior-owned-transition",
-                    errno,
-                )
-            })?;
+            let target = symlink_target(parent, name).at(
+                CodeKey::TransitionRefused,
+                destination,
+                "readlinkat-prior-owned-transition",
+            )?;
             if target.target() != Some(OsStr::new(&prior.applied_artifact_target)) {
                 return Err(Failure::new(
                     CodeKey::TransitionRefused,
@@ -418,14 +406,11 @@ pub(super) fn recover_transition(
                     "read-unpublished-transition",
                 )?;
             } else {
-                let target = symlink_target(parent, &stage).map_err(|errno| {
-                    Failure::syscall(
-                        CodeKey::TransitionRefused,
-                        destination,
-                        "readlinkat-unpublished-transition",
-                        errno,
-                    )
-                })?;
+                let target = symlink_target(parent, &stage).at(
+                    CodeKey::TransitionRefused,
+                    destination,
+                    "readlinkat-unpublished-transition",
+                )?;
                 if target.target() != Some(OsStr::new(&record.applied_artifact_target)) {
                     return Err(Failure::new(
                         CodeKey::TransitionRefused,
@@ -466,14 +451,11 @@ pub(super) fn recover_transition(
             ));
         };
         verify_writable_destination(parent, name, destination, &intended)?;
-        let displaced = symlink_target(parent, &stage).map_err(|errno| {
-            Failure::syscall(
-                CodeKey::TransitionRefused,
-                destination,
-                "readlinkat-displaced-transition",
-                errno,
-            )
-        })?;
+        let displaced = symlink_target(parent, &stage).at(
+            CodeKey::TransitionRefused,
+            destination,
+            "readlinkat-displaced-transition",
+        )?;
         if displaced.target() != Some(OsStr::new(&prior.applied_artifact_target)) {
             return Err(Failure::new(
                 CodeKey::TransitionRefused,
@@ -530,14 +512,11 @@ pub(super) fn recover_transition(
             &displaced_hash,
             "read-restored-transition-destination",
         )?;
-        let restored_stage = symlink_target(parent, &stage).map_err(|errno| {
-            Failure::syscall(
-                CodeKey::TransitionRefused,
-                destination,
-                "readlinkat-restored-transition-stage",
-                errno,
-            )
-        })?;
+        let restored_stage = symlink_target(parent, &stage).at(
+            CodeKey::TransitionRefused,
+            destination,
+            "readlinkat-restored-transition-stage",
+        )?;
         if restored_stage.target() != Some(OsStr::new(&record.applied_artifact_target)) {
             return Err(Failure::new(
                 CodeKey::TransitionRefused,

@@ -80,22 +80,29 @@ pub(crate) fn worker_failure(operation: &'static str, errno: i32) -> ExitCode {
     ExitCode::FAILURE
 }
 
+// the worker reports its own failure site, so the name arriving here is
+// untrusted input. matching it against this list is what earns it a place in a
+// diagnostic, and is also what turns it into the borrowed name the cause holds
+// instead of an allocation owned by the message it came from.
+const WORKER_OPERATIONS: [&str; 12] = [
+    "open-worker-parent",
+    "symlinkat-stage",
+    "read-worker-source",
+    "openat-worker-stage",
+    "write-worker-stage",
+    "chmod-worker-stage",
+    "fsync-worker-stage",
+    "mkdirat-parent-component",
+    "openat-created-parent-component",
+    "chmod-created-parent-component",
+    "stat-created-parent-component",
+    "verify-created-parent-component",
+];
+
 fn known_operation(value: &str) -> Option<&'static str> {
-    match value {
-        "open-worker-parent" => Some("open-worker-parent"),
-        "symlinkat-stage" => Some("symlinkat-stage"),
-        "read-worker-source" => Some("read-worker-source"),
-        "openat-worker-stage" => Some("openat-worker-stage"),
-        "write-worker-stage" => Some("write-worker-stage"),
-        "chmod-worker-stage" => Some("chmod-worker-stage"),
-        "fsync-worker-stage" => Some("fsync-worker-stage"),
-        "mkdirat-parent-component" => Some("mkdirat-parent-component"),
-        "openat-created-parent-component" => Some("openat-created-parent-component"),
-        "chmod-created-parent-component" => Some("chmod-created-parent-component"),
-        "stat-created-parent-component" => Some("stat-created-parent-component"),
-        "verify-created-parent-component" => Some("verify-created-parent-component"),
-        _ => None,
-    }
+    WORKER_OPERATIONS
+        .into_iter()
+        .find(|operation| *operation == value)
 }
 
 fn parse_evidence(bytes: &[u8]) -> Option<Cause<'static>> {

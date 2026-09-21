@@ -1,4 +1,4 @@
-use crate::diagnostic::{CodeKey, Failure, Result};
+use crate::diagnostic::{CodeKey, Context, Failure, Result};
 use rustix::fs::{FlockOperation, Mode, OFlags, flock, open, openat};
 use std::ffi::OsStr;
 use std::os::fd::OwnedFd;
@@ -18,22 +18,16 @@ pub(crate) fn acquire_lock(
         OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::RUSR | Mode::WUSR,
     )
-    .map_err(|errno| {
-        Failure::syscall(
-            CodeKey::InvalidManifest,
-            label.to_string_lossy(),
-            "openat-lock",
-            errno,
-        )
-    })?;
-    flock(&lock, FlockOperation::LockExclusive).map_err(|errno| {
-        Failure::syscall(
-            CodeKey::InvalidManifest,
-            label.to_string_lossy(),
-            "flock",
-            errno,
-        )
-    })?;
+    .at(
+        CodeKey::InvalidManifest,
+        label.to_string_lossy(),
+        "openat-lock",
+    )?;
+    flock(&lock, FlockOperation::LockExclusive).at(
+        CodeKey::InvalidManifest,
+        label.to_string_lossy(),
+        "flock",
+    )?;
     Ok(lock)
 }
 
@@ -56,14 +50,11 @@ pub(crate) fn open_host_lock(lock_name: &OsStr, lock_dir: &Path) -> Result<Owned
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
-    .map_err(|errno| {
-        Failure::syscall(
-            CodeKey::InvalidManifest,
-            lock_dir.to_string_lossy(),
-            "open-run-lock",
-            errno,
-        )
-    })?;
+    .at(
+        CodeKey::InvalidManifest,
+        lock_dir.to_string_lossy(),
+        "open-run-lock",
+    )?;
     acquire_lock(&run_lock, lock_dir, lock_name)
 }
 

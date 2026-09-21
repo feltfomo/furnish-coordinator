@@ -172,6 +172,15 @@ impl LedgerRecord {
         }
     }
 
+    // the call sites for this are runs that published nothing, so there is no
+    // branch of their own to name. an owned record's branch is carried forward
+    // rather than restated; a pending one has none to carry, and update is the
+    // weakest claim that is still true of a destination left as it was found.
+    pub(crate) fn applied_by_or_update(&self) -> AppliedOperation {
+        self.owned()
+            .map_or(AppliedOperation::Update, |owned| owned.applied_by)
+    }
+
     pub(crate) fn is_owned(&self) -> bool {
         matches!(self.status, RecordStatus::Owned { .. })
     }

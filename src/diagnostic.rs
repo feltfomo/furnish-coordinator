@@ -167,6 +167,25 @@ impl Failure {
     }
 }
 
+// every syscall site used to spell out the same map_err closure, which rustfmt
+// then spread over five lines and pushed the operation name away from the call
+// it names. the label and operation stay on the call here.
+pub(crate) trait Context<T> {
+    fn at(self, key: CodeKey, label: impl Into<String>, operation: &'static str) -> Result<T>;
+}
+
+impl<T> Context<T> for std::result::Result<T, Errno> {
+    fn at(self, key: CodeKey, label: impl Into<String>, operation: &'static str) -> Result<T> {
+        self.map_err(|errno| Failure::syscall(key, label, operation, errno))
+    }
+}
+
+impl<T> Context<T> for std::result::Result<T, io::Error> {
+    fn at(self, key: CodeKey, label: impl Into<String>, operation: &'static str) -> Result<T> {
+        self.map_err(|error| Failure::io(key, label, operation, &error))
+    }
+}
+
 pub(crate) fn code(codes: &DiagnosticCodes, key: CodeKey) -> &str {
     match key {
         CodeKey::InvalidManifest => &codes.invalid_manifest,

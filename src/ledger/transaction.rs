@@ -60,6 +60,26 @@ pub(crate) fn owned_record(
     record
 }
 
+// a run that publishes nothing still has to leave evidence that it looked, so
+// the record is restated under this run's identity while the applied state
+// travels across unchanged. the branch is carried, not re-decided, because the
+// run doing the carrying is not the one that published.
+pub(crate) fn refreshed_record(
+    identity: &RunIdentity,
+    entry: &Entry,
+    prior: &LedgerRecord,
+) -> LedgerRecord {
+    let mut record = identity.record(
+        entry,
+        RecordStatus::Owned {
+            applied_by: prior.applied_by_or_update(),
+            unresolved_retirement: None,
+        },
+    );
+    carry_applied_state(prior, &mut record);
+    record
+}
+
 // a witness hash is a baseline only where it hashes bytes that live at the
 // destination. for a symlink it hashes a path string, which is not a baseline
 // and must not be stored as one.

@@ -1,5 +1,5 @@
 use super::{FILE_TYPE_MASK, REGULAR_MODE, SYMLINK_MODE, WRITABLE_FILE_MODE};
-use crate::diagnostic::{CodeKey, Failure, Result};
+use crate::diagnostic::{CodeKey, Context, Failure, Result};
 use crate::hash::sha256_hex;
 use rustix::fs::{AtFlags, Mode, OFlags, openat, readlinkat, statat};
 use rustix::io::Errno;
@@ -79,28 +79,24 @@ pub(crate) fn observe_kind(
     name: &OsStr,
     destination: &str,
 ) -> Result<Option<u32>> {
-    match statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(stat) => Ok(Some(stat.st_mode & FILE_TYPE_MASK)),
-        Err(Errno::NOENT) => Ok(None),
-        Err(errno) => Err(Failure::syscall(
+    let stat = match statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Err(Errno::NOENT) => return Ok(None),
+        other => other.at(
             CodeKey::ConflictingDestination,
             destination,
             "fstatat-destination-kind",
-            errno,
-        )),
-    }
+        )?,
+    };
+    Ok(Some(stat.st_mode & FILE_TYPE_MASK))
 }
 
 pub(crate) fn observe_mode(parent: &OwnedFd, name: &OsStr, destination: &str) -> Result<u32> {
-    match statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(stat) => Ok(stat.st_mode & 0o7777),
-        Err(errno) => Err(Failure::syscall(
-            CodeKey::ConflictingDestination,
-            destination,
-            "fstatat-destination-mode",
-            errno,
-        )),
-    }
+    let stat = statat(parent, name, AtFlags::SYMLINK_NOFOLLOW).at(
+        CodeKey::ConflictingDestination,
+        destination,
+        "fstatat-destination-mode",
+    )?;
+    Ok(stat.st_mode & 0o7777)
 }
 
 fn read_regular(
@@ -116,11 +112,11 @@ fn read_regular(
         OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::empty(),
     )
-    .map_err(|errno| Failure::syscall(key, destination, operation, errno))?;
+    .at(key, destination, operation)?;
     let mut file = fs::File::from(opened);
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)
-        .map_err(|error| Failure::io(key, destination, operation, &error))?;
+        .at(key, destination, operation)?;
     Ok(bytes)
 }
 

@@ -8,7 +8,7 @@ pub(crate) use model::{
     Representation, TransitionPair, UnresolvedRetirement,
 };
 pub(crate) use persistence::LedgerState;
-pub(crate) use transaction::{baseline_for, carry_applied_state, owned_record, pending_record};
+pub(crate) use transaction::{baseline_for, owned_record, pending_record, refreshed_record};
 
 pub(crate) const LEDGER_SCHEMA_VERSION: u64 = 2;
 pub(crate) const LEDGER_FILE_NAME: &str = "applied-state.json";

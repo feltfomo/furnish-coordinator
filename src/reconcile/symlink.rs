@@ -1,5 +1,5 @@
 use super::{
-    CodeKey, Entry, Failure, Result, cleanup_unpublished_after_failure, profile_for,
+    CodeKey, Context, Entry, Failure, Result, cleanup_unpublished_after_failure, profile_for,
     remove_unpublished_stage, run_executor, symlink_target,
 };
 use std::ffi::OsStr;
@@ -35,14 +35,11 @@ pub(super) fn stage_symlink(
         &entry.authority,
         profile,
     )?;
-    let staged = symlink_target(parent, stage).map_err(|errno| {
-        Failure::syscall(
-            CodeKey::StagingVerification,
-            destination,
-            "readlinkat-staging",
-            errno,
-        )
-    })?;
+    let staged = symlink_target(parent, stage).at(
+        CodeKey::StagingVerification,
+        destination,
+        "readlinkat-staging",
+    )?;
     if staged.target() != Some(expected) {
         return Err(cleanup_unpublished_after_failure(
             parent,

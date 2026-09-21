@@ -1,4 +1,4 @@
-use crate::diagnostic::{CodeKey, Failure, Result};
+use crate::diagnostic::{CodeKey, Context, Failure, Result};
 use crate::executor::{self, WorkerProgram};
 use crate::manifest::Authority;
 use rustix::fs::{Mode, OFlags, open, openat};
@@ -82,7 +82,7 @@ pub(crate) fn walk_parent(
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
         Mode::empty(),
     )
-    .map_err(|errno| Failure::syscall(CodeKey::ParentTraversal, destination, "open-root", errno))?;
+    .at(CodeKey::ParentTraversal, destination, "open-root")?;
 
     // components at and above the managed root cannot be created.
     let boundary = managed_root_path.components().count();
@@ -128,14 +128,11 @@ fn open_parent_component(
         Err(Errno::NOENT) => match mode {
             ParentMode::Create { setpriv, authority } if creatable => {
                 run_directory_executor(setpriv, parent, part, destination, authority)?;
-                openat(parent, part, flags, Mode::empty()).map_err(|errno| {
-                    Failure::syscall(
-                        CodeKey::ParentTraversal,
-                        destination,
-                        "openat-created-parent-component",
-                        errno,
-                    )
-                })
+                openat(parent, part, flags, Mode::empty()).at(
+                    CodeKey::ParentTraversal,
+                    destination,
+                    "openat-created-parent-component",
+                )
             }
             _ => Err(refusal(Errno::NOENT)),
         },

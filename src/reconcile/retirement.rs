@@ -1,5 +1,5 @@
 use super::{
-    CodeKey, DestinationObservation, Failure, LedgerRecord, REGULAR_MODE, Result,
+    CodeKey, Context, DestinationObservation, Failure, LedgerRecord, REGULAR_MODE, Result,
     UnresolvedRetirement, WRITABLE_REPRESENTATION, hash_regular, observe_kind, open_parent,
     symlink_target,
 };
@@ -44,14 +44,11 @@ pub(super) fn retire_record(record: &LedgerRecord) -> Result<RetireOutcome> {
                 if record.baseline_hash.as_deref() == Some(observed_hash.as_str()) {
                     // pristine, so the destination is exactly what furnish put
                     // there and removing it destroys nothing.
-                    unlinkat(&parent, name.as_os_str(), AtFlags::empty()).map_err(|errno| {
-                        Failure::syscall(
-                            CodeKey::ExecutorFailed,
-                            destination,
-                            "unlinkat-retire",
-                            errno,
-                        )
-                    })?;
+                    unlinkat(&parent, name.as_os_str(), AtFlags::empty()).at(
+                        CodeKey::ExecutorFailed,
+                        destination,
+                        "unlinkat-retire",
+                    )?;
                     Ok(RetireOutcome::Removed)
                 } else {
                     Ok(RetireOutcome::Unresolved(UnresolvedRetirement {
@@ -69,28 +66,22 @@ pub(super) fn retire_record(record: &LedgerRecord) -> Result<RetireOutcome> {
         };
     }
 
-    let observed = symlink_target(&parent, &name).map_err(|errno| {
-        Failure::syscall(
-            CodeKey::ConflictingDestination,
-            destination,
-            "fstatat-retire",
-            errno,
-        )
-    })?;
+    let observed = symlink_target(&parent, &name).at(
+        CodeKey::ConflictingDestination,
+        destination,
+        "fstatat-retire",
+    )?;
     let recorded = OsStr::new(&record.applied_artifact_target);
     match observed {
         // already gone. there is nothing to unlink, and the record is the only
         // thing left to remove.
         DestinationObservation::Missing => Ok(RetireOutcome::Removed),
         DestinationObservation::Symlink(actual) if actual == recorded => {
-            unlinkat(&parent, name.as_os_str(), AtFlags::empty()).map_err(|errno| {
-                Failure::syscall(
-                    CodeKey::ExecutorFailed,
-                    destination,
-                    "unlinkat-retire",
-                    errno,
-                )
-            })?;
+            unlinkat(&parent, name.as_os_str(), AtFlags::empty()).at(
+                CodeKey::ExecutorFailed,
+                destination,
+                "unlinkat-retire",
+            )?;
             Ok(RetireOutcome::Removed)
         }
         _ => Err(Failure::new(

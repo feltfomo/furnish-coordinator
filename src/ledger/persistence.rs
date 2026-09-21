@@ -7,7 +7,7 @@ use super::model::{
 use super::{
     LEDGER_FILE_NAME, LEDGER_ROLLBACK_FILE_NAME, LEDGER_SCHEMA_VERSION, LEDGER_STAGE_PREFIX,
 };
-use crate::diagnostic::{CodeKey, Failure, Result};
+use crate::diagnostic::{CodeKey, Context, Failure, Result};
 use rustix::fs::{Mode, OFlags, fsync, open};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -78,6 +78,16 @@ pub(super) struct RawUnresolvedRetirement {
     pub(super) baseline_hash: Option<String>,
 }
 
+// every decode of this file reports the same way, so the three call sites that
+// can hit it stay wrong-in-unison rather than drifting apart.
+fn cannot_decode(path: &Path, error: &serde_json::Error) -> Failure {
+    Failure::new(
+        CodeKey::LedgerInvalid,
+        path.to_string_lossy(),
+        format!("cannot decode applied state: {error}"),
+    )
+}
+
 fn default_state() -> String {
     OWNED_STATE.to_owned()
 }
@@ -105,16 +115,12 @@ impl LedgerState {
         let label = directory.to_string_lossy().into_owned();
         let path = directory.join(LEDGER_FILE_NAME);
         let existing = match fs::read(&path) {
-            Ok(bytes) => Some(bytes),
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => {
-                return Err(Failure::io(
-                    CodeKey::LedgerUnreadable,
-                    path.to_string_lossy(),
-                    "read-applied-state",
-                    &error,
-                ));
-            }
+            other => Some(other.at(
+                CodeKey::LedgerUnreadable,
+                path.to_string_lossy(),
+                "read-applied-state",
+            )?),
         };
         let on_disk_version = match existing.as_deref() {
             Some(bytes) => {
@@ -123,13 +129,8 @@ impl LedgerState {
                 struct Version {
                     schema_version: u64,
                 }
-                let version: Version = serde_json::from_slice(bytes).map_err(|error| {
-                    Failure::new(
-                        CodeKey::LedgerInvalid,
-                        path.to_string_lossy(),
-                        format!("cannot decode applied state: {error}"),
-                    )
-                })?;
+                let version: Version =
+                    serde_json::from_slice(bytes).map_err(|error| cannot_decode(&path, &error))?;
                 Some(version.schema_version)
             }
             None => None,
@@ -145,38 +146,25 @@ impl LedgerState {
                 ),
             ));
         }
-        fs::create_dir_all(directory).map_err(|error| {
-            Failure::io(
-                CodeKey::LedgerUnreadable,
-                &label,
-                "create-state-directory",
-                &error,
-            )
-        })?;
+        fs::create_dir_all(directory).at(
+            CodeKey::LedgerUnreadable,
+            &label,
+            "create-state-directory",
+        )?;
         // writability is the privilege here, since anything that can write this
         // file can claim ownership of a destination. readability is not, and
         // keeping it readable lets the unprivileged harness verify that the
         // record survived a root wipe without being handed root to look.
-        fs::set_permissions(directory, fs::Permissions::from_mode(0o755)).map_err(|error| {
-            Failure::io(
-                CodeKey::LedgerUnreadable,
-                &label,
-                "chmod-state-directory",
-                &error,
-            )
-        })?;
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o755)).at(
+            CodeKey::LedgerUnreadable,
+            &label,
+            "chmod-state-directory",
+        )?;
         // asserted rather than assumed. a mode that is 0755 because it was chosen
         // is a decision; a mode that is 0755 because of this host's umask is an
         // accident that will silently be something else on the next host.
         let mode = fs::metadata(directory)
-            .map_err(|error| {
-                Failure::io(
-                    CodeKey::LedgerUnreadable,
-                    &label,
-                    "stat-state-directory",
-                    &error,
-                )
-            })?
+            .at(CodeKey::LedgerUnreadable, &label, "stat-state-directory")?
             .permissions()
             .mode()
             & 0o7777;
@@ -201,22 +189,13 @@ impl LedgerState {
                     // first v2 write so a downgrade always has the exact input the
                     // migration consumed.
                     let rollback = directory.join(LEDGER_ROLLBACK_FILE_NAME);
-                    fs::write(&rollback, &bytes).map_err(|error| {
-                        Failure::io(
-                            CodeKey::LedgerWriteFailed,
-                            rollback.to_string_lossy(),
-                            "write-applied-state-rollback",
-                            &error,
-                        )
-                    })?;
-                    let mut document: RawLedger =
-                        serde_json::from_slice(&bytes).map_err(|error| {
-                            Failure::new(
-                                CodeKey::LedgerInvalid,
-                                path.to_string_lossy(),
-                                format!("cannot decode applied state: {error}"),
-                            )
-                        })?;
+                    fs::write(&rollback, &bytes).at(
+                        CodeKey::LedgerWriteFailed,
+                        rollback.to_string_lossy(),
+                        "write-applied-state-rollback",
+                    )?;
+                    let mut document: RawLedger = serde_json::from_slice(&bytes)
+                        .map_err(|error| cannot_decode(&path, &error))?;
                     migrate_v1(&mut document.schema_version, document.records.values_mut());
                     (validate_records(document, &path)?, true)
                 } else {
@@ -286,110 +265,87 @@ impl LedgerState {
             "{LEDGER_STAGE_PREFIX}.{}.stage",
             std::process::id()
         ));
-        let mut file = fs::OpenOptions::new()
+        let file = fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o644)
             .open(&stage)
-            .map_err(|error| {
-                Failure::io(
-                    CodeKey::LedgerWriteFailed,
-                    &label,
-                    "open-applied-state-stage",
-                    &error,
-                )
-            })?;
-        // openoptions mode is masked by the ambient umask, so the mode above is
-        // a request, not a guarantee. it is set explicitly and asserted, since the
-        // record has to be readable by the unprivileged verifier on every host,
-        // not only on hosts whose umask happens to be 022.
-        if let Err(error) = fs::set_permissions(&stage, fs::Permissions::from_mode(0o644)) {
-            let _ = fs::remove_file(&stage);
-            return Err(Failure::io(
+            .at(
                 CodeKey::LedgerWriteFailed,
                 &label,
-                "chmod-applied-state-stage",
-                &error,
-            ));
-        }
-        match fs::metadata(&stage) {
-            Ok(metadata) => {
-                let mode = metadata.permissions().mode() & 0o7777;
-                if mode != 0o644 {
-                    let _ = fs::remove_file(&stage);
-                    return Err(Failure::new(
-                        CodeKey::LedgerWriteFailed,
-                        &label,
-                        format!("applied state mode is {mode:04o}; expected 0644"),
-                    ));
-                }
-            }
-            Err(error) => {
-                let _ = fs::remove_file(&stage);
-                return Err(Failure::io(
-                    CodeKey::LedgerWriteFailed,
-                    &label,
-                    "stat-applied-state-stage",
-                    &error,
-                ));
-            }
-        }
-        if let Err(error) = file.write_all(&encoded) {
+                "open-applied-state-stage",
+            )?;
+        // from here on the stage file exists, and every way out other than a
+        // completed rename has to take it with it. otherwise the next run
+        // inherits a half-written ledger under a name it has no reason to doubt.
+        let published = self.publish_stage(file, &stage, &encoded, &label);
+        if published.is_err() {
             let _ = fs::remove_file(&stage);
-            return Err(Failure::io(
+        }
+        published
+    }
+
+    fn publish_stage(
+        &self,
+        mut file: fs::File,
+        stage: &Path,
+        encoded: &[u8],
+        label: &str,
+    ) -> Result<()> {
+        // openoptions mode is masked by the ambient umask, so the mode requested
+        // at open is a request, not a guarantee. it is set explicitly and
+        // asserted, since the record has to be readable by the unprivileged
+        // verifier on every host, not only on hosts whose umask happens to be 022.
+        fs::set_permissions(stage, fs::Permissions::from_mode(0o644)).at(
+            CodeKey::LedgerWriteFailed,
+            label,
+            "chmod-applied-state-stage",
+        )?;
+        let mode = fs::metadata(stage)
+            .at(
                 CodeKey::LedgerWriteFailed,
-                &label,
-                "write-applied-state-stage",
-                &error,
+                label,
+                "stat-applied-state-stage",
+            )?
+            .permissions()
+            .mode()
+            & 0o7777;
+        if mode != 0o644 {
+            return Err(Failure::new(
+                CodeKey::LedgerWriteFailed,
+                label,
+                format!("applied state mode is {mode:04o}; expected 0644"),
             ));
         }
+        file.write_all(encoded).at(
+            CodeKey::LedgerWriteFailed,
+            label,
+            "write-applied-state-stage",
+        )?;
         // contents durable before the name is published, so a crash can lose the
         // update but cannot expose a truncated one under the real name.
-        if let Err(error) = file.sync_all() {
-            let _ = fs::remove_file(&stage);
-            return Err(Failure::io(
-                CodeKey::LedgerWriteFailed,
-                &label,
-                "fsync-applied-state-stage",
-                &error,
-            ));
-        }
+        file.sync_all().at(
+            CodeKey::LedgerWriteFailed,
+            label,
+            "fsync-applied-state-stage",
+        )?;
         drop(file);
-        if let Err(error) = fs::rename(&stage, &self.path) {
-            let _ = fs::remove_file(&stage);
-            return Err(Failure::io(
-                CodeKey::LedgerWriteFailed,
-                &label,
-                "rename-applied-state",
-                &error,
-            ));
-        }
+        fs::rename(stage, &self.path).at(
+            CodeKey::LedgerWriteFailed,
+            label,
+            "rename-applied-state",
+        )?;
         let directory = open(
             &self.directory,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
             Mode::empty(),
         )
-        .map_err(|errno| {
-            Failure::syscall(
-                CodeKey::LedgerWriteFailed,
-                &label,
-                "open-state-directory",
-                errno,
-            )
-        })?;
+        .at(CodeKey::LedgerWriteFailed, label, "open-state-directory")?;
         // the bytes were synced; this syncs the name. without it the rename can
         // be lost across a power cut and the ledger reverts to a state that
         // disagrees with the symlink already on disk.
-        fsync(&directory).map_err(|errno| {
-            Failure::syscall(
-                CodeKey::LedgerWriteFailed,
-                &label,
-                "fsync-state-directory",
-                errno,
-            )
-        })?;
-        Ok(())
+        fsync(&directory).at(CodeKey::LedgerWriteFailed, label, "fsync-state-directory")
     }
 }
 
@@ -611,13 +567,8 @@ impl From<UnresolvedRetirement> for RawUnresolvedRetirement {
 }
 
 fn decode_records(bytes: &[u8], path: &Path) -> Result<BTreeMap<String, LedgerRecord>> {
-    let document: RawLedger = serde_json::from_slice(bytes).map_err(|error| {
-        Failure::new(
-            CodeKey::LedgerInvalid,
-            path.to_string_lossy(),
-            format!("cannot decode applied state: {error}"),
-        )
-    })?;
+    let document: RawLedger =
+        serde_json::from_slice(bytes).map_err(|error| cannot_decode(path, &error))?;
     validate_records(document, path)
 }
 

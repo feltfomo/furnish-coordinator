@@ -12,7 +12,9 @@ use symlink::stage_symlink;
 use transition::transition_representation;
 use writable::{hash_source, reconcile_writable_entry, stage_writable};
 
-use crate::diagnostic::{CodeKey, Failure, Result, emit_bootstrap, emit_failure, emit_warning};
+use crate::diagnostic::{
+    CodeKey, Context, Failure, Result, emit_bootstrap, emit_failure, emit_warning,
+};
 use crate::fault::fault_point;
 use crate::filesystem::{
     DestinationObservation, DisplacedCleanup, ParentMode, REGULAR_MODE, SYMLINK_MODE,
@@ -26,8 +28,8 @@ use crate::hash::sha256_hex;
 use crate::identity::RunIdentity;
 use crate::ledger::{
     AppliedOperation, LedgerRecord, LedgerState, PendingIntent, RecordStatus, Representation,
-    TransitionPair, UnresolvedRetirement, baseline_for, carry_applied_state, owned_record,
-    pending_record,
+    TransitionPair, UnresolvedRetirement, baseline_for, owned_record, pending_record,
+    refreshed_record,
 };
 use crate::lock::open_host_lock;
 use crate::manifest::{
@@ -83,14 +85,11 @@ pub(super) fn reconcile_entry(
 
     let expected = OsStr::new(&entry.retained_artifact_target);
 
-    let observed = symlink_target(&open.parent, name).map_err(|errno| {
-        Failure::syscall(
-            CodeKey::ConflictingDestination,
-            destination,
-            "fstatat-destination",
-            errno,
-        )
-    })?;
+    let observed = symlink_target(&open.parent, name).at(
+        CodeKey::ConflictingDestination,
+        destination,
+        "fstatat-destination",
+    )?;
 
     match observed {
         DestinationObservation::Missing => {
@@ -141,17 +140,7 @@ pub(super) fn reconcile_entry(
             // carried forward rather than restated as a decision this run made,
             // and so is everything else the applied state already recorded.
             if let Some(prior) = ledger.record(canonical).cloned() {
-                let mut refreshed = identity.record(
-                    entry,
-                    RecordStatus::Owned {
-                        applied_by: prior
-                            .owned()
-                            .map_or(AppliedOperation::Update, |owned| owned.applied_by),
-                        unresolved_retirement: None,
-                    },
-                );
-                carry_applied_state(&prior, &mut refreshed);
-                ledger.commit(canonical, refreshed)?;
+                ledger.commit(canonical, refreshed_record(identity, entry, &prior))?;
             }
             Ok(())
         }
@@ -197,30 +186,27 @@ pub(super) fn reconcile_entry(
             // since a link into a late-mounting filesystem reads unresolvable at
             // boot and resolvable at switch, and the coordinator runs at both.
             let applied_by = match statat(&open.parent, name, AtFlags::empty()) {
-                // what furnish published is still live.
-                Ok(_) => AppliedOperation::Update,
                 // what furnish published was reaped.
                 Err(Errno::NOENT) => AppliedOperation::Repair,
-                Err(errno) => {
-                    return Err(Failure::syscall(
+                // anything else that stats is still live; anything that fails to
+                // stat for another reason is not a verdict about the target.
+                other => {
+                    other.at(
                         CodeKey::ConflictingDestination,
                         destination,
                         "fstatat-recorded-target",
-                        errno,
-                    ));
+                    )?;
+                    AppliedOperation::Update
                 }
             };
 
             // republishing toward a target that is not there would manufacture
             // the exact breakage being repaired.
-            if let Err(error) = fs::metadata(&entry.retained_artifact_target) {
-                return Err(Failure::io(
-                    CodeKey::UnresolvableDesiredTarget,
-                    destination,
-                    "stat-desired-target",
-                    &error,
-                ));
-            }
+            fs::metadata(&entry.retained_artifact_target).at(
+                CodeKey::UnresolvableDesiredTarget,
+                destination,
+                "stat-desired-target",
+            )?;
 
             let stage = stage_name(index);
             let intended = sha256_hex(entry.retained_artifact_target.as_bytes());

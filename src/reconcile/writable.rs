@@ -1,9 +1,9 @@
 use super::{
-    AppliedOperation, CodeKey, ConflictPolicy, DisplacedCleanup, Entry, Failure, LedgerRecord,
-    LedgerState, OpenDestination, PendingIntent, REGULAR_MODE, ReconcileContext, RecordStatus,
-    Result, RunIdentity, WRITABLE_FILE_MODE, baseline_for, carry_applied_state,
-    cleanup_unpublished_after_failure, fault_point, hash_regular, observe_kind, observe_mode,
-    owned_record, pending_record, profile_for, publish_writable_exchange, publish_writable_new,
+    AppliedOperation, CodeKey, ConflictPolicy, Context, DisplacedCleanup, Entry, Failure,
+    LedgerRecord, LedgerState, OpenDestination, PendingIntent, REGULAR_MODE, ReconcileContext,
+    Result, RunIdentity, WRITABLE_FILE_MODE, baseline_for, cleanup_unpublished_after_failure,
+    fault_point, hash_regular, observe_kind, observe_mode, owned_record, pending_record,
+    profile_for, publish_writable_exchange, publish_writable_new, refreshed_record,
     remove_unpublished_stage, run_executor, sha256_hex, stage_name, verify_writable_destination,
 };
 use std::ffi::OsStr;
@@ -12,14 +12,11 @@ use std::os::fd::OwnedFd;
 use std::path::Path;
 
 pub(super) fn hash_source(source: &str, destination: &str) -> Result<String> {
-    let bytes = fs::read(source).map_err(|error| {
-        Failure::io(
-            CodeKey::UnresolvableDesiredTarget,
-            destination,
-            "read-source-artifact",
-            &error,
-        )
-    })?;
+    let bytes = fs::read(source).at(
+        CodeKey::UnresolvableDesiredTarget,
+        destination,
+        "read-source-artifact",
+    )?;
     Ok(sha256_hex(&bytes))
 }
 
@@ -277,17 +274,7 @@ pub(super) fn reconcile_writable_entry(
                     // row one. nothing to publish, but the record is refreshed
                     // so that when this last reconciled has a live answer here
                     // and not only on the symlink steady-state path.
-                    let mut refreshed = identity.record(
-                        entry,
-                        RecordStatus::Owned {
-                            applied_by: record
-                                .owned()
-                                .map_or(AppliedOperation::Update, |owned| owned.applied_by),
-                            unresolved_retirement: None,
-                        },
-                    );
-                    carry_applied_state(&record, &mut refreshed);
-                    ledger.commit(canonical, refreshed)?;
+                    ledger.commit(canonical, refreshed_record(identity, entry, &record))?;
                     return Ok(());
                 }
                 // row five. the crash window after the destination was
@@ -301,9 +288,7 @@ pub(super) fn reconcile_writable_entry(
                     owned_record(
                         identity,
                         entry,
-                        record
-                            .owned()
-                            .map_or(AppliedOperation::Update, |owned| owned.applied_by),
+                        record.applied_by_or_update(),
                         record.owned(),
                         &intended,
                     ),
@@ -315,17 +300,7 @@ pub(super) fn reconcile_writable_entry(
                 // row two. the source has not changed but the destination has,
                 // so a user edited the file after furnish wrote it. the edit
                 // is preserved and no reload is triggered.
-                let mut refreshed = identity.record(
-                    entry,
-                    RecordStatus::Owned {
-                        applied_by: record
-                            .owned()
-                            .map_or(AppliedOperation::Update, |owned| owned.applied_by),
-                        unresolved_retirement: None,
-                    },
-                );
-                carry_applied_state(&record, &mut refreshed);
-                ledger.commit(canonical, refreshed)?;
+                ledger.commit(canonical, refreshed_record(identity, entry, &record))?;
                 return Ok(());
             }
 
@@ -380,16 +355,7 @@ pub(super) fn reconcile_writable_entry(
                     // settled decision instead of the same conflict again. the
                     // witness moves with it because every writable owned
                     // record in this file keeps the two equal.
-                    let mut refreshed = identity.record(
-                        entry,
-                        RecordStatus::Owned {
-                            applied_by: record
-                                .owned()
-                                .map_or(AppliedOperation::Update, |owned| owned.applied_by),
-                            unresolved_retirement: None,
-                        },
-                    );
-                    carry_applied_state(&record, &mut refreshed);
+                    let mut refreshed = refreshed_record(identity, entry, &record);
                     refreshed.baseline_hash = baseline_for(entry.representation, &intended);
                     refreshed.intended_witness_hash = Some(intended.clone());
                     ledger.commit(canonical, refreshed)?;
