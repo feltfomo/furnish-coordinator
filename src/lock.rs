@@ -63,30 +63,21 @@ mod tests {
     use super::*;
     use crate::diagnostic::serialize_failure;
     use crate::manifest::DiagnosticCodes;
+    use crate::scratch::scratch_directory;
     use rustix::io::Errno;
-    use std::env;
     use std::ffi::OsString;
     use std::fs;
     use std::os::unix::fs::symlink;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
-
-    static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     struct TestLockRoot(PathBuf);
 
     impl TestLockRoot {
         fn new() -> Self {
-            let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let path = env::temp_dir().join(format!(
-                "furnish-lock-test-{}-{sequence}",
-                std::process::id()
-            ));
-            fs::create_dir(&path).expect("create isolated lock directory");
-            Self(path)
+            Self(scratch_directory("lock-test"))
         }
 
         fn open(&self) -> OwnedFd {

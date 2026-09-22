@@ -8,6 +8,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+// the classes the coordinator exits with. a bare number in an assertion
+// stops saying which kind of refusal the test is about.
+const EXIT_REFUSED: i32 = 1;
+
 fn coordinator() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_furnish-coordinator"))
 }
@@ -110,7 +114,7 @@ fn a_lock_name_with_a_separator_is_refused_with_the_bare_name_label() {
     let dir = unique_dir("lock-separator");
     fs::write(dir.join("manifest.json"), manifest_json("[]")).expect("write manifest");
     let output = run_reconcile_with_lock_name(&dir, "a/b.lock");
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(EXIT_REFUSED));
     let diagnostic = stderr_line(&output);
     assert_eq!(diagnostic["code"], "runtime/invalid-manifest");
     assert_eq!(
@@ -128,7 +132,7 @@ fn a_lock_name_that_is_a_symlink_is_refused_without_being_followed() {
     fs::create_dir(&lock).expect("create lock dir");
     std::os::unix::fs::symlink("/elsewhere", lock.join("test.lock")).expect("plant lock symlink");
     let output = run_reconcile(&dir);
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(EXIT_REFUSED));
     let diagnostic = stderr_line(&output);
     assert_eq!(diagnostic["code"], "runtime/invalid-manifest");
     assert_eq!(diagnostic["cause"]["operation"], "openat-lock");
@@ -165,7 +169,7 @@ fn the_default_lock_dir_is_used_when_lock_dir_is_omitted() {
         assert!(lock.is_file());
         fs::remove_file(&lock).ok();
     } else {
-        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(output.status.code(), Some(EXIT_REFUSED));
         let diagnostic = stderr_line(&output);
         let label = diagnostic["primary"]["label"].as_str().unwrap();
         assert!(label == "/run/lock" || label == format!("/run/lock/{name}"));
@@ -191,7 +195,7 @@ fn refuse_with_entry(dir: &Path, entry: String) -> serde_json::Value {
     )
     .expect("write manifest");
     let output = run_reconcile(dir);
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(EXIT_REFUSED));
     stderr_line(&output)
 }
 

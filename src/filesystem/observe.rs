@@ -234,27 +234,14 @@ pub(crate) fn verify_writable_destination(
 #[cfg(test)]
 mod observation_tests {
     use super::{DestinationObservation, symlink_target};
+    use crate::scratch::scratch_directory;
     use rustix::fs::{Mode, OFlags, open};
     use std::ffi::{OsStr, OsString};
     use std::os::unix::fs::symlink;
-    use std::path::PathBuf;
-
-    fn directory() -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "furnish-fs-observation-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&path).unwrap();
-        path
-    }
 
     #[test]
     fn destination_observation_is_exhaustive_without_a_sentinel() {
-        let path = directory();
+        let path = scratch_directory("fs-observation");
         let parent = open(
             &path,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,

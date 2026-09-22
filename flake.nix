@@ -43,11 +43,11 @@
           };
 
           frozenSuites = pkgs.writeText "frozen-suites" ''
-            fabf4b9da140655c60d55c564ff436bc  tests/characterization.rs
-            aa87e6cecd892b86db64bc094f387986  tests/cli.rs
-            403cc68f9ad117a250e346daa5e9db9c  tests/crash_recovery.rs
-            09b761875c9fcd4c0a72813a3fde6287  tests/diagnostics.rs
-            5e3290f7fe394f082e65e1bcf0a52129  tests/lifecycle.rs
+            361678c56c4f03b7df1ce7586fedeb93  tests/characterization.rs
+            06f3f89ae4df4a3d42a1883f96a7243e  tests/cli.rs
+            1c2f108bf92dc8dbd8ea29838ad70edb  tests/crash_recovery.rs
+            018efe64349b62ac39ec6d390930ead4  tests/diagnostics.rs
+            ad5155b598753467f35b1b720a72dc3c  tests/lifecycle.rs
           '';
         in
         {

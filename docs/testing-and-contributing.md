@@ -59,6 +59,7 @@ Module-local tests cover:
 - ledger model transitions and exact serialization;
 - v1 and v2 migration, including nested witnesses, and rollback evidence;
 - stale ledger-stage replacement and exact modes;
+- deferred changes reaching disk only on a flush or a durable commit;
 - destination observation and stage cleanup;
 - transition gating and recovery edge cases;
 - failure payload size and diagnostic null semantics.

@@ -78,26 +78,13 @@ pub(crate) fn remove_verified_displaced<Fd: std::os::fd::AsFd>(
 #[cfg(test)]
 mod cleanup_tests {
     use super::remove_unpublished_stage;
+    use crate::scratch::scratch_directory;
     use rustix::fs::{Mode, OFlags, open};
     use std::ffi::OsStr;
-    use std::path::PathBuf;
-
-    fn directory() -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "furnish-fs-cleanup-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&path).unwrap();
-        path
-    }
 
     #[test]
     fn unpublished_cleanup_accepts_only_absence() {
-        let path = directory();
+        let path = scratch_directory("fs-cleanup");
         let parent = open(
             &path,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,

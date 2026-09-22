@@ -9,6 +9,8 @@ mod ledger;
 mod lock;
 mod manifest;
 mod reconcile;
+#[cfg(test)]
+mod scratch;
 
 use std::ffi::OsString;
 use std::process::ExitCode;

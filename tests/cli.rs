@@ -8,6 +8,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+// the classes the coordinator exits with. a bare number in an assertion
+// stops saying which kind of refusal the test is about.
+const EXIT_REFUSED: i32 = 1;
+const EXIT_USAGE: i32 = 2;
+
 fn coordinator() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_furnish-coordinator"))
 }
@@ -35,8 +40,19 @@ fn os<'a>(args: &'a [&'a str]) -> Vec<&'a OsStr> {
     args.iter().map(OsStr::new).collect()
 }
 
+// an argument list the parser cannot make sense of exits in the usage class,
+// and it stays silent because there is no diagnostic contract to emit under
+// until a manifest has been read.
+fn assert_silent_usage_failure(output: &Output) {
+    assert_eq!(output.status.code(), Some(EXIT_USAGE));
+    assert!(output.stderr.is_empty());
+}
+
+// a worker that parsed its arguments and then failed against the filesystem
+// is a plain refusal. it reports through the coordinator's worker protocol
+// rather than a diagnostic, so it is silent for a different reason.
 fn assert_silent_failure(output: &Output) {
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(EXIT_REFUSED));
     assert!(output.stderr.is_empty());
 }
 
@@ -109,13 +125,13 @@ fn reconcile_requires_all_four_options() {
         ];
         let position = argv.iter().position(|arg| *arg == missing).unwrap();
         argv.drain(position..=position + 1);
-        assert_silent_failure(&run(&os(&argv)));
+        assert_silent_usage_failure(&run(&os(&argv)));
     }
 }
 
 #[test]
 fn an_unknown_subcommand_fails_silently() {
-    assert_silent_failure(&run(&os(&["bogus-subcommand"])));
+    assert_silent_usage_failure(&run(&os(&["bogus-subcommand"])));
 }
 
 #[test]
@@ -125,7 +141,7 @@ fn reconcile_ignores_unknown_flags_but_workers_refuse_them() {
     let output = run_reconcile(&dir, &["--bogus", "q"]);
     assert_eq!(output.status.code(), Some(0));
     // the same stray flag is a hard failure inside a worker parse loop.
-    assert_silent_failure(&run(&os(&["stage-native-symlink", "--bogus", "q"])));
+    assert_silent_usage_failure(&run(&os(&["stage-native-symlink", "--bogus", "q"])));
 }
 
 #[test]
@@ -194,7 +210,7 @@ fn the_symlink_worker_requires_its_three_arguments() {
             "stage",
         ],
     ] {
-        assert_silent_failure(&run(&os(&argv)));
+        assert_silent_usage_failure(&run(&os(&argv)));
     }
 }
 

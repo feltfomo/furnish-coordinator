@@ -85,6 +85,35 @@ pub(crate) enum CodeKey {
     PendingRecovery,
 }
 
+// a refusal that an activation script can branch on without parsing the
+// diagnostic. the classes are what an operator would do differently, not one
+// code per key, because a code per key would make every new key a contract
+// change for anything that reads the status.
+pub(crate) const EXIT_REFUSED: u8 = 1;
+pub(crate) const EXIT_USAGE: u8 = 2;
+pub(crate) const EXIT_LEDGER: u8 = 3;
+pub(crate) const EXIT_CONFLICT: u8 = 4;
+pub(crate) const EXIT_INTERRUPTED: u8 = 5;
+
+impl CodeKey {
+    pub(crate) fn exit_code(self) -> u8 {
+        match self {
+            // the ledger cannot be trusted, so nothing here is about the
+            // declaration and rerunning unchanged will not help.
+            Self::LedgerUnreadable | Self::LedgerInvalid | Self::LedgerWriteFailed => EXIT_LEDGER,
+            // something is at the destination that furnish does not own, or
+            // both sides moved off the baseline. a human decides.
+            Self::ConflictingDestination | Self::UnresolvedRetirement => EXIT_CONFLICT,
+            // a previous run died mid-transaction and recovery could not
+            // finish it, so the destination is between two known states.
+            Self::PendingRecovery => EXIT_INTERRUPTED,
+            // everything else is the coordinator declining to act on the
+            // declaration or the filesystem condition it found.
+            _ => EXIT_REFUSED,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct Failure {
     pub(crate) key: CodeKey,

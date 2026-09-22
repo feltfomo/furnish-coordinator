@@ -11,6 +11,10 @@ use rustix::fs::{RenameFlags, fsync, renameat_with};
 use std::ffi::OsStr;
 use std::os::fd::OwnedFd;
 
+// a bare exchange, for the recovery paths that are putting things back. the
+// stage holds the bytes being restored there, so unlinking it on failure would
+// destroy the very thing the restore exists to preserve. publication uses
+// rename_or_clean instead.
 pub(crate) fn exchange_names(
     parent: &OwnedFd,
     name: &OsStr,
@@ -26,6 +30,56 @@ pub(crate) fn exchange_names(
     )
 }
 
+// the rename is the publication, and a rename that fails on the way in always
+// leaves a stage nothing else will come back for, so every publishing route
+// shares both the attempt and the cleanup instead of each one remembering to
+// unlink. the code key is the caller's, because the same failed rename means
+// "lost a race" on the apply paths and "refused the transfer" on the
+// representation change.
+pub(crate) fn rename_or_clean(
+    parent: &OwnedFd,
+    name: &OsStr,
+    stage: &OsStr,
+    destination: &str,
+    flags: RenameFlags,
+    key: CodeKey,
+    operation: &'static str,
+) -> Result<()> {
+    renameat_with(parent, stage, parent, name, flags).map_err(|errno| {
+        cleanup_unpublished_after_failure(
+            parent,
+            stage,
+            destination,
+            Failure::syscall(key, destination, operation, errno),
+        )
+    })
+}
+
+// a name that is occupied when the pre-publication check runs is something
+// outside furnish arriving mid-flight, not a destination to replace.
+fn refuse_occupied_name(parent: &OwnedFd, stage: &OsStr, destination: &str) -> Failure {
+    cleanup_unpublished_after_failure(
+        parent,
+        stage,
+        destination,
+        Failure::new(
+            CodeKey::PublishRace,
+            destination,
+            "destination appeared before atomic publish; refusing replacement",
+        ),
+    )
+}
+
+// the rename returning is not the end of publication; the parent directory
+// entry reaching disk is. the two fault points stay either side of the sync so
+// a crash test can still land in the window between them.
+fn commit_to_disk(parent: &OwnedFd, destination: &str) -> Result<()> {
+    fault_point("published");
+    sync_parent(parent, destination)?;
+    fault_point("published-synced");
+    Ok(())
+}
+
 pub(crate) fn publish_new(
     parent: &OwnedFd,
     name: &OsStr,
@@ -37,35 +91,18 @@ pub(crate) fn publish_new(
         .at(CodeKey::PublishRace, destination, "fstatat-before-publish")?
         .exists()
     {
-        return Err(cleanup_unpublished_after_failure(
-            parent,
-            stage,
-            destination,
-            Failure::new(
-                CodeKey::PublishRace,
-                destination,
-                "destination appeared before atomic publish; refusing replacement",
-            ),
-        ));
+        return Err(refuse_occupied_name(parent, stage, destination));
     }
-
-    if let Err(errno) = renameat_with(parent, stage, parent, name, RenameFlags::NOREPLACE) {
-        return Err(cleanup_unpublished_after_failure(
-            parent,
-            stage,
-            destination,
-            Failure::syscall(
-                CodeKey::PublishRace,
-                destination,
-                "renameat2-noreplace-publish",
-                errno,
-            ),
-        ));
-    }
-
-    fault_point("published");
-    sync_parent(parent, destination)?;
-    fault_point("published-synced");
+    rename_or_clean(
+        parent,
+        name,
+        stage,
+        destination,
+        RenameFlags::NOREPLACE,
+        CodeKey::PublishRace,
+        "renameat2-noreplace-publish",
+    )?;
+    commit_to_disk(parent, destination)?;
 
     let final_target = symlink_target(parent, name).at(
         CodeKey::FinalVerification,
@@ -90,19 +127,15 @@ pub(crate) fn publish_exchange(
     expected: &OsStr,
     recorded: &OsStr,
 ) -> Result<()> {
-    if let Err(errno) = renameat_with(parent, stage, parent, name, RenameFlags::EXCHANGE) {
-        return Err(cleanup_unpublished_after_failure(
-            parent,
-            stage,
-            destination,
-            Failure::syscall(
-                CodeKey::PublishRace,
-                destination,
-                "renameat2-exchange-publish",
-                errno,
-            ),
-        ));
-    }
+    rename_or_clean(
+        parent,
+        name,
+        stage,
+        destination,
+        RenameFlags::EXCHANGE,
+        CodeKey::PublishRace,
+        "renameat2-exchange-publish",
+    )?;
     fault_point("exchange-published");
 
     let published = symlink_target(parent, name).at(
@@ -124,10 +157,7 @@ pub(crate) fn publish_exchange(
     }
 
     remove_verified_displaced(parent, stage, destination)?;
-    fault_point("published");
-    sync_parent(parent, destination)?;
-    fault_point("published-synced");
-    Ok(())
+    commit_to_disk(parent, destination)
 }
 
 pub(crate) fn sync_parent(parent: &OwnedFd, destination: &str) -> Result<()> {
@@ -176,33 +206,18 @@ pub(crate) fn publish_writable_new(
 ) -> Result<()> {
     fault_point("stage-synced");
     if observe_kind(parent, name, destination)?.is_some() {
-        return Err(cleanup_unpublished_after_failure(
-            parent,
-            stage,
-            destination,
-            Failure::new(
-                CodeKey::PublishRace,
-                destination,
-                "destination appeared before atomic publish; refusing replacement",
-            ),
-        ));
+        return Err(refuse_occupied_name(parent, stage, destination));
     }
-    if let Err(errno) = renameat_with(parent, stage, parent, name, RenameFlags::NOREPLACE) {
-        return Err(cleanup_unpublished_after_failure(
-            parent,
-            stage,
-            destination,
-            Failure::syscall(
-                CodeKey::PublishRace,
-                destination,
-                "renameat2-noreplace-publish",
-                errno,
-            ),
-        ));
-    }
-    fault_point("published");
-    sync_parent(parent, destination)?;
-    fault_point("published-synced");
+    rename_or_clean(
+        parent,
+        name,
+        stage,
+        destination,
+        RenameFlags::NOREPLACE,
+        CodeKey::PublishRace,
+        "renameat2-noreplace-publish",
+    )?;
+    commit_to_disk(parent, destination)?;
     verify_writable_destination(parent, name, destination, intended_hash)?;
     fault_point("verified");
     Ok(())
@@ -218,19 +233,15 @@ pub(crate) fn publish_writable_exchange(
     cleanup: DisplacedCleanup,
 ) -> Result<()> {
     fault_point("stage-synced");
-    if let Err(errno) = renameat_with(parent, stage, parent, name, RenameFlags::EXCHANGE) {
-        return Err(cleanup_unpublished_after_failure(
-            parent,
-            stage,
-            destination,
-            Failure::syscall(
-                CodeKey::PublishRace,
-                destination,
-                "renameat2-exchange-publish",
-                errno,
-            ),
-        ));
-    }
+    rename_or_clean(
+        parent,
+        name,
+        stage,
+        destination,
+        RenameFlags::EXCHANGE,
+        CodeKey::PublishRace,
+        "renameat2-exchange-publish",
+    )?;
     fault_point("exchange-published");
     // the displaced hash must equal the pre-publication witness.
     let displaced_hash = hash_regular(
@@ -266,9 +277,7 @@ pub(crate) fn publish_writable_exchange(
             discard_displaced_under_policy(parent, stage, destination)?;
         }
     }
-    fault_point("published");
-    sync_parent(parent, destination)?;
-    fault_point("published-synced");
+    commit_to_disk(parent, destination)?;
     verify_writable_destination(parent, name, destination, intended_hash)?;
     fault_point("verified");
     Ok(())

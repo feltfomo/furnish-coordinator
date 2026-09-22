@@ -85,12 +85,16 @@ The Rust code selects the semantic key; the Nix manifest controls the externally
 | Successful settled run | `0` | Empty |
 | Successful apply or repair | `0` | Empty |
 | Unresolved edited-file retirement | `0` | Warning JSON |
-| Invalid CLI grammar | `1` | Empty |
-| Manifest bootstrap failure | `1` | Bootstrap JSON |
 | Validation or runtime refusal | `1` | Runtime JSON |
 | Worker failure when invoked internally | `1` | Bounded evidence consumed by parent |
+| Invalid CLI grammar | `2` | Empty |
+| Manifest bootstrap failure | `2` | Bootstrap JSON |
+| `ledger-*` refusal | `3` | Runtime JSON |
+| `conflicting-destination` refusal | `4` | Runtime JSON |
+| `status` or `--dry-run` finding drift | `4` | Empty, report on stdout |
+| `pending-recovery` refusal | `5` | Runtime JSON |
 
-Every intentional process result is success or failure; there are no specialized exit codes.
+The classes are what an operator would do differently, not one code per diagnostic key: a code per key would make every new key a contract change for anything that reads the status. An activation script can branch on the class without parsing the diagnostic. [`reference.md`](reference.md) has the full key-to-class mapping.
 
 ## Reading common failures
 
@@ -120,7 +124,7 @@ The ledger records an interrupted transaction whose forward or prior state canno
 
 ### `unresolved-retirement`
 
-This is a nonfatal warning. The declaration disappeared, but an edited writable file was preserved. The ledger retains ownership and the observed hash so the orphan remains explained.
+This is a nonfatal warning. The declaration disappeared, but an edited writable file was preserved. The ledger retains ownership and the observed hash so the orphan remains explained. Redeclaring the destination clears it; so do the `release` and `discard` verbs, which are the only way to say the other thing.
 
 ### `ledger-invalid`
 

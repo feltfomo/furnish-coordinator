@@ -9,6 +9,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+// the classes the coordinator exits with. a bare number in an assertion
+// stops saying which kind of refusal the test is about.
+const EXIT_REFUSED: i32 = 1;
+const EXIT_CONFLICT: i32 = 4;
+
 fn coordinator() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_furnish-coordinator"))
 }
@@ -184,6 +189,39 @@ fn run_reconcile(dir: &Path) -> Output {
         ]))
         .output()
         .expect("run coordinator")
+}
+
+// the read-only and resolution verbs take the same manifest, lock, and state
+// directory the apply path takes, so one helper drives all of them.
+fn run_verb(dir: &Path, verb: &str, extra: &[&str]) -> Output {
+    let lock = dir.join("lock");
+    fs::create_dir_all(&lock).expect("create lock dir");
+    let manifest = dir.join("manifest.json");
+    let state = dir.join("state");
+    let mut args = vec![
+        verb,
+        "--manifest",
+        manifest.to_str().unwrap(),
+        "--lock-name",
+        "test.lock",
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--lock-dir",
+        lock.to_str().unwrap(),
+    ];
+    args.extend_from_slice(extra);
+    Command::new(coordinator())
+        .args(os(&args))
+        .output()
+        .expect("run coordinator")
+}
+
+fn report_lines(output: &Output) -> Vec<String> {
+    String::from_utf8(output.stdout.clone())
+        .expect("stdout utf8")
+        .lines()
+        .map(str::to_owned)
+        .collect()
 }
 
 fn read_ledger(dir: &Path) -> serde_json::Value {
@@ -477,7 +515,7 @@ fn the_error_policy_refuses_a_two_sided_divergence_and_commits_nothing() {
     );
     let before = fs::read_to_string(dir.join("state").join("applied-state.json")).unwrap();
     let output = run_reconcile(&dir);
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(EXIT_CONFLICT));
     let diagnostic = stderr_line(&output);
     assert_eq!(diagnostic["code"], "runtime/conflicting-destination");
     assert_eq!(fs::read(&destination).unwrap(), b"edited\n");
@@ -547,7 +585,7 @@ fn a_destination_equal_to_the_source_without_a_record_is_refused() {
     )
     .expect("write manifest");
     let output = run_reconcile(&dir);
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(EXIT_CONFLICT));
     let diagnostic = stderr_line(&output);
     assert_eq!(diagnostic["code"], "runtime/conflicting-destination");
     assert_eq!(
@@ -636,7 +674,7 @@ fn a_writable_destination_without_a_recorded_baseline_is_refused_under_every_pol
         ),
     );
     let output = run_reconcile(&dir);
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(EXIT_CONFLICT));
     let diagnostic = stderr_line(&output);
     assert_eq!(diagnostic["code"], "runtime/conflicting-destination");
     assert_eq!(
@@ -680,7 +718,7 @@ fn a_destination_that_is_not_a_regular_file_is_refused() {
         ),
     );
     let output = run_reconcile(&dir);
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(EXIT_CONFLICT));
     let diagnostic = stderr_line(&output);
     assert_eq!(diagnostic["code"], "runtime/conflicting-destination");
     assert_eq!(
@@ -881,7 +919,7 @@ fn retirement_refuses_a_destination_that_stopped_matching_its_record() {
         ),
     );
     let output = run_reconcile(&dir);
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(EXIT_CONFLICT));
     let diagnostic = stderr_line(&output);
     assert_eq!(diagnostic["code"], "runtime/conflicting-destination");
     assert_eq!(
@@ -984,7 +1022,7 @@ fn a_failing_entry_means_the_retirement_sweep_never_runs() {
         ),
     );
     let output = run_reconcile(&dir);
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(EXIT_CONFLICT));
     assert_eq!(fs::read_link(&undeclared).unwrap(), target);
     let record = record_at(&dir, &undeclared);
     assert_eq!(record["state"], "owned");
@@ -1084,7 +1122,7 @@ fn a_transfer_from_symlink_to_writable_requires_the_recorded_link() {
         ),
     );
     let output = run_reconcile(&dir);
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(EXIT_REFUSED));
     let diagnostic = stderr_line(&output);
     assert_eq!(diagnostic["code"], "runtime/transition-refused");
     assert_eq!(
@@ -1172,7 +1210,7 @@ fn a_transfer_from_writable_to_symlink_refuses_an_edited_destination() {
         ),
     );
     let output = run_reconcile(&dir);
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(EXIT_REFUSED));
     let diagnostic = stderr_line(&output);
     assert_eq!(diagnostic["code"], "runtime/transition-refused");
     assert_eq!(
@@ -1184,4 +1222,261 @@ fn a_transfer_from_writable_to_symlink_refuses_an_edited_destination() {
     assert_eq!(record["representation"], "writable");
     assert_eq!(record["baselineHash"], OLD_PAYLOAD_HASH);
     assert_eq!(stage_files_in(&dir), 0);
+}
+
+#[test]
+fn a_settled_host_reports_nothing_to_do_and_a_drifted_one_reports_the_verb() {
+    let dir = unique_dir("status-settled");
+    let target = dir.join("target");
+    fs::write(&target, b"live").expect("create link target");
+    let destination = dir.join("value");
+    fs::write(
+        dir.join("manifest.json"),
+        manifest_json(&format!("[{}]", symlink_entry_json(&dir, "value", &target))),
+    )
+    .expect("write manifest");
+    fs::create_dir_all(dir.join("state")).expect("create state dir");
+
+    // nothing is planted, so the name is free and no record claims it.
+    let drifted = run_verb(&dir, "status", &[]);
+    assert_eq!(drifted.status.code(), Some(EXIT_CONFLICT));
+    assert_eq!(
+        report_lines(&drifted),
+        vec![format!("publish\t{}", destination.to_str().unwrap())]
+    );
+    // reading is not deciding: the report left the destination alone.
+    assert!(fs::symlink_metadata(&destination).is_err());
+    assert!(!dir.join("state").join("applied-state.json").exists());
+
+    std::os::unix::fs::symlink(&target, &destination).expect("plant destination link");
+    plant_ledger(
+        &dir,
+        &format!("test:{}", destination.to_str().unwrap()),
+        &record_json(
+            &destination,
+            &target,
+            &dir,
+            "new",
+            "owned",
+            "symlink",
+            None,
+            None,
+            3,
+            None,
+        ),
+    );
+    let settled = run_verb(&dir, "status", &[]);
+    assert_eq!(settled.status.code(), Some(0));
+    assert_eq!(
+        report_lines(&settled),
+        vec![format!("settled\t{}", destination.to_str().unwrap())]
+    );
+}
+
+#[test]
+fn a_status_report_never_creates_the_parent_a_run_would_make() {
+    // the apply path walks with creation enabled, so a missing directory is
+    // not drift it reports but work it does. the report has to reach the same
+    // verdict without leaving the directory behind.
+    let dir = unique_dir("status-parent");
+    let target = dir.join("target");
+    fs::write(&target, b"live").expect("create link target");
+    let nested = dir.join("nested");
+    fs::write(
+        dir.join("manifest.json"),
+        manifest_json(&format!(
+            "[{}]",
+            symlink_entry_json(&dir, "nested/value", &target)
+        )),
+    )
+    .expect("write manifest");
+    fs::create_dir_all(dir.join("state")).expect("create state dir");
+    let output = run_verb(&dir, "status", &[]);
+    assert_eq!(output.status.code(), Some(EXIT_CONFLICT));
+    assert_eq!(
+        report_lines(&output),
+        vec![format!(
+            "publish\t{}",
+            nested.join("value").to_str().unwrap()
+        )]
+    );
+    assert!(!nested.exists());
+}
+
+#[test]
+fn a_dry_run_reports_the_replacement_it_would_make_and_writes_nothing() {
+    let dir = unique_dir("dry-run");
+    let source = dir.join("source");
+    fs::write(&source, "new payload\n").expect("write source");
+    let destination = dir.join("value");
+    fs::write(&destination, "payload\n").expect("plant destination");
+    set_mode(&destination, 0o644);
+    fs::write(
+        dir.join("manifest.json"),
+        manifest_json(&format!(
+            "[{}]",
+            writable_entry_json(&dir, "value", &source, "error")
+        )),
+    )
+    .expect("write manifest");
+    plant_ledger(
+        &dir,
+        &format!("test:{}", destination.to_str().unwrap()),
+        &record_json(
+            &destination,
+            &source,
+            &dir,
+            "new",
+            "owned",
+            "writable",
+            Some(PAYLOAD_HASH),
+            Some(PAYLOAD_HASH),
+            4,
+            None,
+        ),
+    );
+    let planted = fs::read_to_string(dir.join("state").join("applied-state.json"))
+        .expect("read planted ledger");
+    let output = run_verb(
+        &dir,
+        "reconcile",
+        &["--setpriv", "/nonexistent/setpriv", "--dry-run"],
+    );
+    assert_eq!(output.status.code(), Some(EXIT_CONFLICT));
+    assert_eq!(
+        report_lines(&output),
+        vec![format!("replace\t{}", destination.to_str().unwrap())]
+    );
+    assert_eq!(fs::read(&destination).unwrap(), b"payload\n");
+    assert_eq!(
+        fs::read_to_string(dir.join("state").join("applied-state.json")).unwrap(),
+        planted
+    );
+}
+
+// the marked record the resolution verbs act on is produced rather than
+// planted, because the marker is the authorization and a planted one would
+// prove nothing about the path that writes it.
+fn block_a_retirement(name: &str) -> (PathBuf, PathBuf) {
+    let dir = unique_dir(name);
+    let source = dir.join("source");
+    let destination = dir.join("value");
+    fs::write(&destination, "the user edited this\n").expect("plant edited destination");
+    set_mode(&destination, 0o644);
+    fs::write(dir.join("manifest.json"), manifest_json("[]")).expect("write manifest");
+    plant_ledger(
+        &dir,
+        &format!("test:{}", destination.to_str().unwrap()),
+        &record_json(
+            &destination,
+            &source,
+            &dir,
+            "new",
+            "owned",
+            "writable",
+            Some(PAYLOAD_HASH),
+            Some(PAYLOAD_HASH),
+            0,
+            None,
+        ),
+    );
+    assert_eq!(run_reconcile(&dir).status.code(), Some(0));
+    assert_eq!(
+        record_at(&dir, &destination)["unresolvedRetirement"]["observedHash"],
+        USER_EDIT_HASH
+    );
+    (dir, destination)
+}
+
+#[test]
+fn release_drops_the_ownership_record_and_leaves_the_file() {
+    let (dir, destination) = block_a_retirement("release");
+    let output = run_verb(
+        &dir,
+        "release",
+        &["--destination", destination.to_str().unwrap()],
+    );
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    assert_eq!(fs::read(&destination).unwrap(), b"the user edited this\n");
+    assert!(record_at(&dir, &destination).is_null());
+    // the destination is foreign now, so a later status of a manifest that
+    // declares it again would refuse rather than adopt it.
+    let repeated = run_verb(
+        &dir,
+        "release",
+        &["--destination", destination.to_str().unwrap()],
+    );
+    assert_eq!(repeated.status.code(), Some(EXIT_CONFLICT));
+}
+
+#[test]
+fn discard_refuses_content_that_changed_after_the_retirement_was_blocked() {
+    let (dir, destination) = block_a_retirement("discard-moved");
+    fs::write(&destination, "edited again\n").expect("edit past the marker");
+    let refused = run_verb(
+        &dir,
+        "discard",
+        &["--destination", destination.to_str().unwrap()],
+    );
+    assert_eq!(refused.status.code(), Some(EXIT_REFUSED));
+    assert_eq!(
+        stderr_line(&refused)["code"],
+        "runtime/content-verification"
+    );
+    assert!(destination.exists());
+    assert!(!record_at(&dir, &destination).is_null());
+
+    fs::write(&destination, "the user edited this\n").expect("restore the reported content");
+    let discarded = run_verb(
+        &dir,
+        "discard",
+        &["--destination", destination.to_str().unwrap()],
+    );
+    assert_eq!(discarded.status.code(), Some(0));
+    assert!(!destination.exists());
+    assert!(record_at(&dir, &destination).is_null());
+}
+
+#[test]
+fn the_resolution_verbs_refuse_a_destination_the_manifest_still_declares() {
+    let dir = unique_dir("resolve-declared");
+    let target = dir.join("target");
+    fs::write(&target, b"live").expect("create link target");
+    let destination = dir.join("value");
+    std::os::unix::fs::symlink(&target, &destination).expect("plant destination link");
+    fs::write(
+        dir.join("manifest.json"),
+        manifest_json(&format!("[{}]", symlink_entry_json(&dir, "value", &target))),
+    )
+    .expect("write manifest");
+    plant_ledger(
+        &dir,
+        &format!("test:{}", destination.to_str().unwrap()),
+        &record_json(
+            &destination,
+            &target,
+            &dir,
+            "new",
+            "owned",
+            "symlink",
+            None,
+            None,
+            3,
+            None,
+        ),
+    );
+    for verb in ["release", "discard"] {
+        let output = run_verb(
+            &dir,
+            verb,
+            &["--destination", destination.to_str().unwrap()],
+        );
+        assert_eq!(output.status.code(), Some(EXIT_CONFLICT));
+        assert_eq!(
+            stderr_line(&output)["code"],
+            "runtime/conflicting-destination"
+        );
+        assert!(fs::symlink_metadata(&destination).is_ok());
+    }
 }

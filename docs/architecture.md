@@ -22,14 +22,18 @@ The coordinator does not discover declarations, choose executors dynamically, or
 
 `main.rs` removes `argv[0]` and delegates to `furnish_coordinator::run`. `lib.rs` exposes only that process entry and keeps implementation modules private.
 
-`cli.rs` selects one of four effective command paths:
+`cli.rs` selects one of seven effective command paths:
 
-- `reconcile` — the host-level orchestration command;
+- `reconcile` — the host-level orchestration command, or a read-only report under `--dry-run`;
+- `status` — the same report without `--setpriv`, which it has no use for;
+- `release` and `discard` — the two exits from an unresolved retirement;
 - `stage-native-symlink` — create one staged symlink;
 - `stage-native-writable` — create and sync one staged regular file;
 - `create-native-directory` — create one parent component.
 
 The worker commands are internal execution doors, not user APIs. They operate on an inherited parent descriptor and a single normal path component.
+
+The four host-level verbs open the same session: read and validate the manifest, take the host lock, then load the ledger under it. A read-only verb holding the same lock is what keeps a report from being a torn read of a ledger a concurrent run is rewriting.
 
 ## Top-level reconciliation order
 
@@ -67,6 +71,16 @@ Each entry is reconciled through a shared skeleton:
 
 A pending recovery may first restore or promote old intent and then allow ordinary reconciliation to advance to the current declaration. Recovery and current reconciliation are intentionally separate decisions.
 
+Steps 5 through 10 are one bracket, written once in `reconcile::publication`. Each route supplies only the staging and publication in the middle; the pending commit, the two fault points around it, and the owned commit are not restated per route.
+
+## Durable and deferred ledger changes
+
+A change that a filesystem mutation is about to depend on is durable before it returns. The pending record in the publication bracket is the reason the distinction exists: without it on disk, a crash mid-publication leaves an object no later run can explain.
+
+A change that only records an observation is deferred and flushed once on the way out of the run. These are the paths that publish nothing — a destination already equal to its source, a preserved runtime edit, a runtime-wins decision, an unresolved-retirement marker, and the removal of a record whose destination is already gone. The whole document is rewritten and fsynced on every durable change, so a host whose entries are all settled used to rewrite an N-record document N times.
+
+The flush runs on every exit from a run, including a refused one, so deferring decides when a change becomes durable and never whether it does. Only a crash can lose one, and what is lost is an observation the next run re-derives from the same destination.
+
 ## Module boundaries
 
 ### `manifest`
@@ -81,21 +95,27 @@ Validates a one-component lock name, opens the lock directory without following 
 
 Provides refusing or creating parent walks, destination observation, exact hashing, stage cleanup, atomic publication, exchange rollback, directory synchronization, and final verification.
 
+Two renames are deliberately distinct. Publication uses the one that removes the stage when the rename fails, since a stage left at a refused publication is an orphan nothing returns for. Recovery uses the bare one, because there the stage holds the bytes being restored and unlinking it would destroy what the restore exists to preserve.
+
 ### `executor` and `cli`
 
 Launch reduced-privilege workers, transport bounded errno evidence, parse worker arguments strictly, and implement the three narrow worker operations.
 
 ### `ledger`
 
-Owns the in-memory record model, JSON decoding and validation, v1 migration, atomic persistence, transaction constructors, and exact prior-owned snapshots.
+Owns the in-memory record model, JSON decoding and validation, the v1 and v2 migrations, atomic persistence, the durable-or-deferred write distinction, transaction constructors, and exact prior-owned snapshots.
 
 ### `reconcile`
 
 Contains the state machine: symlink handling, writable hash decisions, representation transitions, pending recovery, and retirement.
 
+Two of those decisions are extracted as pure functions of what was observed. `symlink_action` takes the destination observation, the desired target, and the record; `writable_action` takes the three hash equalities and the declared policy. The apply path acts on the answer and the read-only report prints it, which is what makes a dry run unable to describe a decision a real run would not make. Reads are duplicated between the two paths, because reads are not decisions; the decisions are not.
+
+The report walks parents in refusing mode, so describing a run never leaves a directory behind, and it never calls recovery, because recovery writes. A pending record is reported as pending rather than resolved.
+
 ### `diagnostic`
 
-Maps internal failure keys through the manifest’s diagnostic registry and emits one-line JSON envelopes with optional provenance, syscall cause, and observed hashes.
+Maps internal failure keys through the manifest’s diagnostic registry and emits one-line JSON envelopes with optional provenance, syscall cause, and observed hashes. It also maps each key to a refusal class an activation script can branch on without parsing the envelope. The classes are what an operator would do differently, so a new key joins an existing class rather than adding a code.
 
 ### `identity`
 

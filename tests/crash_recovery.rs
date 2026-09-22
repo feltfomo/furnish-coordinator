@@ -11,6 +11,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+// the classes the coordinator exits with. a bare number in an assertion
+// stops saying which kind of refusal the test is about.
+const EXIT_INTERRUPTED: i32 = 5;
+
 fn coordinator() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_furnish-coordinator"))
 }
@@ -327,7 +331,7 @@ fn a_death_after_the_exchange_with_edited_displaced_bytes_restores_and_refuses()
         .expect("a displaced stage survived the crash");
     fs::write(dir.join(&stage), "the user edited this\n").expect("edit the displaced bytes");
     let recovered = run_reconcile(&dir, None);
-    assert_eq!(recovered.status.code(), Some(1));
+    assert_eq!(recovered.status.code(), Some(EXIT_INTERRUPTED));
     let diagnostic = stderr_line(&recovered);
     assert_eq!(diagnostic["code"], "runtime/pending-recovery");
     assert_eq!(fs::read(&destination).unwrap(), b"the user edited this\n");

@@ -8,6 +8,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+// the classes the coordinator exits with. a bare number in an assertion
+// stops saying which kind of refusal the test is about.
+const EXIT_REFUSED: i32 = 1;
+const EXIT_USAGE: i32 = 2;
+const EXIT_CONFLICT: i32 = 4;
+
 fn coordinator() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_furnish-coordinator"))
 }
@@ -104,7 +110,7 @@ fn stderr_line(output: &Output) -> serde_json::Value {
 fn an_unreadable_manifest_produces_the_bootstrap_shape_and_no_lock() {
     let dir = unique_dir("unreadable");
     let output = run_reconcile(&dir);
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(EXIT_USAGE));
     let diagnostic = stderr_line(&output);
     let object = diagnostic.as_object().unwrap();
     let mut keys: Vec<&String> = object.keys().collect();
@@ -138,7 +144,7 @@ fn an_undecodable_manifest_produces_the_bootstrap_shape_and_no_lock() {
     let dir = unique_dir("undecodable");
     fs::write(dir.join("manifest.json"), "not json").expect("write manifest");
     let output = run_reconcile(&dir);
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(EXIT_USAGE));
     let diagnostic = stderr_line(&output);
     assert_eq!(diagnostic["code"], "furnish/runtime-bootstrap");
     assert!(
@@ -156,7 +162,7 @@ fn a_manifest_missing_a_code_fails_to_decode() {
     let manifest = "{\"schemaVersion\":2,\"diagnosticContract\":{\"schemaVersion\":1,\"codes\":{\"invalidManifest\":\"x\"}},\"entries\":[]}";
     fs::write(dir.join("manifest.json"), manifest).expect("write manifest");
     let output = run_reconcile(&dir);
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(EXIT_USAGE));
     let diagnostic = stderr_line(&output);
     assert_eq!(diagnostic["code"], "furnish/runtime-bootstrap");
 }
@@ -167,7 +173,7 @@ fn an_unsupported_manifest_schema_is_refused_with_the_manifest_label() {
     let manifest = manifest_json("[]").replace("\"schemaVersion\":2", "\"schemaVersion\":99");
     fs::write(dir.join("manifest.json"), manifest).expect("write manifest");
     let output = run_reconcile(&dir);
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(EXIT_REFUSED));
     let diagnostic = stderr_line(&output);
     assert_eq!(diagnostic["code"], "runtime/invalid-manifest");
     assert_eq!(
@@ -184,7 +190,7 @@ fn refuse(dir: &Path, manifest: String) -> serde_json::Value {
     // no lock file behind either.
     fs::write(dir.join("manifest.json"), manifest).expect("write manifest");
     let output = run_reconcile(dir);
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(EXIT_REFUSED));
     assert!(!dir.join("lock").join("test.lock").exists());
     stderr_line(&output)
 }
@@ -346,7 +352,7 @@ fn a_conflict_diagnostic_carries_the_full_runtime_shape() {
     );
     fs::write(state.join("applied-state.json"), &ledger).expect("plant ledger");
     let output = run_reconcile(&dir);
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(EXIT_CONFLICT));
     let diagnostic = stderr_line(&output);
     assert_eq!(diagnostic["schemaVersion"], 1);
     assert_eq!(diagnostic["severity"], "error");

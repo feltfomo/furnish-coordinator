@@ -1,10 +1,11 @@
 use super::{
     AppliedOperation, CodeKey, Context, Entry, Failure, LedgerRecord, LedgerState, OpenDestination,
-    PendingIntent, Result, RunIdentity, TransitionPair, WRITABLE_REPRESENTATION,
-    cleanup_unpublished_after_failure, exchange_names, fault_point, hash_regular, hash_source,
-    owned_record, pending_record, remove_unpublished_stage, stage_name, stage_symlink,
-    stage_writable, symlink_target, sync_parent, verify_writable_destination, witness,
+    PendingIntent, Publication, Result, RunIdentity, TransitionPair, WRITABLE_REPRESENTATION,
+    fault_point, hash_regular, hash_source, remove_unpublished_stage, rename_or_clean, stage_name,
+    stage_symlink, stage_writable, symlink_target, sync_parent, verify_writable_destination,
+    witness,
 };
+use rustix::fs::RenameFlags;
 use std::ffi::OsStr;
 use std::path::Path;
 
@@ -21,7 +22,6 @@ pub(super) fn transition_representation(
 ) -> Result<()> {
     let parent = &open.parent;
     let name = open.name.as_os_str();
-    let canonical = &entry.filesystem_identity.canonical;
     let destination = &entry.filesystem_identity.destination;
     let from = record.representation;
     let to = entry.representation;
@@ -46,51 +46,34 @@ pub(super) fn transition_representation(
             ));
         }
         let intended = hash_source(&entry.retained_artifact_target, destination)?;
-        fault_point("pre-pending");
-        let mut pending = pending_record(
-            identity,
+        return Publication {
             entry,
-            PendingIntent::Transition(pair),
-            record.owned(),
-            &stage,
-            &intended,
-        );
-        pending.applied_artifact_target = record.applied_artifact_target.clone();
-        ledger.commit(canonical, pending)?;
-        fault_point("pending-committed");
-        stage_writable(setpriv, parent, &stage, entry, &intended)?;
-        fault_point("stage-synced");
-        if let Err(failure) = exchange_names(
-            parent,
-            name,
-            &stage,
-            destination,
-            CodeKey::TransitionRefused,
-            "renameat2-exchange-transition",
-        ) {
-            return Err(cleanup_unpublished_after_failure(
+            identity,
+            intent: PendingIntent::Transition(pair),
+            applied_by: AppliedOperation::Update,
+            prior: record.owned(),
+            stage: &stage,
+            witness: &intended,
+            pending_artifact_target: Some(&record.applied_artifact_target),
+        }
+        .run(ledger, || {
+            stage_writable(setpriv, parent, &stage, entry, &intended)?;
+            fault_point("stage-synced");
+            rename_or_clean(
                 parent,
+                name,
                 &stage,
                 destination,
-                failure,
-            ));
-        }
-        fault_point("exchange-published");
-        sync_parent(parent, destination)?;
-        verify_writable_destination(parent, name, destination, &intended)?;
-        fault_point("verified");
-        remove_unpublished_stage(parent, &stage, destination)?;
-        ledger.commit(
-            canonical,
-            owned_record(
-                identity,
-                entry,
-                AppliedOperation::Update,
-                record.owned(),
-                &intended,
-            ),
-        )?;
-        return Ok(());
+                RenameFlags::EXCHANGE,
+                CodeKey::TransitionRefused,
+                "renameat2-exchange-transition",
+            )?;
+            fault_point("exchange-published");
+            sync_parent(parent, destination)?;
+            verify_writable_destination(parent, name, destination, &intended)?;
+            fault_point("verified");
+            remove_unpublished_stage(parent, &stage, destination)
+        });
     }
 
     // writable to symlink is automatic only when the destination still equals
@@ -117,59 +100,46 @@ pub(super) fn transition_representation(
         ));
     }
     let expected = OsStr::new(&entry.retained_artifact_target);
-    fault_point("pre-pending");
-    let pending = pending_record(
-        identity,
+    let intended = witness(entry.retained_artifact_target.as_bytes());
+    Publication {
         entry,
-        PendingIntent::Transition(pair),
-        record.owned(),
-        &stage,
-        &witness(entry.retained_artifact_target.as_bytes()),
-    );
-    ledger.commit(canonical, pending)?;
-    fault_point("pending-committed");
-    stage_symlink(setpriv, parent, &stage, entry, expected)?;
-    fault_point("stage-synced");
-    if let Err(failure) = exchange_names(
-        parent,
-        name,
-        &stage,
-        destination,
-        CodeKey::TransitionRefused,
-        "renameat2-exchange-transition",
-    ) {
-        return Err(cleanup_unpublished_after_failure(
+        identity,
+        intent: PendingIntent::Transition(pair),
+        applied_by: AppliedOperation::Update,
+        prior: record.owned(),
+        stage: &stage,
+        witness: &intended,
+        pending_artifact_target: None,
+    }
+    .run(ledger, || {
+        stage_symlink(setpriv, parent, &stage, entry, expected)?;
+        fault_point("stage-synced");
+        rename_or_clean(
             parent,
+            name,
             &stage,
             destination,
-            failure,
-        ));
-    }
-    fault_point("exchange-published");
-    sync_parent(parent, destination)?;
-    let published = symlink_target(parent, name).at(
-        CodeKey::TransitionRefused,
-        destination,
-        "readlinkat-transition-published",
-    )?;
-    if published.target() != Some(expected) {
-        return Err(Failure::new(
+            RenameFlags::EXCHANGE,
+            CodeKey::TransitionRefused,
+            "renameat2-exchange-transition",
+        )?;
+        fault_point("exchange-published");
+        sync_parent(parent, destination)?;
+        let published = symlink_target(parent, name).at(
             CodeKey::TransitionRefused,
             destination,
-            "post-transfer verification did not observe the intended link",
-        ));
-    }
-    fault_point("verified");
-    // the displaced object is the pristine regular file, proven equal to its
-    // baseline above, so removing it destroys no work.
-    remove_unpublished_stage(parent, &stage, destination)?;
-    let owned = owned_record(
-        identity,
-        entry,
-        AppliedOperation::Update,
-        record.owned(),
-        &witness(entry.retained_artifact_target.as_bytes()),
-    );
-    ledger.commit(canonical, owned)?;
-    Ok(())
+            "readlinkat-transition-published",
+        )?;
+        if published.target() != Some(expected) {
+            return Err(Failure::new(
+                CodeKey::TransitionRefused,
+                destination,
+                "post-transfer verification did not observe the intended link",
+            ));
+        }
+        fault_point("verified");
+        // the displaced object is the pristine regular file, proven equal to its
+        // baseline above, so removing it destroys no work.
+        remove_unpublished_stage(parent, &stage, destination)
+    })
 }

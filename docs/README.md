@@ -48,6 +48,7 @@ coordinator/
 │   ├── identity.rs
 │   ├── lock.rs
 │   ├── manifest.rs
+│   ├── scratch.rs
 │   ├── filesystem/
 │   │   ├── mod.rs
 │   │   ├── observe.rs
@@ -63,9 +64,13 @@ coordinator/
 │   └── reconcile/
 │       ├── mod.rs
 │       ├── context.rs
+│       ├── plan.rs
+│       ├── publication.rs
 │       ├── recovery.rs
+│       ├── resolve.rs
 │       ├── retirement.rs
 │       ├── symlink.rs
+│       ├── tests.rs
 │       ├── transition.rs
 │       └── writable.rs
 └── tests/

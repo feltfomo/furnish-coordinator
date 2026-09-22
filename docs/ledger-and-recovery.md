@@ -139,6 +139,8 @@ Important convergent states include:
 
 ## Ledger persistence
 
+A change that a filesystem mutation depends on is written before it returns. A change that only records an observation is held and written once on the way out of the run, so a host whose entries are all settled writes the document once rather than once per entry. The flush runs on every exit, refused runs included, so the applied state a run leaves does not depend on which kind of change it made.
+
 Every write:
 
 1. serializes the complete v3 document;
@@ -172,3 +174,7 @@ When an undeclared writable destination no longer matches its baseline, the file
 - the recorded baseline hash.
 
 This marker explains why cleanup did not occur. Redeclaration resolves the marker because the destination is once again part of the desired set.
+
+Nothing else in the reconcile loop can clear it: the loop only ever sees a destination that is declared or one that is not, and it is the not-declared case that produced the marker in the first place. The `release` and `discard` verbs are the other two exits, and they refuse every record except a marked one. See [`reference.md`](reference.md) for their grammar and refusals.
+
+A reconcile whose only complaint is a blocked retirement still exits `0`, because what is blocked is the retirement and not the activation around it. `status` is where the marker becomes visible without running anything: it prints the destination as `blocked` and exits `4`.

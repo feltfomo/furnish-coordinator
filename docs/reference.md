@@ -8,7 +8,8 @@ furnish-coordinator reconcile \
   --lock-name <one-component-name> \
   --setpriv <path> \
   --state-dir <path> \
-  [--lock-dir <path>]
+  [--lock-dir <path>] \
+  [--dry-run]
 ```
 
 `--lock-dir` defaults to `/run/lock`.
@@ -20,7 +21,79 @@ The reconcile parser intentionally preserves compatibility behavior:
 - repeated options use the first occurrence;
 - a flag-looking string may still serve as the previous option’s value.
 
-All four required options must resolve. Invalid grammar exits `1` silently.
+`--dry-run` is value-less and is scanned rather than paired, so it cannot swallow the argument after it. It takes the host lock and loads the ledger, then prints the report and stops. Nothing is published and nothing is written to applied state.
+
+All four required options must resolve. Invalid grammar exits `2` silently.
+
+## Read-only command
+
+```text
+furnish-coordinator status \
+  --manifest <path> \
+  --lock-name <one-component-name> \
+  --state-dir <path> \
+  [--lock-dir <path>]
+```
+
+`status` is `reconcile --dry-run` without `--setpriv`, which it has no use for because it never launches an executor. It takes the same host lock, so a report is never a torn read of a ledger a concurrent run is rewriting, and it walks parents in refusing mode, so it never creates a directory a real run would.
+
+One tab-separated line per destination on stdout, and one line per record whose destination the manifest no longer declares:
+
+| Word | Meaning |
+| --- | --- |
+| `settled` | the destination already holds what the declaration asks for |
+| `publish` | the name is free and nothing records ownership of it |
+| `repair` | the name is free and a record claims it |
+| `republish` | an owned symlink would be exchanged for the desired target |
+| `replace` | an owned writable file would be exchanged for the source content |
+| `transition` | the recorded representation is not the declared one |
+| `recover` | a pending record is present and recovery would run first |
+| `refused` | a real run would refuse; the diagnostic is emitted as a warning |
+| `retire` | the record is undeclared and its destination would be removed |
+| `blocked` | the record is undeclared and its retirement is already blocked |
+
+A report does not stop at the first refusal, because the point of asking is to see every destination at once.
+
+The words come from the same two decision cores the apply path calls, so the report cannot name a decision a real run would not reach. `recover` is the one verdict it cannot resolve further: which way recovery would go depends on what recovery finds, and finding out is not a read.
+
+## Resolution commands
+
+```text
+furnish-coordinator release|discard \
+  --destination <path> \
+  --manifest <path> \
+  --lock-name <one-component-name> \
+  --state-dir <path> \
+  [--lock-dir <path>]
+```
+
+The only exit from an unresolved retirement. `release` drops the ownership record and leaves the file, which makes the destination foreign; a later declaration of it refuses rather than adopts. `discard` drops both.
+
+Both take the manifest for its diagnostic registry, even though the destination they act on is by definition not declared in it. Both refuse when:
+
+- the manifest still declares the destination;
+- applied state records no ownership of it;
+- more than one canonical identity records it;
+- the record carries no unresolved retirement.
+
+The marker is the authorization. Without it these would be a way to drop ownership of a live destination, or delete a file, without the coordinator ever having decided that retirement was blocked.
+
+`discard` additionally re-reads the file and refuses unless it still hashes to the marker's observed hash. If the destination moved again since the marker was written, the operator would be authorizing the destruction of content they have not seen.
+
+## Exit codes
+
+Refusal classes, not one code per diagnostic. A code per key would make every new key a contract change for anything that reads the status.
+
+| Code | Class | Keys |
+| --- | --- | --- |
+| `0` | success | — |
+| `1` | refused | everything not listed below |
+| `2` | usage | unparsable arguments, unreadable or undecodable manifest |
+| `3` | ledger | `ledgerUnreadable`, `ledgerInvalid`, `ledgerWriteFailed` |
+| `4` | conflict | `conflictingDestination`, `unresolvedRetirement` |
+| `5` | interrupted | `pendingRecovery` |
+
+`status` and `reconcile --dry-run` exit `4` when the host does not match its declaration, so an activation script can branch on drift without reading stdout. A refusal in the report decides the status instead, under the class of the first one reported.
 
 ## Internal worker commands
 

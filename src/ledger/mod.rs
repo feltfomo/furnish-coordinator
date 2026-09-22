@@ -4,8 +4,8 @@ mod persistence;
 mod transaction;
 
 pub(crate) use model::{
-    AppliedOperation, AuthorityScope, LedgerRecord, PendingIntent, RecordStatus, ReloadEvidence,
-    Representation, TransitionPair, UnresolvedRetirement,
+    AppliedOperation, AuthorityScope, LedgerRecord, OwnedRecord, PendingIntent, RecordStatus,
+    ReloadEvidence, Representation, TransitionPair, UnresolvedRetirement,
 };
 pub(crate) use persistence::LedgerState;
 pub(crate) use transaction::{baseline_for, owned_record, pending_record, refreshed_record};

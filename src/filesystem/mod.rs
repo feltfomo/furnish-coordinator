@@ -17,7 +17,7 @@ pub(crate) use observe::{
 pub(crate) use parent::{ParentMode, open_parent, walk_parent};
 pub(crate) use publish::{
     exchange_names, publish_exchange, publish_new, publish_writable_exchange, publish_writable_new,
-    rollback_exchange, sync_parent,
+    rename_or_clean, rollback_exchange, sync_parent,
 };
 #[cfg(test)]
 pub(crate) use stage::FAIL_VERIFIED_DISPLACED_CLEANUP;

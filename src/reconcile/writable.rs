@@ -1,11 +1,11 @@
 use super::{
     AppliedOperation, CodeKey, ConflictPolicy, Context, DisplacedCleanup, Entry, Failure,
-    LedgerRecord, LedgerState, OpenDestination, PendingIntent, REGULAR_MODE, ReconcileContext,
-    Result, RunIdentity, WRITABLE_FILE_MODE, algorithm_of, baseline_for,
+    LedgerRecord, LedgerState, OpenDestination, PendingIntent, Publication, REGULAR_MODE,
+    ReconcileContext, Result, RunIdentity, WRITABLE_FILE_MODE, algorithm_of, baseline_for,
     cleanup_unpublished_after_failure, fault_point, hash_matches, hash_regular, observe_kind,
-    observe_mode, owned_record, pending_record, profile_for, publish_writable_exchange,
-    publish_writable_new, read_regular, refreshed_record, remove_unpublished_stage, run_executor,
-    stage_name, verify_writable_destination, witness,
+    observe_mode, owned_record, profile_for, publish_writable_exchange, publish_writable_new,
+    read_regular, refreshed_record, remove_unpublished_stage, run_executor, stage_name,
+    verify_writable_destination, witness,
 };
 use std::ffi::OsStr;
 use std::fs;
@@ -104,6 +104,75 @@ pub(super) fn stage_writable(
     Ok(())
 }
 
+// the refusals that guard the writable decision, worded once, because the
+// read-only report has to decline for the same reasons the apply path does.
+pub(super) const NOT_RECORDED: &str = "refusing to take ownership of a pre-existing destination: applied state records no furnish ownership of it";
+pub(super) const NOT_REGULAR: &str = "refusing a destination that is not a regular file";
+pub(super) const NO_BASELINE: &str =
+    "refusing to reconcile a writable destination with no recorded baseline";
+
+// a baseline this build cannot recompute is not a diverged baseline. falling
+// through would hand row four a two-sided divergence it invented out of not
+// understanding the record, and row four is allowed to overwrite.
+pub(super) fn unreadable_baseline(destination: &str, baseline: &str) -> Failure {
+    Failure::new(
+        CodeKey::LedgerInvalid,
+        destination,
+        format!("recorded baseline {baseline} names no hash this build can compute"),
+    )
+}
+
+// the whole writable decision, once, as a function of the three equalities and
+// the declared policy. reconcile acts on it and the read-only report prints
+// it, so a dry run cannot describe a decision a real run would not make.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum WritableAction {
+    // publish nothing and re-state the record under this run.
+    Settle,
+    // the destination already equals the source while the baseline does not,
+    // which is the crash window after a replacement and before its commit.
+    VerifyAndAdvance,
+    Exchange { displaced_is_baseline: bool },
+    RefuseConflict,
+}
+
+pub(super) fn writable_action(
+    d_eq_s: bool,
+    d_eq_b: bool,
+    s_eq_b: bool,
+    policy: ConflictPolicy,
+) -> WritableAction {
+    if d_eq_s {
+        // row one, then row five.
+        return if s_eq_b {
+            WritableAction::Settle
+        } else {
+            WritableAction::VerifyAndAdvance
+        };
+    }
+    // row two. the source has not changed but the destination has, so a user
+    // edited the file after furnish wrote it. the edit is preserved.
+    if s_eq_b {
+        return WritableAction::Settle;
+    }
+    // row three. the source changed and the destination is still exactly what
+    // furnish last wrote, so the new version goes in through the exchange.
+    if d_eq_b {
+        return WritableAction::Exchange {
+            displaced_is_baseline: true,
+        };
+    }
+    // row four. both sides moved off the baseline, so nothing here is
+    // derivable from the hashes and the declaration's policy decides.
+    match policy {
+        ConflictPolicy::Error => WritableAction::RefuseConflict,
+        ConflictPolicy::SourceWins => WritableAction::Exchange {
+            displaced_is_baseline: false,
+        },
+        ConflictPolicy::RuntimeWins => WritableAction::Settle,
+    }
+}
+
 // row three and source-wins share one pending-record bracket after the caller
 // selects publication.
 pub(super) struct WritableUpdate<'a> {
@@ -138,47 +207,34 @@ pub(super) fn publish_writable_update(
     let identity = context.identity;
     let parent = &open.parent;
     let name = open.name.as_os_str();
-    let canonical = &entry.filesystem_identity.canonical;
     let destination = &entry.filesystem_identity.destination;
     let stage = stage_name(index);
-    fault_point("pre-pending");
-    ledger.commit(
-        canonical,
-        pending_record(
-            identity,
-            entry,
-            PendingIntent::Apply(AppliedOperation::Update),
-            record.owned(),
+    Publication {
+        entry,
+        identity,
+        intent: PendingIntent::Apply(AppliedOperation::Update),
+        applied_by: AppliedOperation::Update,
+        prior: record.owned(),
+        stage: &stage,
+        witness: intended,
+        pending_artifact_target: None,
+    }
+    .run(ledger, || {
+        stage_writable(setpriv, parent, &stage, entry, intended)?;
+        publish_writable_exchange(
+            parent,
+            name,
             &stage,
+            destination,
+            expected_displaced,
             intended,
-        ),
-    )?;
-    fault_point("pending-committed");
-    stage_writable(setpriv, parent, &stage, entry, intended)?;
-    publish_writable_exchange(
-        parent,
-        name,
-        &stage,
-        destination,
-        expected_displaced,
-        intended,
-        if entry.on_conflict == ConflictPolicy::SourceWins && !displaced_is_baseline {
-            DisplacedCleanup::PolicyDisplaced
-        } else {
-            DisplacedCleanup::VerifiedOwned
-        },
-    )?;
-    ledger.commit(
-        canonical,
-        owned_record(
-            identity,
-            entry,
-            AppliedOperation::Update,
-            record.owned(),
-            intended,
-        ),
-    )?;
-    Ok(())
+            if entry.on_conflict == ConflictPolicy::SourceWins && !displaced_is_baseline {
+                DisplacedCleanup::PolicyDisplaced
+            } else {
+                DisplacedCleanup::VerifiedOwned
+            },
+        )
+    })
 }
 
 // first ownership of an absent destination, the self-heal for an owned one that
@@ -213,46 +269,34 @@ pub(super) fn reconcile_writable_entry(
                 AppliedOperation::New
             };
             let stage = stage_name(index);
-            fault_point("pre-pending");
-            ledger.commit(
-                canonical,
-                pending_record(
-                    identity,
-                    entry,
-                    PendingIntent::Apply(applied_by),
-                    prior.as_ref().and_then(LedgerRecord::owned),
-                    &stage,
-                    &intended,
-                ),
-            )?;
-            fault_point("pending-committed");
-            stage_writable(setpriv, parent, &stage, entry, &intended)?;
-            publish_writable_new(parent, name, &stage, destination, &intended)?;
-            ledger.commit(
-                canonical,
-                owned_record(
-                    identity,
-                    entry,
-                    applied_by,
-                    prior.as_ref().and_then(LedgerRecord::owned),
-                    &intended,
-                ),
-            )?;
-            Ok(())
+            Publication {
+                entry,
+                identity,
+                intent: PendingIntent::Apply(applied_by),
+                applied_by,
+                prior: prior.as_ref().and_then(LedgerRecord::owned),
+                stage: &stage,
+                witness: &intended,
+                pending_artifact_target: None,
+            }
+            .run(ledger, || {
+                stage_writable(setpriv, parent, &stage, entry, &intended)?;
+                publish_writable_new(parent, name, &stage, destination, &intended)
+            })
         }
         // refused by default even when the content already equals the source.
         // equality is not adoption proof.
         (Some(_), None) => Err(Failure::new(
             CodeKey::ConflictingDestination,
             destination,
-            "refusing to take ownership of a pre-existing destination: applied state records no furnish ownership of it",
+            NOT_RECORDED,
         )),
         (Some(kind), Some(record)) => {
             if kind != REGULAR_MODE {
                 return Err(Failure::new(
                     CodeKey::ConflictingDestination,
                     destination,
-                    "refusing a destination that is not a regular file",
+                    NOT_REGULAR,
                 ));
             }
             let destination_bytes = read_regular(
@@ -272,19 +316,11 @@ pub(super) fn reconcile_writable_entry(
                 return Err(Failure::new(
                     CodeKey::ConflictingDestination,
                     destination,
-                    "refusing to reconcile a writable destination with no recorded baseline",
+                    NO_BASELINE,
                 ));
             };
             if algorithm_of(baseline).is_none() {
-                // a baseline this build cannot recompute is not a diverged
-                // baseline either. falling through would hand row four a
-                // two-sided divergence it invented out of not understanding the
-                // record, and row four is allowed to overwrite.
-                return Err(Failure::new(
-                    CodeKey::LedgerInvalid,
-                    destination,
-                    format!("recorded baseline {baseline} names no hash this build can compute"),
-                ));
+                return Err(unreadable_baseline(destination, baseline));
             }
             // the baseline is checked by re-running the function that wrote it,
             // which is what lets a schema 2 record keep its meaning while this
@@ -300,103 +336,63 @@ pub(super) fn reconcile_writable_entry(
             // run holds, so the witness is rewritten under the current hash
             // instead of carried forward. that is what retires the last schema 2
             // value on a host whose destinations never need publishing again.
-            let settle = |ledger: &mut LedgerState| -> Result<()> {
+            // deferred, in all of these, because the destination already holds
+            // what the record is being made to say. nothing is published behind
+            // them, so nothing on disk is waiting for them to be durable.
+            let settle = |ledger: &mut LedgerState| {
                 let mut refreshed = refreshed_record(identity, entry, &record);
                 refreshed.baseline_hash = baseline_for(entry.representation, &intended);
                 refreshed.intended_witness_hash = Some(intended.clone());
-                ledger.commit(canonical, refreshed)
+                ledger.note(canonical, refreshed);
+            };
+            let exchange = |ledger: &mut LedgerState, displaced_is_baseline| {
+                // the bytes it will displace are the ones just measured, which
+                // is what the post-exchange recheck expects.
+                let mut context = ReconcileContext::new(setpriv, ledger, identity);
+                publish_writable_update(
+                    &mut context,
+                    WritableUpdate {
+                        entry,
+                        index,
+                        record: &record,
+                        destination: open,
+                        expected_displaced: &observed_hash,
+                        intended: &intended,
+                        displaced_is_baseline,
+                    },
+                )
             };
 
-            if d_eq_s {
-                if s_eq_b {
-                    // row one. nothing to publish, but the record is refreshed
-                    // so that when this last reconciled has a live answer here
-                    // and not only on the symlink steady-state path.
-                    settle(ledger)?;
-                    return Ok(());
+            match writable_action(d_eq_s, d_eq_b, s_eq_b, entry.on_conflict) {
+                WritableAction::Settle => {
+                    settle(ledger);
+                    Ok(())
                 }
-                // row five. the crash window after the destination was
-                // replaced and before the baseline was committed, so the
-                // representation is verified and the baseline advances under
-                // the applied_by this record already carries rather than
-                // being reported as a conflict.
-                verify_writable_destination(parent, name, destination, &intended)?;
-                ledger.commit(
-                    canonical,
-                    owned_record(
-                        identity,
-                        entry,
-                        record.applied_by_or_update(),
-                        record.owned(),
-                        &intended,
-                    ),
-                )?;
-                return Ok(());
-            }
-
-            if s_eq_b {
-                // row two. the source has not changed but the destination has,
-                // so a user edited the file after furnish wrote it. the edit
-                // is preserved and no reload is triggered.
-                settle(ledger)?;
-                return Ok(());
-            }
-
-            if d_eq_b {
-                // row three. the source changed and the destination is still
-                // exactly what furnish last wrote, so the new version goes in
-                // through the exchange route. the bytes it will displace are
-                // the ones just measured, which is what the recheck expects.
-                return {
-                    let mut context = ReconcileContext::new(setpriv, ledger, identity);
-                    publish_writable_update(
-                        &mut context,
-                        WritableUpdate {
+                WritableAction::VerifyAndAdvance => {
+                    // the baseline advances under the applied_by this record
+                    // already carries rather than being reported as a conflict.
+                    verify_writable_destination(parent, name, destination, &intended)?;
+                    ledger.note(
+                        canonical,
+                        owned_record(
+                            identity,
                             entry,
-                            index,
-                            record: &record,
-                            destination: open,
-                            expected_displaced: &observed_hash,
-                            intended: &intended,
-                            displaced_is_baseline: true,
-                        },
-                    )
-                };
-            }
-
-            // row four. the destination and the source have both moved off the
-            // baseline, so nothing here is derivable from the hashes and the
-            // declaration's policy is the only thing left to decide it.
-            match entry.on_conflict {
-                ConflictPolicy::Error => Err(Failure::conflict(
+                            record.applied_by_or_update(),
+                            record.owned(),
+                            &intended,
+                        ),
+                    );
+                    Ok(())
+                }
+                WritableAction::Exchange {
+                    displaced_is_baseline,
+                } => exchange(ledger, displaced_is_baseline),
+                WritableAction::RefuseConflict => Err(Failure::conflict(
                     destination,
                     Some(baseline),
                     &intended,
                     &observed_hash,
                 )),
-                ConflictPolicy::SourceWins => {
-                    let mut context = ReconcileContext::new(setpriv, ledger, identity);
-                    publish_writable_update(
-                        &mut context,
-                        WritableUpdate {
-                            entry,
-                            index,
-                            record: &record,
-                            destination: open,
-                            expected_displaced: &observed_hash,
-                            intended: &intended,
-                            displaced_is_baseline: false,
-                        },
-                    )
-                }
-                ConflictPolicy::RuntimeWins => {
-                    // the destination stays as it is and the baseline advances
-                    // to the source that was refused, so a later run sees a
-                    // settled decision instead of the same conflict again. the
-                    // witness moves with it because every writable owned
-                    // record in this file keeps the two equal.
-                    settle(ledger)
-                }
             }
         }
     }

@@ -1,7 +1,8 @@
+use crate::diagnostic::EXIT_USAGE;
 use crate::executor::{self, WorkerCommand, WorkerKind, WorkerProgram};
 use crate::filesystem::WRITABLE_FILE_MODE;
 use crate::lock::DEFAULT_LOCK_DIR;
-use crate::reconcile::reconcile;
+use crate::reconcile::{Resolution, reconcile, resolve_retirement, status};
 use rustix::fs::{Mode, OFlags, mkdirat, open, openat, symlinkat};
 use rustix::io::Errno;
 use std::ffi::{OsStr, OsString};
@@ -22,6 +23,23 @@ pub(crate) enum Command {
         setpriv: PathBuf,
         state_dir: PathBuf,
         lock_dir: PathBuf,
+        dry_run: bool,
+    },
+    // read-only. it takes the same host lock so the report cannot be a torn
+    // read of a ledger a concurrent run is rewriting.
+    Status {
+        manifest: PathBuf,
+        lock_name: OsString,
+        state_dir: PathBuf,
+        lock_dir: PathBuf,
+    },
+    Resolve {
+        resolution: Resolution,
+        destination: PathBuf,
+        manifest: PathBuf,
+        lock_name: OsString,
+        state_dir: PathBuf,
+        lock_dir: PathBuf,
     },
     Worker(WorkerCommand),
 }
@@ -31,11 +49,35 @@ impl Command {
     // discards another argument.
     pub(crate) fn parse(args: &[OsString]) -> Option<Self> {
         let subcommand = args.first()?.to_str()?;
-        if subcommand == "reconcile" {
-            return Self::parse_reconcile(&args[1..]);
+        match subcommand {
+            "reconcile" => return Self::parse_reconcile(&args[1..]),
+            "status" => return Self::parse_status(&args[1..]),
+            "release" => return Self::parse_resolve(Resolution::Release, &args[1..]),
+            "discard" => return Self::parse_resolve(Resolution::Discard, &args[1..]),
+            _ => {}
         }
         let program = WorkerProgram::from_subcommand(subcommand)?;
         Self::parse_worker(program, &args[1..]).map(Self::Worker)
+    }
+
+    fn parse_status(args: &[OsString]) -> Option<Self> {
+        Some(Self::Status {
+            manifest: option(args, "--manifest")?,
+            lock_name: option(args, "--lock-name")?.into_os_string(),
+            state_dir: option(args, "--state-dir")?,
+            lock_dir: option(args, "--lock-dir").unwrap_or_else(|| PathBuf::from(DEFAULT_LOCK_DIR)),
+        })
+    }
+
+    fn parse_resolve(resolution: Resolution, args: &[OsString]) -> Option<Self> {
+        Some(Self::Resolve {
+            resolution,
+            destination: option(args, "--destination")?,
+            manifest: option(args, "--manifest")?,
+            lock_name: option(args, "--lock-name")?.into_os_string(),
+            state_dir: option(args, "--state-dir")?,
+            lock_dir: option(args, "--lock-dir").unwrap_or_else(|| PathBuf::from(DEFAULT_LOCK_DIR)),
+        })
     }
 
     // this permissive grammar is compatibility. overlapping pairs preserve
@@ -47,6 +89,10 @@ impl Command {
             setpriv: option(args, "--setpriv")?,
             state_dir: option(args, "--state-dir")?,
             lock_dir: option(args, "--lock-dir").unwrap_or_else(|| PathBuf::from(DEFAULT_LOCK_DIR)),
+            // a value-less flag, so it is scanned rather than paired. the
+            // permissive pairing above would otherwise read the next argument
+            // as its value and lose it.
+            dry_run: args.iter().any(|argument| argument == "--dry-run"),
         })
     }
 
@@ -97,9 +143,35 @@ pub(crate) fn run(args: &[OsString]) -> ExitCode {
             setpriv,
             state_dir,
             lock_dir,
-        }) => reconcile(&manifest, &lock_name, &setpriv, &state_dir, &lock_dir),
+            dry_run,
+        }) => reconcile(
+            &manifest, &lock_name, &setpriv, &state_dir, &lock_dir, dry_run,
+        ),
+        Some(Command::Status {
+            manifest,
+            lock_name,
+            state_dir,
+            lock_dir,
+        }) => status(&manifest, &lock_name, &state_dir, &lock_dir),
+        Some(Command::Resolve {
+            resolution,
+            destination,
+            manifest,
+            lock_name,
+            state_dir,
+            lock_dir,
+        }) => resolve_retirement(
+            resolution,
+            &destination.to_string_lossy(),
+            &manifest,
+            &lock_name,
+            &state_dir,
+            &lock_dir,
+        ),
         Some(Command::Worker(command)) => run_worker(command),
-        None => ExitCode::FAILURE,
+        // an argument list this cannot parse is the caller's mistake, not a
+        // refusal about anything on this host.
+        None => ExitCode::from(EXIT_USAGE),
     }
 }
 

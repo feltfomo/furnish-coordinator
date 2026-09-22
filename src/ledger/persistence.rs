@@ -106,6 +106,8 @@ pub(crate) struct LedgerState {
     directory: PathBuf,
     path: PathBuf,
     records: BTreeMap<String, LedgerRecord>,
+    // set by a change nothing on disk is waiting for. see note().
+    deferred: bool,
 }
 
 impl LedgerState {
@@ -220,6 +222,7 @@ impl LedgerState {
             directory: directory.to_path_buf(),
             path,
             records,
+            deferred: false,
         };
         if migrated {
             state.write()?;
@@ -240,12 +243,52 @@ impl LedgerState {
 
     pub(crate) fn retire(&mut self, canonical: &str) -> Result<()> {
         self.records.remove(canonical);
-        self.write()
+        self.flushed()
     }
 
+    // a change something on disk is about to depend on, so it is durable before
+    // this returns. the pending record in a publication bracket is the reason
+    // this distinction exists at all.
     pub(crate) fn commit(&mut self, canonical: &str, record: LedgerRecord) -> Result<()> {
         self.records.insert(canonical.to_owned(), record);
-        self.write()
+        self.flushed()
+    }
+
+    // a change nothing on disk is waiting for, because the destination already
+    // holds what this record describes. the whole document is rewritten and
+    // fsynced on every durable change, so a host whose entries are all settled
+    // used to rewrite an N-record document N times to record N observations it
+    // could have recorded once. batching them costs only that a crash before
+    // the flush loses the observation, and the next run re-derives it from the
+    // same destination it read this time.
+    pub(crate) fn note(&mut self, canonical: &str, record: LedgerRecord) {
+        self.records.insert(canonical.to_owned(), record);
+        self.deferred = true;
+    }
+
+    // the deferred counterpart of retire. safe for the same reason: the
+    // destination is already gone when this runs, and a retirement that is
+    // lost re-runs against a missing destination, which is already retired.
+    pub(crate) fn forget(&mut self, canonical: &str) {
+        self.records.remove(canonical);
+        self.deferred = true;
+    }
+
+    // called on every exit from a run, so deferring a change decides when it
+    // becomes durable and never whether it does.
+    pub(crate) fn flush(&mut self) -> Result<()> {
+        if self.deferred {
+            self.flushed()
+        } else {
+            Ok(())
+        }
+    }
+
+    fn flushed(&mut self) -> Result<()> {
+        self.write()?;
+        // the document is written whole, so any deferred change rode along.
+        self.deferred = false;
+        Ok(())
     }
 
     fn write(&self) -> Result<()> {
@@ -622,18 +665,10 @@ fn validate_records(document: RawLedger, path: &Path) -> Result<BTreeMap<String,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    use crate::scratch::scratch_directory;
 
     fn state_directory(label: &str) -> PathBuf {
-        let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "furnish-persistence-{label}-{}-{sequence}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&path).expect("create persistence test directory");
-        path
+        scratch_directory(&format!("persistence-{label}"))
     }
 
     fn empty_ledger(directory: &Path) -> LedgerState {
@@ -641,6 +676,7 @@ mod tests {
             directory: directory.to_owned(),
             path: directory.join(LEDGER_FILE_NAME),
             records: BTreeMap::new(),
+            deferred: false,
         }
     }
 
@@ -759,6 +795,58 @@ mod tests {
         let bytes = fs::read(directory.join(LEDGER_FILE_NAME)).expect("read ledger");
         let expected = "{\"schemaVersion\":3,\"records\":{\"test:/managed/value\":{\"destination\":\"/managed/value\",\"appliedArtifactTarget\":\"/nix/store/target\",\"managedRoot\":\"/managed\",\"appliedBy\":\"new\",\"appliedGeneration\":null,\"lastSuccessfulReload\":{\"invocationId\":null,\"monotonicSeconds\":0.0},\"reloadActionIdentity\":null,\"bootId\":null,\"state\":\"owned\",\"representation\":\"writable\",\"baselineHash\":\"blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"intendedWitnessHash\":\"blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"appliedOperationGeneration\":0,\"stageName\":null,\"unresolvedRetirement\":null}}}";
         assert_eq!(String::from_utf8(bytes).expect("utf8 ledger"), expected);
+        fs::remove_dir_all(directory).expect("remove persistence test directory");
+    }
+
+    #[test]
+    fn a_noted_change_reaches_disk_only_on_a_flush_or_a_durable_commit() {
+        // the point of note() is that the expensive part does not happen, so
+        // absence of the file is the assertion. a run that never flushed would
+        // pass a test that only checked the final content.
+        let directory = state_directory("deferred");
+        let path = directory.join(LEDGER_FILE_NAME);
+        let mut ledger = empty_ledger(&directory);
+
+        ledger.note("test:/managed/one", sample_record(Representation::Symlink));
+        ledger.note("test:/managed/two", sample_record(Representation::Symlink));
+        assert!(!path.exists(), "a noted change must not write the document");
+
+        ledger.flush().expect("flush the noted changes");
+        let after_flush: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read flushed ledger"))
+                .expect("decode flushed ledger");
+        assert_eq!(after_flush["schemaVersion"], 3);
+        assert_eq!(
+            after_flush["records"]
+                .as_object()
+                .expect("records object")
+                .len(),
+            2
+        );
+
+        // a second flush has nothing to do, so it must not rewrite and resync a
+        // document that is already on disk.
+        fs::remove_file(&path).expect("remove flushed ledger");
+        ledger.flush().expect("second flush is a no-op");
+        assert!(
+            !path.exists(),
+            "a flush with nothing deferred must not write"
+        );
+
+        // a durable commit writes the whole document, so a change noted before
+        // it rides along and must not be left behind as still deferred.
+        ledger.note(
+            "test:/managed/three",
+            sample_record(Representation::Symlink),
+        );
+        ledger
+            .commit("test:/managed/four", sample_record(Representation::Symlink))
+            .expect("durable commit");
+        fs::remove_file(&path).expect("remove committed ledger");
+        ledger
+            .flush()
+            .expect("nothing left deferred after a commit");
+        assert!(!path.exists());
         fs::remove_dir_all(directory).expect("remove persistence test directory");
     }
 
