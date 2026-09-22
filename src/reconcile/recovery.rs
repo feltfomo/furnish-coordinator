@@ -5,7 +5,7 @@ use super::{
     WRITABLE_REPRESENTATION, baseline_for, cleanup_unpublished_after_failure,
     discard_displaced_under_policy, exchange_names, hash_regular, observe_kind, open_parent,
     owned_record, remove_unpublished_stage, remove_verified_displaced, rollback_exchange,
-    sha256_hex, symlink_target, sync_parent, verify_writable_destination, verify_writable_hash,
+    symlink_target, sync_parent, verify_writable_destination, verify_writable_hash, witness,
 };
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
@@ -543,7 +543,7 @@ pub(super) fn recover_transition(
         entry,
         AppliedOperation::Update,
         prior.owned(),
-        &sha256_hex(entry.retained_artifact_target.as_bytes()),
+        &witness(entry.retained_artifact_target.as_bytes()),
     );
     ledger.commit(canonical, owned)?;
     Ok(())

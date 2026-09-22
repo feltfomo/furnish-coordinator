@@ -2,8 +2,8 @@ use super::{
     AppliedOperation, CodeKey, Context, Entry, Failure, LedgerRecord, LedgerState, OpenDestination,
     PendingIntent, Result, RunIdentity, TransitionPair, WRITABLE_REPRESENTATION,
     cleanup_unpublished_after_failure, exchange_names, fault_point, hash_regular, hash_source,
-    owned_record, pending_record, remove_unpublished_stage, sha256_hex, stage_name, stage_symlink,
-    stage_writable, symlink_target, sync_parent, verify_writable_destination,
+    owned_record, pending_record, remove_unpublished_stage, stage_name, stage_symlink,
+    stage_writable, symlink_target, sync_parent, verify_writable_destination, witness,
 };
 use std::ffi::OsStr;
 use std::path::Path;
@@ -124,7 +124,7 @@ pub(super) fn transition_representation(
         PendingIntent::Transition(pair),
         record.owned(),
         &stage,
-        &sha256_hex(entry.retained_artifact_target.as_bytes()),
+        &witness(entry.retained_artifact_target.as_bytes()),
     );
     ledger.commit(canonical, pending)?;
     fault_point("pending-committed");
@@ -168,7 +168,7 @@ pub(super) fn transition_representation(
         entry,
         AppliedOperation::Update,
         record.owned(),
-        &sha256_hex(entry.retained_artifact_target.as_bytes()),
+        &witness(entry.retained_artifact_target.as_bytes()),
     );
     ledger.commit(canonical, owned)?;
     Ok(())

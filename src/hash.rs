@@ -1,111 +1,171 @@
-pub(crate) const SHA256_K: [u32; 64] = [
-    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
-];
+// a witness is written by one run and checked by another, so the function that
+// produced it has to travel with it. without the tag an upgrade that changes
+// the preferred function silently reinterprets every recorded value as a
+// mismatch, which for a writable destination means reporting an edit that never
+// happened.
+//
+// schema 2 predates the tag. every hash it holds is sha-256 by construction, so
+// a bare hex string is read as sha-256 and the v3 migration writes the name in.
+const SHA256_TAG: &str = "sha256:";
+const BLAKE3_TAG: &str = "blake3:";
+const HEX_DIGEST_LENGTH: usize = 64;
 
-pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
-    let mut state: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-        0x5be0cd19,
-    ];
-    let mut padded = bytes.to_vec();
-    let bit_length = (bytes.len() as u64).wrapping_mul(8);
-    padded.push(0x80);
-    while padded.len() % 64 != 56 {
-        padded.push(0);
-    }
-    padded.extend_from_slice(&bit_length.to_be_bytes());
-    for chunk in padded.chunks_exact(64) {
-        let mut w = [0u32; 64];
-        for (index, word) in chunk.chunks_exact(4).enumerate() {
-            w[index] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
-        }
-        for index in 16..64 {
-            let s0 = w[index - 15].rotate_right(7)
-                ^ w[index - 15].rotate_right(18)
-                ^ (w[index - 15] >> 3);
-            let s1 = w[index - 2].rotate_right(17)
-                ^ w[index - 2].rotate_right(19)
-                ^ (w[index - 2] >> 10);
-            w[index] = w[index - 16]
-                .wrapping_add(s0)
-                .wrapping_add(w[index - 7])
-                .wrapping_add(s1);
-        }
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = state;
-        for index in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ ((!e) & g);
-            let temp1 = h
-                .wrapping_add(s1)
-                .wrapping_add(ch)
-                .wrapping_add(SHA256_K[index])
-                .wrapping_add(w[index]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let temp2 = s0.wrapping_add(maj);
-            h = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(temp1);
-            d = c;
-            c = b;
-            b = a;
-            a = temp1.wrapping_add(temp2);
-        }
-        for (slot, value) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
-            *slot = slot.wrapping_add(value);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Algorithm {
+    Sha256,
+    Blake3,
+}
+
+impl Algorithm {
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Sha256 => SHA256_TAG,
+            Self::Blake3 => BLAKE3_TAG,
         }
     }
-    state.iter().map(|word| format!("{word:08x}")).collect()
+
+    fn hex(self, bytes: &[u8]) -> String {
+        match self {
+            Self::Sha256 => {
+                use sha2::Digest;
+                sha2::Sha256::digest(bytes)
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect()
+            }
+            Self::Blake3 => blake3::hash(bytes).to_hex().to_string(),
+        }
+    }
+}
+
+// the one function that produces new witnesses. nothing else picks an
+// algorithm, so there is no path by which a fresh record acquires a legacy one.
+pub(crate) fn witness(bytes: &[u8]) -> String {
+    witness_in(Algorithm::Blake3, bytes)
+}
+
+pub(crate) fn witness_in(algorithm: Algorithm, bytes: &[u8]) -> String {
+    format!("{}{}", algorithm.tag(), algorithm.hex(bytes))
+}
+
+// an unreadable witness is not a mismatch, it is a ledger this build cannot
+// reason about, and the caller has to be able to refuse rather than conclude.
+pub(crate) fn split(recorded: &str) -> Option<(Algorithm, &str)> {
+    for algorithm in [Algorithm::Sha256, Algorithm::Blake3] {
+        if let Some(hex) = recorded.strip_prefix(algorithm.tag()) {
+            return is_hex_digest(hex).then_some((algorithm, hex));
+        }
+    }
+    is_hex_digest(recorded).then_some((Algorithm::Sha256, recorded))
+}
+
+pub(crate) fn algorithm_of(recorded: &str) -> Option<Algorithm> {
+    split(recorded).map(|(algorithm, _)| algorithm)
+}
+
+// verification re-runs the function named by the record rather than the one
+// this build prefers. that asymmetry is the point of the tag, and it is what
+// lets a schema 2 baseline stay checkable while every witness written from here
+// on is blake3.
+pub(crate) fn matches(recorded: &str, bytes: &[u8]) -> bool {
+    split(recorded).is_some_and(|(algorithm, hex)| algorithm.hex(bytes) == hex)
+}
+
+// the v3 migration writes the name into a value that already has an algorithm,
+// it does not measure anything. recomputing instead would look tidier and would
+// be wrong: a writable baseline says what furnish last wrote, and re-deriving
+// it from whatever is at the destination now would quietly turn an edit into a
+// pristine file.
+pub(crate) fn name_untagged(recorded: &mut Option<String>) {
+    if let Some(value) = recorded.as_deref()
+        && is_hex_digest(value)
+    {
+        *recorded = Some(format!("{SHA256_TAG}{value}"));
+    }
+}
+
+fn is_hex_digest(value: &str) -> bool {
+    value.len() == HEX_DIGEST_LENGTH && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // pinned to reference digests rather than to this crate's own output, so a
+    // wiring mistake that is self-consistent still fails.
     #[test]
     fn sha256_reproduces_known_answers() {
         assert_eq!(
-            sha256_hex(b""),
+            Algorithm::Sha256.hex(b""),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
         assert_eq!(
-            sha256_hex(b"abc"),
+            Algorithm::Sha256.hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
         assert_eq!(
-            sha256_hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
-            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
-        );
-    }
-    #[test]
-    fn sha256_reproduces_block_edge_answers() {
-        // 55 bytes is the last single-block length, 64 forces a second
-        // block for the padding alone, 119 and 120 put the length word at
-        // the two edges of it. pinned to reference digests, because a
-        // padding bug here is self-consistent with the function it checks.
-        assert_eq!(
-            sha256_hex(&[b'a'; 55]),
-            "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318"
-        );
-        assert_eq!(
-            sha256_hex(&[b'a'; 64]),
-            "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb"
-        );
-        assert_eq!(
-            sha256_hex(&[b'a'; 119]),
+            Algorithm::Sha256.hex(&[b'a'; 119]),
             "31eba51c313a5c08226adf18d4a359cfdfd8d2e816b13f4af952f7ea6584dcfb"
         );
+    }
+
+    #[test]
+    fn blake3_reproduces_known_answers() {
         assert_eq!(
-            sha256_hex(&[b'a'; 120]),
-            "2f3d335432c70b580af0e8e1b3674a7c020d683aa5f73aaaedfdc55af904c21c"
+            Algorithm::Blake3.hex(b""),
+            "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
         );
+        assert_eq!(
+            Algorithm::Blake3.hex(b"abc"),
+            "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85"
+        );
+    }
+
+    #[test]
+    fn a_new_witness_names_blake3() {
+        assert_eq!(
+            witness(b"abc"),
+            "blake3:6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85"
+        );
+    }
+
+    // the compatibility rule schema 2 depends on. an untagged digest is sha-256
+    // because nothing else could have written one.
+    #[test]
+    fn an_untagged_digest_reads_as_sha256() {
+        let bare = Algorithm::Sha256.hex(b"abc");
+        assert_eq!(algorithm_of(&bare), Some(Algorithm::Sha256));
+        assert!(matches(&bare, b"abc"));
+        assert!(!matches(&bare, b"abd"));
+    }
+
+    #[test]
+    fn verification_follows_the_recorded_algorithm_not_the_preferred_one() {
+        // the same bytes under both names, each verifying only against its own
+        // digest. a check that reached for the preferred function instead would
+        // pass the blake3 case and fail the sha-256 one.
+        for algorithm in [Algorithm::Sha256, Algorithm::Blake3] {
+            let recorded = witness_in(algorithm, b"payload\n");
+            assert_eq!(algorithm_of(&recorded), Some(algorithm));
+            assert!(matches(&recorded, b"payload\n"));
+            assert!(!matches(&recorded, b"payload"));
+        }
+    }
+
+    #[test]
+    fn an_unreadable_witness_is_refused_rather_than_read_as_a_mismatch() {
+        for recorded in [
+            "",
+            "sha256:",
+            "blake3:short",
+            "md5:0123456789abcdef0123456789abcdef",
+            "not-hex-not-hex-not-hex-not-hex-not-hex-not-hex-not-hex-not-hex-",
+            &"a".repeat(63),
+            &"a".repeat(65),
+        ] {
+            assert_eq!(algorithm_of(recorded), None, "{recorded}");
+            assert!(!matches(recorded, b"anything"), "{recorded}");
+        }
     }
 }

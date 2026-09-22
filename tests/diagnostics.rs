@@ -304,9 +304,14 @@ fn the_first_failing_entry_decides_the_diagnostic() {
 
 // Opaque planted prior-state token: it is not the hash of file content.
 // Production reports it unchanged as the observed baseline without recomputing it.
-const BASELINE_HASH: &str = "3b2c67b04a2403e79a83f3a7aceb95116c1b4c8c1063f0271096c4810348f67d";
-const DECLARED_HASH: &str = "a23c9e491c7f53f7ce9ea426ce849525c4373091b668c3c8606ad8859a3b4670";
-const EDITED_HASH: &str = "68f01b289aedcf28e96fce1f9444365e83b9bfc7e1bf32df20f1f15966835316";
+// It still has to name an algorithm, because a witness that names none is
+// refused as an unreadable record rather than read as a divergence.
+const BASELINE_HASH: &str =
+    "blake3:3b2c67b04a2403e79a83f3a7aceb95116c1b4c8c1063f0271096c4810348f67d";
+// Reference blake3 digests of the declared source and of the edited destination.
+const DECLARED_HASH: &str =
+    "blake3:fe94c0fc24eb262d34a5c2fea3dbbbfd675c7f3f9eac08906e0e223a2093a5df";
+const EDITED_HASH: &str = "blake3:1eeec6b0800e677019202825c71dc41724bf17fa1af0a6efbb78a60bcb979ffd";
 
 fn ledger_record_json(root: &Path, name: &str, source: &Path, baseline: &str) -> String {
     let destination = root.join(name);
@@ -335,7 +340,7 @@ fn a_conflict_diagnostic_carries_the_full_runtime_shape() {
     let state = dir.join("state");
     fs::create_dir_all(&state).expect("create state dir");
     let ledger = format!(
-        "{{\"schemaVersion\":2,\"records\":{{\"test:{}\":{}}}}}",
+        "{{\"schemaVersion\":3,\"records\":{{\"test:{}\":{}}}}}",
         destination.to_str().unwrap(),
         ledger_record_json(&dir, "value", &source, BASELINE_HASH)
     );

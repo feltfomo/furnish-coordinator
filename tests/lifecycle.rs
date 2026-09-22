@@ -29,15 +29,25 @@ fn os<'a>(args: &'a [&'a str]) -> Vec<&'a OsStr> {
     args.iter().map(OsStr::new).collect()
 }
 
-const PAYLOAD_HASH: &str = "d4e4877bac978b7952f0d544fc52ebff5411d351d129f1f056fa43f11da9af2b";
-const OLD_PAYLOAD_HASH: &str = "6b53c9c192925718563767d10eb93b8940d8a9af8d9cc412b154d6209f5a1162";
-const NEW_PAYLOAD_HASH: &str = "47e398fd8b576f545397f4b4db4e470b55d4fbe4b4ca219fb0be6abf307e82d0";
-const FIRST_HASH: &str = "b640e840b19d378660b32fb51ae18d67dccb4a8596a29e7bd72c1b2ae5928f41";
-const SECOND_HASH: &str = "480c2336b410f1ad5f8bf1b28944490255804b65350c527787e74ebdd511e3a4";
+// Witnesses carry the name of the hash that produced them, and every witness a
+// schema 3 ledger holds is blake3. These are reference digests of the payloads
+// below, not values copied out of this crate's own output.
+const PAYLOAD_HASH: &str =
+    "blake3:d58a7a4a1898506d5ccdca5cec0184d35d75e42ce82c17daf46d75b5f905fcb0";
+const OLD_PAYLOAD_HASH: &str =
+    "blake3:0c2611ccc1f9773c37871e353b6efdf7584ef5556b09b6a34f9b33c65a9d47e8";
+const NEW_PAYLOAD_HASH: &str =
+    "blake3:cba3f8e817c5f802a01fcd6b9ce9e33435f21f26f6ad6577963ee68125010044";
+const FIRST_HASH: &str = "blake3:dbada8e50433646218ab917906cb7d5402e83c34fcd9c2ef6fd9069d04fbb494";
+const SECOND_HASH: &str = "blake3:a74e619132c4c530d0d738f3cceddefaf06a79aad18b5be1a3bcbc054c1f3f84";
 // Opaque planted prior-state token: it is not the hash of current file content.
 // Production treats it as ledger evidence rather than deriving it in this test.
-const BASELINE_HASH: &str = "3b2c67b04a2403e79a83f3a7aceb95116c1b4c8c1063f0271096c4810348f67d";
-const DECLARED_HASH: &str = "a23c9e491c7f53f7ce9ea426ce849525c4373091b668c3c8606ad8859a3b4670";
+// It still has to name an algorithm, because a witness that names none is
+// refused as an unreadable record rather than read as a mismatch.
+const BASELINE_HASH: &str =
+    "blake3:3b2c67b04a2403e79a83f3a7aceb95116c1b4c8c1063f0271096c4810348f67d";
+const DECLARED_HASH: &str =
+    "blake3:fe94c0fc24eb262d34a5c2fea3dbbbfd675c7f3f9eac08906e0e223a2093a5df";
 
 fn codes_json() -> &'static str {
     concat!(
@@ -147,7 +157,7 @@ fn record_json(
 fn plant_ledger(dir: &Path, canonical: &str, record: &str) {
     let state = dir.join("state");
     fs::create_dir_all(&state).expect("create state dir");
-    let mut text = String::from("{\"schemaVersion\":2,\"records\":{\"");
+    let mut text = String::from("{\"schemaVersion\":3,\"records\":{\"");
     text.push_str(canonical);
     text.push_str("\":");
     text.push_str(record);
@@ -370,8 +380,10 @@ fn a_stale_baseline_advances_as_recovery_without_a_conflict() {
             "owned",
             "writable",
             // Opaque planted mismatch token: it names no file content and is
-            // replaced when production advances the stale baseline.
-            Some("0000000000000000000000000000000000000000000000000000000000000000"),
+            // replaced when production advances the stale baseline. The
+            // algorithm tag is still required, since a witness naming none is
+            // refused as unreadable rather than treated as a stale baseline.
+            Some("blake3:0000000000000000000000000000000000000000000000000000000000000000"),
             None,
             3,
             None,
@@ -742,7 +754,8 @@ fn an_undeclared_pristine_writable_is_retired() {
     assert_eq!(ledger["records"].as_object().unwrap().len(), 0);
 }
 
-const USER_EDIT_HASH: &str = "5cac19b153577e104af440b1642d1a89dfcf3d1df00523d5c40ac5738136463a";
+const USER_EDIT_HASH: &str =
+    "blake3:7cd1f44542aa41323cd7aea0ae2952dddb46c28e84a6d07aa06c01e44aa5bb74";
 
 #[test]
 fn an_edited_writable_is_never_deleted_and_its_retirement_is_recorded() {
@@ -894,7 +907,7 @@ fn an_empty_manifest_retires_everything() {
     fs::write(
         state.join("applied-state.json"),
         format!(
-            "{{\"schemaVersion\":2,\"records\":{{\"test:{}\":{},\"test:{}\":{}}}}}",
+            "{{\"schemaVersion\":3,\"records\":{{\"test:{}\":{},\"test:{}\":{}}}}}",
             first.to_str().unwrap(),
             record_json(
                 &first,
@@ -1119,7 +1132,11 @@ fn a_transfer_from_writable_to_symlink_lands_when_the_destination_is_pristine() 
     // a path string is not content at the destination, so a symlink record
     // carries no baseline and its witness hashes the target string.
     assert_eq!(record["baselineHash"], serde_json::Value::Null);
-    assert_eq!(record["intendedWitnessHash"].as_str().unwrap().len(), 64);
+    // the target string is a test path, so the digest is not pinned here, but
+    // the witness still has to name the hash that produced it.
+    let witness = record["intendedWitnessHash"].as_str().unwrap();
+    assert!(witness.starts_with("blake3:"));
+    assert_eq!(witness.len(), "blake3:".len() + 64);
     assert_eq!(record["appliedOperationGeneration"], 3);
     assert_eq!(stage_files_in(&dir), 0);
 }

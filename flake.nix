@@ -45,9 +45,9 @@
           frozenSuites = pkgs.writeText "frozen-suites" ''
             fabf4b9da140655c60d55c564ff436bc  tests/characterization.rs
             aa87e6cecd892b86db64bc094f387986  tests/cli.rs
-            1d57dd44d08b4fca6f878b01df5e9afa  tests/crash_recovery.rs
-            9c69bcd104bad8e2dccb4b862ee129c7  tests/diagnostics.rs
-            337e2a50592af569e8d17aca34e98c2c  tests/lifecycle.rs
+            403cc68f9ad117a250e346daa5e9db9c  tests/crash_recovery.rs
+            09b761875c9fcd4c0a72813a3fde6287  tests/diagnostics.rs
+            5e3290f7fe394f082e65e1bcf0a52129  tests/lifecycle.rs
           '';
         in
         {

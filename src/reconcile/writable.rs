@@ -1,23 +1,27 @@
 use super::{
     AppliedOperation, CodeKey, ConflictPolicy, Context, DisplacedCleanup, Entry, Failure,
     LedgerRecord, LedgerState, OpenDestination, PendingIntent, REGULAR_MODE, ReconcileContext,
-    Result, RunIdentity, WRITABLE_FILE_MODE, baseline_for, cleanup_unpublished_after_failure,
-    fault_point, hash_regular, observe_kind, observe_mode, owned_record, pending_record,
-    profile_for, publish_writable_exchange, publish_writable_new, refreshed_record,
-    remove_unpublished_stage, run_executor, sha256_hex, stage_name, verify_writable_destination,
+    Result, RunIdentity, WRITABLE_FILE_MODE, algorithm_of, baseline_for,
+    cleanup_unpublished_after_failure, fault_point, hash_matches, hash_regular, observe_kind,
+    observe_mode, owned_record, pending_record, profile_for, publish_writable_exchange,
+    publish_writable_new, read_regular, refreshed_record, remove_unpublished_stage, run_executor,
+    stage_name, verify_writable_destination, witness,
 };
 use std::ffi::OsStr;
 use std::fs;
 use std::os::fd::OwnedFd;
 use std::path::Path;
 
-pub(super) fn hash_source(source: &str, destination: &str) -> Result<String> {
-    let bytes = fs::read(source).at(
+pub(super) fn read_source(source: &str, destination: &str) -> Result<Vec<u8>> {
+    fs::read(source).at(
         CodeKey::UnresolvableDesiredTarget,
         destination,
         "read-source-artifact",
-    )?;
-    Ok(sha256_hex(&bytes))
+    )
+}
+
+pub(super) fn hash_source(source: &str, destination: &str) -> Result<String> {
+    Ok(witness(&read_source(source, destination)?))
 }
 
 // the coordinator re-derives the staged content itself rather than trusting the
@@ -109,6 +113,11 @@ pub(super) struct WritableUpdate<'a> {
     pub(super) destination: &'a OpenDestination<'a>,
     pub(super) expected_displaced: &'a str,
     pub(super) intended: &'a str,
+    // whether the bytes about to be displaced are the ones furnish last wrote.
+    // the caller already decided this against the recorded baseline, and the
+    // baseline may name an older hash than the witness beside it, so re-deriving
+    // it here by comparing two strings would get it wrong.
+    pub(super) displaced_is_baseline: bool,
 }
 
 pub(super) fn publish_writable_update(
@@ -122,6 +131,7 @@ pub(super) fn publish_writable_update(
         destination: open,
         expected_displaced,
         intended,
+        displaced_is_baseline,
     } = update;
     let setpriv = context.setpriv;
     let ledger = &mut context.ledger;
@@ -152,9 +162,7 @@ pub(super) fn publish_writable_update(
         destination,
         expected_displaced,
         intended,
-        if entry.on_conflict == ConflictPolicy::SourceWins
-            && record.baseline_hash.as_deref() != Some(expected_displaced)
-        {
+        if entry.on_conflict == ConflictPolicy::SourceWins && !displaced_is_baseline {
             DisplacedCleanup::PolicyDisplaced
         } else {
             DisplacedCleanup::VerifiedOwned
@@ -189,7 +197,8 @@ pub(super) fn reconcile_writable_entry(
     let destination = open.destination();
     let parent = &open.parent;
     let name = open.name.as_os_str();
-    let intended = hash_source(&entry.retained_artifact_target, destination)?;
+    let source_bytes = read_source(&entry.retained_artifact_target, destination)?;
+    let intended = witness(&source_bytes);
     let record = ledger.record(canonical).cloned();
     let observed = observe_kind(parent, name, destination)?;
 
@@ -246,13 +255,14 @@ pub(super) fn reconcile_writable_entry(
                     "refusing a destination that is not a regular file",
                 ));
             }
-            let observed_hash = hash_regular(
+            let destination_bytes = read_regular(
                 parent,
                 name,
                 destination,
                 CodeKey::ContentVerification,
                 "read-destination",
             )?;
+            let observed_hash = witness(&destination_bytes);
             let Some(baseline) = record.baseline_hash.as_deref() else {
                 // absence of a baseline is not a diverged baseline. a record
                 // that cannot say what furnish last wrote cannot authorise
@@ -265,16 +275,44 @@ pub(super) fn reconcile_writable_entry(
                     "refusing to reconcile a writable destination with no recorded baseline",
                 ));
             };
-            let d_eq_s = observed_hash == intended;
-            let d_eq_b = observed_hash == baseline;
-            let s_eq_b = baseline == intended.as_str();
+            if algorithm_of(baseline).is_none() {
+                // a baseline this build cannot recompute is not a diverged
+                // baseline either. falling through would hand row four a
+                // two-sided divergence it invented out of not understanding the
+                // record, and row four is allowed to overwrite.
+                return Err(Failure::new(
+                    CodeKey::LedgerInvalid,
+                    destination,
+                    format!("recorded baseline {baseline} names no hash this build can compute"),
+                ));
+            }
+            // the baseline is checked by re-running the function that wrote it,
+            // which is what lets a schema 2 record keep its meaning while this
+            // run's own witnesses are blake3. the destination-to-source test
+            // needs no hash at all now that both sides are in hand, and bytes
+            // are a stronger answer than agreeing digests.
+            let d_eq_s = destination_bytes == source_bytes;
+            let d_eq_b = hash_matches(baseline, &destination_bytes);
+            let s_eq_b = hash_matches(baseline, &source_bytes);
+
+            // the three rows that publish nothing and re-state the record. in
+            // all three the baseline describes the source content, which this
+            // run holds, so the witness is rewritten under the current hash
+            // instead of carried forward. that is what retires the last schema 2
+            // value on a host whose destinations never need publishing again.
+            let settle = |ledger: &mut LedgerState| -> Result<()> {
+                let mut refreshed = refreshed_record(identity, entry, &record);
+                refreshed.baseline_hash = baseline_for(entry.representation, &intended);
+                refreshed.intended_witness_hash = Some(intended.clone());
+                ledger.commit(canonical, refreshed)
+            };
 
             if d_eq_s {
                 if s_eq_b {
                     // row one. nothing to publish, but the record is refreshed
                     // so that when this last reconciled has a live answer here
                     // and not only on the symlink steady-state path.
-                    ledger.commit(canonical, refreshed_record(identity, entry, &record))?;
+                    settle(ledger)?;
                     return Ok(());
                 }
                 // row five. the crash window after the destination was
@@ -300,7 +338,7 @@ pub(super) fn reconcile_writable_entry(
                 // row two. the source has not changed but the destination has,
                 // so a user edited the file after furnish wrote it. the edit
                 // is preserved and no reload is triggered.
-                ledger.commit(canonical, refreshed_record(identity, entry, &record))?;
+                settle(ledger)?;
                 return Ok(());
             }
 
@@ -320,6 +358,7 @@ pub(super) fn reconcile_writable_entry(
                             destination: open,
                             expected_displaced: &observed_hash,
                             intended: &intended,
+                            displaced_is_baseline: true,
                         },
                     )
                 };
@@ -346,6 +385,7 @@ pub(super) fn reconcile_writable_entry(
                             destination: open,
                             expected_displaced: &observed_hash,
                             intended: &intended,
+                            displaced_is_baseline: false,
                         },
                     )
                 }
@@ -355,11 +395,7 @@ pub(super) fn reconcile_writable_entry(
                     // settled decision instead of the same conflict again. the
                     // witness moves with it because every writable owned
                     // record in this file keeps the two equal.
-                    let mut refreshed = refreshed_record(identity, entry, &record);
-                    refreshed.baseline_hash = baseline_for(entry.representation, &intended);
-                    refreshed.intended_witness_hash = Some(intended.clone());
-                    ledger.commit(canonical, refreshed)?;
-                    Ok(())
+                    settle(ledger)
                 }
             }
         }

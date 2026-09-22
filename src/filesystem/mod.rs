@@ -11,7 +11,7 @@ const FILE_TYPE_MASK: u32 = 0o170000;
 pub(crate) const WRITABLE_FILE_MODE: u32 = 0o644;
 
 pub(crate) use observe::{
-    DestinationObservation, hash_regular, observe_kind, observe_mode, symlink_target,
+    DestinationObservation, hash_regular, observe_kind, observe_mode, read_regular, symlink_target,
     verify_writable_destination, verify_writable_hash,
 };
 pub(crate) use parent::{ParentMode, open_parent, walk_parent};

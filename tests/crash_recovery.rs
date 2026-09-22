@@ -31,10 +31,15 @@ fn os<'a>(args: &'a [&'a str]) -> Vec<&'a OsStr> {
     args.iter().map(OsStr::new).collect()
 }
 
-const OLD_PAYLOAD_HASH: &str = "6b53c9c192925718563767d10eb93b8940d8a9af8d9cc412b154d6209f5a1162";
-const NEW_PAYLOAD_HASH: &str = "47e398fd8b576f545397f4b4db4e470b55d4fbe4b4ca219fb0be6abf307e82d0";
-const FIRST_HASH: &str = "b640e840b19d378660b32fb51ae18d67dccb4a8596a29e7bd72c1b2ae5928f41";
-const SECOND_HASH: &str = "480c2336b410f1ad5f8bf1b28944490255804b65350c527787e74ebdd511e3a4";
+// Witnesses carry the name of the hash that produced them, and every witness a
+// schema 3 ledger holds is blake3. These are reference digests of the payloads
+// below, not values copied out of this crate's own output.
+const OLD_PAYLOAD_HASH: &str =
+    "blake3:0c2611ccc1f9773c37871e353b6efdf7584ef5556b09b6a34f9b33c65a9d47e8";
+const NEW_PAYLOAD_HASH: &str =
+    "blake3:cba3f8e817c5f802a01fcd6b9ce9e33435f21f26f6ad6577963ee68125010044";
+const FIRST_HASH: &str = "blake3:dbada8e50433646218ab917906cb7d5402e83c34fcd9c2ef6fd9069d04fbb494";
+const SECOND_HASH: &str = "blake3:a74e619132c4c530d0d738f3cceddefaf06a79aad18b5be1a3bcbc054c1f3f84";
 
 fn codes_json() -> &'static str {
     concat!(
@@ -148,7 +153,7 @@ fn prior_owned_json(
 fn plant_ledger(dir: &Path, canonical: &str, record: &str) {
     let state = dir.join("state");
     fs::create_dir_all(&state).expect("create state dir");
-    let mut text = String::from("{\"schemaVersion\":2,\"records\":{\"");
+    let mut text = String::from("{\"schemaVersion\":3,\"records\":{\"");
     text.push_str(canonical);
     text.push_str("\":");
     text.push_str(record);

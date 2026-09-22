@@ -20,11 +20,11 @@ use crate::filesystem::{
     DestinationObservation, DisplacedCleanup, ParentMode, REGULAR_MODE, SYMLINK_MODE,
     WRITABLE_FILE_MODE, cleanup_unpublished_after_failure, discard_displaced_under_policy,
     exchange_names, hash_regular, observe_kind, observe_mode, open_parent, publish_exchange,
-    publish_new, publish_writable_exchange, publish_writable_new, remove_unpublished_stage,
-    remove_verified_displaced, rollback_exchange, symlink_target, sync_parent,
-    verify_writable_destination, verify_writable_hash, walk_parent,
+    publish_new, publish_writable_exchange, publish_writable_new, read_regular,
+    remove_unpublished_stage, remove_verified_displaced, rollback_exchange, symlink_target,
+    sync_parent, verify_writable_destination, verify_writable_hash, walk_parent,
 };
-use crate::hash::sha256_hex;
+use crate::hash::{algorithm_of, matches as hash_matches, witness};
 use crate::identity::RunIdentity;
 use crate::ledger::{
     AppliedOperation, LedgerRecord, LedgerState, PendingIntent, RecordStatus, Representation,
@@ -94,7 +94,7 @@ pub(super) fn reconcile_entry(
     match observed {
         DestinationObservation::Missing => {
             let stage = stage_name(index);
-            let intended = sha256_hex(entry.retained_artifact_target.as_bytes());
+            let intended = witness(entry.retained_artifact_target.as_bytes());
             let prior = ledger.record(canonical).cloned();
             let applied_by = if prior.is_some() {
                 AppliedOperation::Repair
@@ -209,7 +209,7 @@ pub(super) fn reconcile_entry(
             )?;
 
             let stage = stage_name(index);
-            let intended = sha256_hex(entry.retained_artifact_target.as_bytes());
+            let intended = witness(entry.retained_artifact_target.as_bytes());
             fault_point("pre-pending");
             ledger.commit(
                 canonical,
@@ -365,7 +365,7 @@ mod tests {
     use super::*;
     use crate::diagnostic::DIAGNOSTIC_SCHEMA_VERSION;
     use crate::filesystem::FAIL_VERIFIED_DISPLACED_CLEANUP;
-    use crate::ledger::{AuthorityScope, LEDGER_FILE_NAME, LEDGER_ROLLBACK_FILE_NAME};
+    use crate::ledger::{AuthorityScope, LEDGER_FILE_NAME, rollback_file_name};
     use crate::manifest::{
         EXECUTOR_PROFILES, Executor, MANIFEST_SCHEMA_VERSION, NATIVE_EXECUTOR_IDENTITY,
         NATIVE_EXECUTOR_PROTOCOL, NATIVE_WRITABLE_IDENTITY, NATIVE_WRITABLE_PROTOCOL, Provenance,
@@ -508,7 +508,7 @@ mod tests {
             NATIVE_REPRESENTATION,
             &target,
             None,
-            Some(&sha256_hex(target.as_bytes())),
+            Some(&witness(target.as_bytes())),
             None,
         );
 
@@ -1173,7 +1173,7 @@ mod tests {
             destination.to_str().unwrap(),
             &source,
         );
-        let intended = sha256_hex(b"payload\n");
+        let intended = witness(b"payload\n");
         let mut ledger = test_ledger(&dir);
         plant_record(
             &mut ledger,
@@ -1208,7 +1208,7 @@ mod tests {
             destination.to_str().unwrap(),
             &source,
         );
-        let intended = sha256_hex(b"payload\n");
+        let intended = witness(b"payload\n");
         let mut ledger = test_ledger(&dir);
         plant_record(
             &mut ledger,
@@ -1243,7 +1243,7 @@ mod tests {
             destination.to_str().unwrap(),
             &source,
         );
-        let intended = sha256_hex(b"payload\n");
+        let intended = witness(b"payload\n");
         let mut ledger = test_ledger(&dir);
         plant_record(
             &mut ledger,
@@ -1276,7 +1276,7 @@ mod tests {
             destination.to_str().unwrap(),
             &source,
         );
-        let intended = sha256_hex(b"payload\n");
+        let intended = witness(b"payload\n");
         let mut ledger = test_ledger(&dir);
         plant_record(
             &mut ledger,
@@ -1311,7 +1311,7 @@ mod tests {
             destination.to_str().unwrap(),
             &source,
         );
-        let old_intended = sha256_hex(b"old payload\n");
+        let old_intended = witness(b"old payload\n");
         let mut ledger = test_ledger(&dir);
         plant_record(
             &mut ledger,
@@ -1374,7 +1374,7 @@ mod tests {
             .clone();
         assert_eq!(
             record.baseline_hash.as_deref(),
-            Some(sha256_hex(b"payload\n").as_str())
+            Some(witness(b"payload\n").as_str())
         );
         // the counter moves here, and moving it is not double counting. this row
         // is reachable only when the crashed run's owned commit never landed, so
@@ -1427,7 +1427,7 @@ mod tests {
             destination.to_str().unwrap(),
             &source,
         );
-        let intended = sha256_hex(b"payload\n");
+        let intended = witness(b"payload\n");
         let mut ledger = test_ledger(&dir);
         plant_transition_with_prior(
             &mut ledger,
@@ -1473,8 +1473,8 @@ mod tests {
             &entry,
             WRITABLE_REPRESENTATION,
             &source,
-            Some(&sha256_hex(b"payload\n")),
-            &sha256_hex(source.as_bytes()),
+            Some(&witness(b"payload\n")),
+            &witness(source.as_bytes()),
             stage,
         );
         let failure = recover_pending(&entry, &mut ledger, &RunIdentity::observe())
@@ -1512,8 +1512,8 @@ mod tests {
             &entry,
             WRITABLE_REPRESENTATION,
             &source,
-            Some(&sha256_hex(b"payload\n")),
-            &sha256_hex(source.as_bytes()),
+            Some(&witness(b"payload\n")),
+            &witness(source.as_bytes()),
             stage,
         );
         recover_pending(&entry, &mut ledger, &RunIdentity::observe())
@@ -1542,7 +1542,7 @@ mod tests {
         let mut record = identity.record(&entry, owned_status(AppliedOperation::New));
         record.status = owned_status(record.applied_by().expect("owned fixture operation"));
         record.representation = WRITABLE_REPRESENTATION;
-        record.baseline_hash = Some(sha256_hex(b"payload\n"));
+        record.baseline_hash = Some(witness(b"payload\n"));
         let outcome = retire_record(&record).expect("retirement is refused, not failed");
         // edited data is never deleted to satisfy cleanup, and the refusal is
         // recorded rather than thrown away.
@@ -1568,7 +1568,7 @@ mod tests {
         let mut record = identity.record(&entry, owned_status(AppliedOperation::New));
         record.status = owned_status(record.applied_by().expect("owned fixture operation"));
         record.representation = WRITABLE_REPRESENTATION;
-        record.baseline_hash = Some(sha256_hex(b"payload\n"));
+        record.baseline_hash = Some(witness(b"payload\n"));
         let outcome = retire_record(&record).expect("pristine retirement succeeds");
         assert!(matches!(outcome, RetireOutcome::Removed));
         assert!(!destination.exists());
@@ -1587,11 +1587,11 @@ mod tests {
         // refused before anything was touched, so the file is byte-identical and
         // no rollback copy was taken, because no migration was attempted.
         assert_eq!(fs::read_to_string(&ledger_path).unwrap(), payload);
-        assert!(!state.join(LEDGER_ROLLBACK_FILE_NAME).exists());
+        assert!(!state.join(rollback_file_name(99)).exists());
     }
 
     #[test]
-    fn a_v1_ledger_migrates_to_v2_and_leaves_rollback_evidence() {
+    fn a_v1_ledger_migrates_to_the_current_schema_and_leaves_rollback_evidence() {
         let dir = TestDir::new();
         let state = dir.path().join("state");
         fs::create_dir_all(&state).expect("create state directory");
@@ -1613,8 +1613,9 @@ mod tests {
         // writable did not exist in v1, so every v1 record is owned and symlink.
         assert!(record.is_owned());
         assert_eq!(record.representation, NATIVE_REPRESENTATION);
-        // the rollback copy is the evidence, and it is the untouched original.
-        let rollback = state.join(LEDGER_ROLLBACK_FILE_NAME);
+        // the rollback copy is the evidence, and it is the untouched original
+        // under the name of the schema it holds rather than the one it became.
+        let rollback = state.join(rollback_file_name(1));
         assert_eq!(fs::read_to_string(&rollback).unwrap(), original);
     }
 
@@ -1656,7 +1657,7 @@ mod tests {
         assert_eq!(record.applied_by(), Some(AppliedOperation::New));
         assert_eq!(
             record.intended_witness_hash.as_deref(),
-            Some(sha256_hex(b"first\n").as_str())
+            Some(witness(b"first\n").as_str())
         );
         assert!(record.stage_name().is_some());
         // there is no prior record to carry, so a first ownership is the one
@@ -1670,7 +1671,7 @@ mod tests {
     fn self_heal_takes_the_repair_route_and_carries_the_prior_counter() {
         let dir = TestDir::new();
         let source = write_source(&dir, "source", "payload\n");
-        let baseline = sha256_hex(b"payload\n");
+        let baseline = witness(b"payload\n");
         let destination = dir.path().join("value");
         let mut entry = sample_writable_entry(
             dir.path().to_str().unwrap(),
@@ -1713,7 +1714,7 @@ mod tests {
         let dir = TestDir::new();
         let source = write_source(&dir, "source", "second\n");
         let destination = plant_destination(&dir, "value", "first\n");
-        let baseline = sha256_hex(b"first\n");
+        let baseline = witness(b"first\n");
         let mut entry = sample_writable_entry(
             dir.path().to_str().unwrap(),
             destination.to_str().unwrap(),
@@ -1749,7 +1750,7 @@ mod tests {
         // state in which the two fields are allowed to differ.
         assert_eq!(
             record.intended_witness_hash.as_deref(),
-            Some(sha256_hex(b"second\n").as_str())
+            Some(witness(b"second\n").as_str())
         );
         assert_eq!(record.baseline_hash.as_deref(), Some(baseline.as_str()));
         assert_eq!(record.applied_operation_generation, PLANTED_GENERATION);
@@ -1766,7 +1767,7 @@ mod tests {
         let dir = TestDir::new();
         let source = write_source(&dir, "source", "declared\n");
         let destination = plant_destination(&dir, "value", "edited\n");
-        let baseline = sha256_hex(b"baseline\n");
+        let baseline = witness(b"baseline\n");
         let mut entry = sample_writable_entry(
             dir.path().to_str().unwrap(),
             destination.to_str().unwrap(),
@@ -1809,7 +1810,7 @@ mod tests {
         let dir = TestDir::new();
         let source = write_source(&dir, "source", "payload\n");
         let destination = plant_destination(&dir, "value", "payload\n");
-        let intended = sha256_hex(b"payload\n");
+        let intended = witness(b"payload\n");
         let entry = sample_writable_entry(
             dir.path().to_str().unwrap(),
             destination.to_str().unwrap(),
@@ -1849,7 +1850,7 @@ mod tests {
         let dir = TestDir::new();
         let source = write_source(&dir, "source", "payload\n");
         let destination = plant_destination(&dir, "value", "payload\n");
-        let intended = sha256_hex(b"payload\n");
+        let intended = witness(b"payload\n");
         let entry = sample_writable_entry(
             dir.path().to_str().unwrap(),
             destination.to_str().unwrap(),
@@ -1862,7 +1863,7 @@ mod tests {
             RecordStatusSeed::PendingApply(AppliedOperation::Repair),
             WRITABLE_REPRESENTATION,
             &source,
-            Some(&sha256_hex(b"older\n")),
+            Some(&witness(b"older\n")),
             Some(&intended),
             Some(".furnish.test.stage"),
         );
@@ -1891,7 +1892,7 @@ mod tests {
         let dir = TestDir::new();
         let source = write_source(&dir, "source", "second\n");
         let destination = plant_destination(&dir, "value", "second\n");
-        let intended = sha256_hex(b"second\n");
+        let intended = witness(b"second\n");
         let entry = sample_writable_entry(
             dir.path().to_str().unwrap(),
             destination.to_str().unwrap(),
@@ -1904,7 +1905,7 @@ mod tests {
             RecordStatusSeed::PendingApply(AppliedOperation::Update),
             WRITABLE_REPRESENTATION,
             &source,
-            Some(&sha256_hex(b"first\n")),
+            Some(&witness(b"first\n")),
             Some(&intended),
             Some(".furnish.test.stage"),
         );
@@ -1926,7 +1927,7 @@ mod tests {
         let dir = TestDir::new();
         let source = write_source(&dir, "source", "payload\n");
         let destination = plant_destination(&dir, "value", "payload\n");
-        let baseline = sha256_hex(b"payload\n");
+        let baseline = witness(b"payload\n");
         let entry = sample_writable_entry(
             dir.path().to_str().unwrap(),
             destination.to_str().unwrap(),
@@ -1969,7 +1970,7 @@ mod tests {
         let dir = TestDir::new();
         let source = write_source(&dir, "source", "payload\n");
         let destination = plant_destination(&dir, "value", "user edit\n");
-        let baseline = sha256_hex(b"payload\n");
+        let baseline = witness(b"payload\n");
         let entry = sample_writable_entry(
             dir.path().to_str().unwrap(),
             destination.to_str().unwrap(),
@@ -2008,7 +2009,7 @@ mod tests {
         let dir = TestDir::new();
         let source = write_source(&dir, "source", "declared\n");
         let destination = plant_destination(&dir, "value", "edited\n");
-        let intended = sha256_hex(b"declared\n");
+        let intended = witness(b"declared\n");
         let mut entry = sample_writable_entry(
             dir.path().to_str().unwrap(),
             destination.to_str().unwrap(),
@@ -2022,8 +2023,8 @@ mod tests {
             RecordStatusSeed::Owned(AppliedOperation::New),
             WRITABLE_REPRESENTATION,
             &source,
-            Some(&sha256_hex(b"baseline\n")),
-            Some(&sha256_hex(b"baseline\n")),
+            Some(&witness(b"baseline\n")),
+            Some(&witness(b"baseline\n")),
             None,
         );
         plant_generation(&mut ledger, &entry, PLANTED_GENERATION);
@@ -2065,8 +2066,8 @@ mod tests {
             RecordStatusSeed::Owned(AppliedOperation::New),
             WRITABLE_REPRESENTATION,
             &source,
-            Some(&sha256_hex(b"baseline\n")),
-            Some(&sha256_hex(b"baseline\n")),
+            Some(&witness(b"baseline\n")),
+            Some(&witness(b"baseline\n")),
             None,
         );
         plant_generation(&mut ledger, &entry, PLANTED_GENERATION);
@@ -2115,8 +2116,8 @@ mod tests {
             RecordStatusSeed::Owned(AppliedOperation::New),
             WRITABLE_REPRESENTATION,
             &settled_source,
-            Some(&sha256_hex(b"same\n")),
-            Some(&sha256_hex(b"same\n")),
+            Some(&witness(b"same\n")),
+            Some(&witness(b"same\n")),
             None,
         );
         reconcile_writable_at(&settled, setpriv, 0, &mut ledger, &identity)
@@ -2135,8 +2136,8 @@ mod tests {
             RecordStatusSeed::Owned(AppliedOperation::Update),
             WRITABLE_REPRESENTATION,
             &stale_source,
-            Some(&sha256_hex(b"before\n")),
-            Some(&sha256_hex(b"before\n")),
+            Some(&witness(b"before\n")),
+            Some(&witness(b"before\n")),
             None,
         );
         reconcile_writable_at(&stale, setpriv, 1, &mut ledger, &identity)
@@ -2156,8 +2157,8 @@ mod tests {
             RecordStatusSeed::Owned(AppliedOperation::New),
             WRITABLE_REPRESENTATION,
             &refused_source,
-            Some(&sha256_hex(b"baseline\n")),
-            Some(&sha256_hex(b"baseline\n")),
+            Some(&witness(b"baseline\n")),
+            Some(&witness(b"baseline\n")),
             None,
         );
         reconcile_writable_at(&refused, setpriv, 2, &mut ledger, &identity)
@@ -2176,8 +2177,8 @@ mod tests {
             RecordStatusSeed::PendingApply(AppliedOperation::Update),
             WRITABLE_REPRESENTATION,
             &recovered_source,
-            Some(&sha256_hex(b"before\n")),
-            Some(&sha256_hex(b"recovered\n")),
+            Some(&witness(b"before\n")),
+            Some(&witness(b"recovered\n")),
             Some(".furnish.test.stage"),
         );
         recover_pending(&recovered, &mut ledger, &identity).expect("the recovery route settles");
@@ -2220,14 +2221,14 @@ mod tests {
         let mut prior = identity.record(&restored, owned_status(AppliedOperation::New));
         prior.representation = NATIVE_REPRESENTATION;
         prior.applied_artifact_target = target.to_str().unwrap().to_owned();
-        prior.intended_witness_hash = Some(sha256_hex(target.to_str().unwrap().as_bytes()));
+        prior.intended_witness_hash = Some(witness(target.to_str().unwrap().as_bytes()));
         let mut pending = pending_record(
             &identity,
             &restored,
             PendingIntent::Transition(TransitionPair::from_target(restored.representation)),
             prior.owned(),
             OsStr::new(".furnish.test.stage"),
-            &sha256_hex(b"linked"),
+            &witness(b"linked"),
         );
         pending.representation = WRITABLE_REPRESENTATION;
         ledger
@@ -2239,7 +2240,7 @@ mod tests {
         assert_eq!(record.representation, NATIVE_REPRESENTATION);
         assert_eq!(
             record.intended_witness_hash.as_deref(),
-            Some(sha256_hex(target.to_str().unwrap().as_bytes()).as_str())
+            Some(witness(target.to_str().unwrap().as_bytes()).as_str())
         );
 
         // not written by a reconciliation. a record planted the way the v1
@@ -2268,11 +2269,8 @@ mod tests {
             // wrote, which today means migrated v1 records and records planted
             // before a publish. it is permitted here by name rather than by
             // silence, and it expires when the v1 migration path does.
-            if let Some(witness) = record.intended_witness_hash.as_deref() {
-                assert_eq!(
-                    witness,
-                    sha256_hex(record.applied_artifact_target.as_bytes())
-                );
+            if let Some(recorded) = record.intended_witness_hash.as_deref() {
+                assert_eq!(recorded, witness(record.applied_artifact_target.as_bytes()));
             }
         }
     }
@@ -2817,7 +2815,7 @@ mod tests {
                 NATIVE_REPRESENTATION,
                 "/nix/store/target",
                 None,
-                Some(&sha256_hex("/nix/store/target".as_bytes())),
+                Some(&witness("/nix/store/target".as_bytes())),
                 Some(".furnish.test.stage"),
             );
             let failure = recover_pending(&entry, &mut ledger, &RunIdentity::observe())
@@ -2869,7 +2867,7 @@ mod tests {
                 NATIVE_REPRESENTATION,
                 "/nix/store/target",
                 None,
-                Some(&sha256_hex("/nix/store/target".as_bytes())),
+                Some(&witness("/nix/store/target".as_bytes())),
                 None,
             );
             let failure = recover_pending(&entry, &mut ledger, &RunIdentity::observe())
@@ -2893,7 +2891,7 @@ mod tests {
             let dir = TestDir::new();
             let source = write_source(&dir, "source", "payload\n");
             let destination = plant_destination(&dir, "value", "payload\n");
-            let intended = sha256_hex(b"payload\n");
+            let intended = witness(b"payload\n");
             let entry = sample_writable_entry(
                 dir.path().to_str().unwrap(),
                 destination.to_str().unwrap(),
@@ -2906,7 +2904,7 @@ mod tests {
                 RecordStatusSeed::PendingApply(AppliedOperation::Update),
                 WRITABLE_REPRESENTATION,
                 &source,
-                Some(&sha256_hex(b"older\n")),
+                Some(&witness(b"older\n")),
                 Some(&intended),
                 Some(".furnish.test.stage"),
             );
@@ -2933,7 +2931,7 @@ mod tests {
             let dir = TestDir::new();
             let source = write_source(&dir, "source", "new payload\n");
             let destination = plant_destination(&dir, "value", "old payload\n");
-            let old_intended = sha256_hex(b"old payload\n");
+            let old_intended = witness(b"old payload\n");
             let mut entry = sample_writable_entry(
                 dir.path().to_str().unwrap(),
                 destination.to_str().unwrap(),
@@ -2969,7 +2967,7 @@ mod tests {
             assert_eq!(record.applied_by(), Some(AppliedOperation::Update));
             assert_eq!(
                 record.intended_witness_hash.as_deref(),
-                Some(sha256_hex(b"new payload\n").as_str())
+                Some(witness(b"new payload\n").as_str())
             );
             assert_eq!(record.baseline_hash.as_deref(), Some(old_intended.as_str()));
             assert_eq!(record.applied_operation_generation, PLANTED_GENERATION + 1);
@@ -2995,8 +2993,8 @@ mod tests {
                 RecordStatusSeed::PendingApply(AppliedOperation::Update),
                 WRITABLE_REPRESENTATION,
                 &source,
-                Some(&sha256_hex(b"old payload\n")),
-                Some(&sha256_hex(b"new payload\n")),
+                Some(&witness(b"old payload\n")),
+                Some(&witness(b"new payload\n")),
                 Some(stage),
             );
 
@@ -3027,7 +3025,7 @@ mod tests {
             let dir = TestDir::new();
             let source = write_source(&dir, "source", "second\n");
             let destination = plant_destination(&dir, "value", "first\n");
-            let baseline = sha256_hex(b"first\n");
+            let baseline = witness(b"first\n");
             let mut entry = sample_writable_entry(
                 dir.path().to_str().unwrap(),
                 destination.to_str().unwrap(),
@@ -3060,7 +3058,7 @@ mod tests {
             assert_eq!(record.applied_by(), Some(AppliedOperation::Update));
             assert_eq!(
                 record.intended_witness_hash.as_deref(),
-                Some(sha256_hex(b"second\n").as_str())
+                Some(witness(b"second\n").as_str())
             );
             assert_eq!(record.baseline_hash.as_deref(), Some(baseline.as_str()));
             assert_eq!(fs::read_to_string(&destination).unwrap(), "first\n");
@@ -3118,7 +3116,7 @@ mod tests {
                 &source,
             );
             let mut ledger = test_ledger(&dir);
-            let baseline = sha256_hex(b"payload\n");
+            let baseline = witness(b"payload\n");
             plant_record(
                 &mut ledger,
                 &entry,
@@ -3171,7 +3169,7 @@ mod tests {
                 &old_entry,
                 AppliedOperation::New,
                 None,
-                &sha256_hex(b"old payload\n"),
+                &witness(b"old payload\n"),
             );
             let pending = pending_record(
                 &identity,
@@ -3179,7 +3177,7 @@ mod tests {
                 PendingIntent::Apply(AppliedOperation::Update),
                 prior.owned(),
                 OsStr::new(".furnish.test.stage"),
-                &sha256_hex(b"new payload\n"),
+                &witness(b"new payload\n"),
             );
             let mut ledger = test_ledger(&dir);
             ledger
@@ -3194,7 +3192,7 @@ mod tests {
             assert_eq!(restored.representation, WRITABLE_REPRESENTATION);
             assert_eq!(
                 restored.baseline_hash.as_deref(),
-                Some(sha256_hex(b"old payload\n").as_str())
+                Some(witness(b"old payload\n").as_str())
             );
             assert!(restored.prior_owned().is_none());
             assert_eq!(fs::read(&destination).unwrap(), b"old payload\n");
@@ -3216,7 +3214,7 @@ mod tests {
                 &entry,
                 AppliedOperation::New,
                 None,
-                &sha256_hex(b"payload\n"),
+                &witness(b"payload\n"),
             );
             let pending = pending_record(
                 &identity,
@@ -3224,7 +3222,7 @@ mod tests {
                 PendingIntent::Apply(AppliedOperation::Update),
                 owned.owned(),
                 OsStr::new(".furnish.test.stage"),
-                &sha256_hex(b"next\n"),
+                &witness(b"next\n"),
             );
 
             let failure = retire_record(&pending).expect_err("pending retirement is refused");
@@ -3245,8 +3243,8 @@ mod tests {
                 &name,
                 OsStr::new("stage"),
                 "/dest",
-                &sha256_hex(b"recorded prior\n"),
-                &sha256_hex(b"intended\n"),
+                &witness(b"recorded prior\n"),
+                &witness(b"intended\n"),
             )
             .expect_err("restored destination must match prior evidence");
 
@@ -3284,8 +3282,8 @@ mod tests {
                 &entry,
                 AppliedOperation::Update,
                 &source,
-                &sha256_hex(b"old payload\n"),
-                &sha256_hex(b"new payload\n"),
+                &witness(b"old payload\n"),
+                &witness(b"new payload\n"),
                 stage,
             );
             let failure = recover_pending(&entry, &mut ledger, &RunIdentity::observe())
@@ -3302,11 +3300,11 @@ mod tests {
             assert!(record.is_owned());
             assert_eq!(
                 record.baseline_hash.as_deref(),
-                Some(sha256_hex(b"old payload\n").as_str())
+                Some(witness(b"old payload\n").as_str())
             );
             assert_eq!(
                 record.intended_witness_hash.as_deref(),
-                Some(sha256_hex(b"old payload\n").as_str())
+                Some(witness(b"old payload\n").as_str())
             );
         }
 
@@ -3329,8 +3327,8 @@ mod tests {
                 RecordStatusSeed::PendingApply(AppliedOperation::Update),
                 WRITABLE_REPRESENTATION,
                 &source,
-                Some(&sha256_hex(b"old payload\n")),
-                Some(&sha256_hex(b"new payload\n")),
+                Some(&witness(b"old payload\n")),
+                Some(&witness(b"new payload\n")),
                 Some(stage),
             );
 
@@ -3374,14 +3372,14 @@ mod tests {
             let mut prior = identity.record(&entry, owned_status(AppliedOperation::New));
             prior.applied_artifact_target = recorded_target.to_string_lossy().into_owned();
             prior.intended_witness_hash =
-                Some(sha256_hex(recorded_target.as_os_str().as_encoded_bytes()));
+                Some(witness(recorded_target.as_os_str().as_encoded_bytes()));
             let pending = pending_record(
                 &identity,
                 &entry,
                 PendingIntent::Apply(AppliedOperation::Update),
                 prior.owned(),
                 OsStr::new(stage),
-                &sha256_hex(desired_target.as_os_str().as_encoded_bytes()),
+                &witness(desired_target.as_os_str().as_encoded_bytes()),
             );
             ledger
                 .commit(&entry.filesystem_identity.canonical, pending)
@@ -3416,8 +3414,8 @@ mod tests {
                 &name,
                 OsStr::new("stage"),
                 "/dest",
-                sha256_hex(b"different\n").as_str(),
-                sha256_hex(b"staged\n").as_str(),
+                witness(b"different\n").as_str(),
+                witness(b"staged\n").as_str(),
                 DisplacedCleanup::VerifiedOwned,
             )
             .expect_err("a displaced mismatch reverses the exchange");
@@ -3445,8 +3443,8 @@ mod tests {
                 &name,
                 OsStr::new("stage"),
                 "/dest",
-                &sha256_hex(b"displaced\n"),
-                &sha256_hex(b"intended\n"),
+                &witness(b"displaced\n"),
+                &witness(b"intended\n"),
             )
             .expect_err("reverse exchange is injected to fail");
             unsafe {

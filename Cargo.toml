@@ -11,12 +11,31 @@ name = "furnish-coordinator"
 path = "src/main.rs"
 
 [dependencies]
-libc = "0.2"
+blake3 = "1.8.7"
 rustix = { version = "1.1.4", features = ["fs", "process"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+# transitional. this exists only to keep verifying baselines a schema 2 ledger
+# already wrote, and every commit rewrites the witness it checked as blake3, so
+# the first successful reconcile on a host retires its last sha-256 value. the
+# dependency comes out when no supported upgrade path can still present one.
+sha2 = { version = "0.11.0", default-features = false }
+# default features pull a caching layer and a logging facade for what is one
+# passwd lookup per declared user authority.
+uzers = { version = "0.12.2", default-features = false }
 
 # off by default so the crash points are absent from the shipped binary at
 # compile time rather than merely unreachable at runtime.
 [features]
 fault-injection = []
+
+# blake3 unoptimized is around two orders of magnitude slower than its release
+# build, which is enough to make a debug test run look like a hang. the rest of
+# the crate stays unoptimized so a debugger still has something to work with.
+[profile.dev.package.blake3]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

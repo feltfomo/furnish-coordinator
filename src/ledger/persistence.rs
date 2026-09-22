@@ -1,12 +1,10 @@
-use super::migration::{V1Record, migrate_v1};
+use super::migration::{V1Record, V2Record, migrate_v1, migrate_v2};
 use super::model::{
     AppliedOperation, LedgerRecord, ModelError, OWNED_STATE, PENDING_STATE, PendingIntent,
     PriorOwned, RecordStatus, ReloadEvidence, Representation, SYMLINK_REPRESENTATION,
     TRANSITION_MARKER, TransitionPair, UnresolvedRetirement,
 };
-use super::{
-    LEDGER_FILE_NAME, LEDGER_ROLLBACK_FILE_NAME, LEDGER_SCHEMA_VERSION, LEDGER_STAGE_PREFIX,
-};
+use super::{LEDGER_FILE_NAME, LEDGER_SCHEMA_VERSION, LEDGER_STAGE_PREFIX, rollback_file_name};
 use crate::diagnostic::{CodeKey, Context, Failure, Result};
 use rustix::fs::{Mode, OFlags, fsync, open};
 use serde::{Deserialize, Serialize};
@@ -184,11 +182,13 @@ impl LedgerState {
                 let version = on_disk_version.expect("existing ledger has a decoded version");
                 if version == LEDGER_SCHEMA_VERSION {
                     (decode_records(&bytes, &path)?, false)
-                } else if version == 1 {
-                    // the copy is the rollback evidence, and it is written before the
-                    // first v2 write so a downgrade always has the exact input the
-                    // migration consumed.
-                    let rollback = directory.join(LEDGER_ROLLBACK_FILE_NAME);
+                } else if version == 1 || version == 2 {
+                    // the copy is the rollback evidence, and it is written before
+                    // the first v3 write so a downgrade always has the exact input
+                    // the migration consumed. it is named for the schema it holds,
+                    // so a host arriving from v1 keeps the v1 bytes rather than
+                    // having them replaced by the v2 shape they passed through.
+                    let rollback = directory.join(rollback_file_name(version));
                     fs::write(&rollback, &bytes).at(
                         CodeKey::LedgerWriteFailed,
                         rollback.to_string_lossy(),
@@ -196,7 +196,14 @@ impl LedgerState {
                     )?;
                     let mut document: RawLedger = serde_json::from_slice(&bytes)
                         .map_err(|error| cannot_decode(&path, &error))?;
-                    migrate_v1(&mut document.schema_version, document.records.values_mut());
+                    // run as a chain rather than as a jump, so v1 has exactly one
+                    // description of how it becomes v2 and the witness naming does
+                    // not have to be repeated for a record that arrived by the
+                    // longer route.
+                    if document.schema_version == 1 {
+                        migrate_v1(&mut document.schema_version, document.records.values_mut());
+                    }
+                    migrate_v2(&mut document.schema_version, document.records.values_mut());
                     (validate_records(document, &path)?, true)
                 } else {
                     return Err(Failure::new(
@@ -368,6 +375,28 @@ impl V1Record for RawLedgerRecord {
 
     fn clear_unresolved_retirement(&mut self) {
         self.unresolved_retirement = None;
+    }
+}
+
+impl RawUnresolvedRetirement {
+    fn witnesses(&mut self) -> [&mut Option<String>; 2] {
+        [&mut self.observed_hash, &mut self.baseline_hash]
+    }
+}
+
+impl V2Record for RawLedgerRecord {
+    fn witnesses(&mut self) -> Vec<&mut Option<String>> {
+        let mut witnesses = vec![&mut self.baseline_hash, &mut self.intended_witness_hash];
+        if let Some(prior) = self.prior_owned.as_mut() {
+            witnesses.extend([&mut prior.baseline_hash, &mut prior.intended_witness_hash]);
+            if let Some(retirement) = prior.unresolved_retirement.as_mut() {
+                witnesses.extend(retirement.witnesses());
+            }
+        }
+        if let Some(retirement) = self.unresolved_retirement.as_mut() {
+            witnesses.extend(retirement.witnesses());
+        }
+        witnesses
     }
 }
 
@@ -633,7 +662,7 @@ mod tests {
 
         assert_eq!(
             fs::read(directory.join(LEDGER_FILE_NAME)).expect("read replaced ledger"),
-            br#"{"schemaVersion":2,"records":{}}"#
+            br#"{"schemaVersion":3,"records":{}}"#
         );
         assert!(!stage.exists());
         fs::remove_dir_all(directory).expect("remove persistence test directory");
@@ -716,10 +745,11 @@ mod tests {
         let directory = state_directory("exact-bytes");
         let mut ledger = empty_ledger(&directory);
         let mut record = sample_record(Representation::Writable);
-        // opaque serialization token, not a claimed content digest;
+        // opaque serialization token, not a claimed content digest, but carrying
+        // the algorithm tag production now writes so the pinned bytes include it;
         // production writes it unchanged into both JSON fields.
-        record.baseline_hash = Some("a".repeat(64));
-        record.intended_witness_hash = Some("a".repeat(64));
+        record.baseline_hash = Some(format!("blake3:{}", "a".repeat(64)));
+        record.intended_witness_hash = record.baseline_hash.clone();
         ledger
             .records
             .insert("test:/managed/value".to_owned(), record);
@@ -727,7 +757,7 @@ mod tests {
         ledger.write().expect("write exact record");
 
         let bytes = fs::read(directory.join(LEDGER_FILE_NAME)).expect("read ledger");
-        let expected = "{\"schemaVersion\":2,\"records\":{\"test:/managed/value\":{\"destination\":\"/managed/value\",\"appliedArtifactTarget\":\"/nix/store/target\",\"managedRoot\":\"/managed\",\"appliedBy\":\"new\",\"appliedGeneration\":null,\"lastSuccessfulReload\":{\"invocationId\":null,\"monotonicSeconds\":0.0},\"reloadActionIdentity\":null,\"bootId\":null,\"state\":\"owned\",\"representation\":\"writable\",\"baselineHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"intendedWitnessHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"appliedOperationGeneration\":0,\"stageName\":null,\"unresolvedRetirement\":null}}}";
+        let expected = "{\"schemaVersion\":3,\"records\":{\"test:/managed/value\":{\"destination\":\"/managed/value\",\"appliedArtifactTarget\":\"/nix/store/target\",\"managedRoot\":\"/managed\",\"appliedBy\":\"new\",\"appliedGeneration\":null,\"lastSuccessfulReload\":{\"invocationId\":null,\"monotonicSeconds\":0.0},\"reloadActionIdentity\":null,\"bootId\":null,\"state\":\"owned\",\"representation\":\"writable\",\"baselineHash\":\"blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"intendedWitnessHash\":\"blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"appliedOperationGeneration\":0,\"stageName\":null,\"unresolvedRetirement\":null}}}";
         assert_eq!(String::from_utf8(bytes).expect("utf8 ledger"), expected);
         fs::remove_dir_all(directory).expect("remove persistence test directory");
     }

@@ -4,7 +4,7 @@ use crate::manifest::Authority;
 use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 use std::env;
-use std::ffi::{CString, OsStr, OsString};
+use std::ffi::{OsStr, OsString};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
@@ -116,23 +116,21 @@ fn parse_evidence(bytes: &[u8]) -> Option<Cause<'static>> {
     })
 }
 
+// a passwd lookup through uzers rather than getpwnam directly, so the raw
+// pointer that the returned gid used to be read through is not this crate's
+// problem. an identity containing a null byte cannot name a passwd entry, so it
+// is refused the same way a missing entry is rather than being a separate error
+// the caller has to know about.
 fn primary_group_id(identity: &str, target: &str) -> Result<u32> {
-    let name = CString::new(identity).map_err(|_| {
-        Failure::new(
-            CodeKey::ExecutorFailed,
-            target,
-            "user authority identity contains a null byte",
-        )
-    })?;
-    let passwd = unsafe { libc::getpwnam(name.as_ptr()) };
-    if passwd.is_null() {
-        return Err(Failure::new(
-            CodeKey::ExecutorFailed,
-            target,
-            format!("cannot resolve primary group for user authority {identity}"),
-        ));
-    }
-    Ok(unsafe { (*passwd).pw_gid })
+    uzers::get_user_by_name(identity)
+        .map(|user| user.primary_group_id())
+        .ok_or_else(|| {
+            Failure::new(
+                CodeKey::ExecutorFailed,
+                target,
+                format!("cannot resolve primary group for user authority {identity}"),
+            )
+        })
 }
 
 pub(crate) fn launch(

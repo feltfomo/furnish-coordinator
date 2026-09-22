@@ -1,6 +1,6 @@
 use super::{FILE_TYPE_MASK, REGULAR_MODE, SYMLINK_MODE, WRITABLE_FILE_MODE};
 use crate::diagnostic::{CodeKey, Context, Failure, Result};
-use crate::hash::sha256_hex;
+use crate::hash::{algorithm_of, witness, witness_in};
 use rustix::fs::{AtFlags, Mode, OFlags, openat, readlinkat, statat};
 use rustix::io::Errno;
 use std::ffi::{OsStr, OsString};
@@ -99,7 +99,7 @@ pub(crate) fn observe_mode(parent: &OwnedFd, name: &OsStr, destination: &str) ->
     Ok(stat.st_mode & 0o7777)
 }
 
-fn read_regular(
+pub(crate) fn read_regular(
     parent: &OwnedFd,
     name: &OsStr,
     destination: &str,
@@ -127,13 +127,37 @@ pub(crate) fn hash_regular(
     key: CodeKey,
     operation: &'static str,
 ) -> Result<String> {
-    Ok(sha256_hex(&read_regular(
+    Ok(witness(&read_regular(
         parent,
         name,
         destination,
         key,
         operation,
     )?))
+}
+
+// the recorded witness decides how the destination is hashed, so a schema 2
+// baseline is still checked with the function that wrote it. a witness this
+// build cannot parse is reported as unreadable rather than as a mismatch,
+// because concluding that the bytes changed would be a claim about the
+// destination made on the strength of not understanding the record.
+pub(crate) fn hash_regular_against(
+    parent: &OwnedFd,
+    name: &OsStr,
+    destination: &str,
+    recorded: &str,
+    key: CodeKey,
+    operation: &'static str,
+) -> Result<String> {
+    let Some(algorithm) = algorithm_of(recorded) else {
+        return Err(Failure::new(
+            CodeKey::LedgerInvalid,
+            destination,
+            format!("recorded witness {recorded} names no hash this build can compute"),
+        ));
+    };
+    let bytes = read_regular(parent, name, destination, key, operation)?;
+    Ok(witness_in(algorithm, &bytes))
 }
 
 pub(crate) fn verify_writable_hash(
@@ -150,10 +174,11 @@ pub(crate) fn verify_writable_hash(
             "transaction side is not the recorded regular file",
         ));
     }
-    let observed = hash_regular(
+    let observed = hash_regular_against(
         parent,
         name,
         destination,
+        expected,
         CodeKey::PendingRecovery,
         operation,
     )?;
@@ -180,10 +205,11 @@ pub(crate) fn verify_writable_destination(
             "published destination is not a regular file",
         ));
     }
-    let observed = hash_regular(
+    let observed = hash_regular_against(
         parent,
         name,
         destination,
+        intended_hash,
         CodeKey::ContentVerification,
         "read-published",
     )?;
