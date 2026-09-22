@@ -4,11 +4,11 @@
 
 ## Ledger document
 
-The current schema is version 2:
+The current schema is version 3:
 
 ```json
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "records": {
     "namespace:/absolute/destination": {
       "destination": "/absolute/destination",
@@ -24,8 +24,8 @@ The current schema is version 2:
       "bootId": "...",
       "state": "owned",
       "representation": "writable",
-      "baselineHash": "...",
-      "intendedWitnessHash": "...",
+      "baselineHash": "blake3:...",
+      "intendedWitnessHash": "blake3:...",
       "appliedOperationGeneration": 1,
       "stageName": null,
       "unresolvedRetirement": null
@@ -35,6 +35,12 @@ The current schema is version 2:
 ```
 
 Records are ordered by canonical identity through a `BTreeMap`, producing deterministic bytes.
+
+## Witness naming
+
+Every recorded digest carries its algorithm as an `algorithm:hex` prefix, so a record is verified with the function that produced it rather than with whatever the coordinator happens to prefer today. New witnesses are written as `blake3:`. A `sha256:` witness is still read and compared, and it is rewritten as `blake3:` the first time the entry settles.
+
+A bare 64-character hex digest with no prefix is read as `sha256:`, because that is what pre-v3 ledgers contain. A witness with an unrecognized prefix is refused as `ledger-invalid` rather than guessed at, since guessing wrong turns an equal destination into a reported divergence.
 
 ## Record states
 
@@ -135,7 +141,7 @@ Important convergent states include:
 
 Every write:
 
-1. serializes the complete v2 document;
+1. serializes the complete v3 document;
 1. writes a sibling `.applied-state.<pid>.stage` file;
 1. forces mode `0644` and verifies it;
 1. writes and syncs the bytes;
@@ -146,13 +152,16 @@ The state directory is created or normalized to `0755`. An existing stale ledger
 
 ## Schema migration
 
-Version 1 records migrate to version 2 as owned symlinks. Transaction and retirement-only fields are cleared. Before the first v2 write, the exact v1 input is retained as:
+Version 1 records migrate to version 2 as owned symlinks, clearing transaction and retirement-only fields. Version 2 records migrate to version 3 by naming every bare witness `sha256:`, including the copies nested in `priorOwned` and in both `unresolvedRetirement` positions. A v1 ledger runs the two steps as a chain, so the v1 description is written once and the naming is not repeated for records that arrive by the longer route.
+
+Before the first v3 write, the exact input is retained under the schema it holds:
 
 ```text
 applied-state.v1.json
+applied-state.v2.json
 ```
 
-A ledger newer than version 2 is refused before mutation. Unknown, malformed, or unsupported record fields are validated into the typed model rather than silently interpreted.
+A ledger newer than version 3 is refused before mutation. Unknown, malformed, or unsupported record fields are validated into the typed model rather than silently interpreted.
 
 ## Unresolved retirement
 

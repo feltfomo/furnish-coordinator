@@ -51,13 +51,13 @@ Runs only with `fault-injection`. It causes real process aborts at transaction b
 
 Module-local tests cover:
 
-- exact SHA-256 answers, including padding boundaries;
+- exact blake3 and sha256 answers, and the rules for naming, reading, and refusing witnesses;
 - CLI parser compatibility;
 - strict bounded worker evidence;
 - lock serialization and `NOFOLLOW` behavior;
 - manifest profile uniqueness and duplicate destinations;
 - ledger model transitions and exact serialization;
-- v1 migration and rollback evidence;
+- v1 and v2 migration, including nested witnesses, and rollback evidence;
 - stale ledger-stage replacement and exact modes;
 - destination observation and stage cleanup;
 - transition gating and recovery edge cases;

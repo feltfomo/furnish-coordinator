@@ -132,7 +132,7 @@ For a runtime incident, collect:
 
 1. the exact JSON diagnostic line or lines;
 1. the active manifest;
-1. `applied-state.json` and any `applied-state.v1.json` rollback copy;
+1. `applied-state.json` and any `applied-state.v<schema>.json` rollback copy;
 1. destination type, target or content hash, and mode;
 1. any sibling `.furnish.*.stage` object;
 1. current system generation and service invocation context.

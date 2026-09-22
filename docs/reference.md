@@ -43,9 +43,11 @@ Worker grammar is strict. Unknown, repeated, malformed, or incomplete pairs fail
 | --- | --- |
 | Manifest schema | `2` |
 | Diagnostic schema | `1` |
-| Ledger schema | `2` |
+| Ledger schema | `3` |
 | Ledger file | `applied-state.json` |
-| v1 rollback file | `applied-state.v1.json` |
+| Rollback file | `applied-state.v<schema>.json` |
+| Witness algorithm written | `blake3` |
+| Witness algorithms read | `blake3`, `sha256`, untagged hex as `sha256` |
 | Default lock directory | `/run/lock` |
 
 ## Executor profiles

@@ -365,6 +365,7 @@ mod tests {
     use super::*;
     use crate::diagnostic::DIAGNOSTIC_SCHEMA_VERSION;
     use crate::filesystem::FAIL_VERIFIED_DISPLACED_CLEANUP;
+    use crate::hash::{Algorithm, witness_in};
     use crate::ledger::{AuthorityScope, LEDGER_FILE_NAME, rollback_file_name};
     use crate::manifest::{
         EXECUTOR_PROFILES, Executor, MANIFEST_SCHEMA_VERSION, NATIVE_EXECUTOR_IDENTITY,
@@ -1963,6 +1964,136 @@ mod tests {
             record.intended_witness_hash.as_deref(),
             Some(baseline.as_str())
         );
+    }
+
+    // the three tests below are the ones that matter for the schema 2 upgrade.
+    // a baseline written by sha-256 has to keep producing the same verdict it
+    // produced before the algorithm changed, and then stop being sha-256.
+
+    #[test]
+    fn a_legacy_sha256_baseline_settles_and_is_rewritten_as_blake3() {
+        let dir = TestDir::new();
+        let source = write_source(&dir, "source", "payload\n");
+        let destination = plant_destination(&dir, "value", "payload\n");
+        // exactly what a migrated schema 2 record carries: the old digest with
+        // its algorithm named, and nothing about it recomputed.
+        let legacy = witness_in(Algorithm::Sha256, b"payload\n");
+        let entry = sample_writable_entry(
+            dir.path().to_str().unwrap(),
+            destination.to_str().unwrap(),
+            &source,
+        );
+        let mut ledger = test_ledger(&dir);
+        plant_record(
+            &mut ledger,
+            &entry,
+            RecordStatusSeed::Owned(AppliedOperation::New),
+            WRITABLE_REPRESENTATION,
+            &source,
+            Some(&legacy),
+            Some(&legacy),
+            None,
+        );
+        plant_generation(&mut ledger, &entry, PLANTED_GENERATION);
+        reconcile_writable_at(
+            &entry,
+            Path::new("/nonexistent/setpriv"),
+            0,
+            &mut ledger,
+            &RunIdentity::observe(),
+        )
+        .expect("a legacy baseline still settles");
+        let record = committed(&ledger, &entry);
+        // still a steady state, so nothing was published and the counter is
+        // untouched. a build that hashed the destination with its own preferred
+        // function instead would have read this as a two-sided divergence.
+        assert!(record.is_owned());
+        assert_eq!(record.applied_operation_generation, PLANTED_GENERATION);
+        // and the record no longer names sha-256, so the next run never has to
+        // compute it. this is what retires the transitional dependency.
+        let rewritten = witness(b"payload\n");
+        assert_eq!(record.baseline_hash.as_deref(), Some(rewritten.as_str()));
+        assert_eq!(
+            record.intended_witness_hash.as_deref(),
+            Some(rewritten.as_str())
+        );
+    }
+
+    #[test]
+    fn a_legacy_sha256_baseline_still_sees_a_runtime_edit() {
+        let dir = TestDir::new();
+        let source = write_source(&dir, "source", "payload\n");
+        let destination = plant_destination(&dir, "value", "user edit\n");
+        let legacy = witness_in(Algorithm::Sha256, b"payload\n");
+        let entry = sample_writable_entry(
+            dir.path().to_str().unwrap(),
+            destination.to_str().unwrap(),
+            &source,
+        );
+        let mut ledger = test_ledger(&dir);
+        plant_record(
+            &mut ledger,
+            &entry,
+            RecordStatusSeed::Owned(AppliedOperation::New),
+            WRITABLE_REPRESENTATION,
+            &source,
+            Some(&legacy),
+            Some(&legacy),
+            None,
+        );
+        plant_generation(&mut ledger, &entry, PLANTED_GENERATION);
+        reconcile_writable_at(
+            &entry,
+            Path::new("/nonexistent/setpriv"),
+            0,
+            &mut ledger,
+            &RunIdentity::observe(),
+        )
+        .expect("a legacy baseline still preserves an edit");
+        // the edit survives, which is the half that proves the settle above was
+        // a real match and not the algorithm mismatch passing by accident.
+        assert_eq!(fs::read(&destination).unwrap(), b"user edit\n");
+        let record = committed(&ledger, &entry);
+        assert_eq!(record.applied_operation_generation, PLANTED_GENERATION);
+        assert_eq!(
+            record.baseline_hash.as_deref(),
+            Some(witness(b"payload\n").as_str())
+        );
+    }
+
+    #[test]
+    fn a_baseline_naming_no_known_hash_is_refused_rather_than_read_as_divergence() {
+        let dir = TestDir::new();
+        let source = write_source(&dir, "source", "payload\n");
+        let destination = plant_destination(&dir, "value", "payload\n");
+        let entry = sample_writable_entry(
+            dir.path().to_str().unwrap(),
+            destination.to_str().unwrap(),
+            &source,
+        );
+        let mut ledger = test_ledger(&dir);
+        plant_record(
+            &mut ledger,
+            &entry,
+            RecordStatusSeed::Owned(AppliedOperation::New),
+            WRITABLE_REPRESENTATION,
+            &source,
+            Some("md5:0123456789abcdef0123456789abcdef"),
+            Some("md5:0123456789abcdef0123456789abcdef"),
+            None,
+        );
+        let failure = reconcile_writable_at(
+            &entry,
+            Path::new("/nonexistent/setpriv"),
+            0,
+            &mut ledger,
+            &RunIdentity::observe(),
+        )
+        .expect_err("an uncomputable baseline is refused");
+        // not a conflict. a conflict would mean the bytes were compared and
+        // found to differ, and under the error policy row four is entitled to
+        // overwrite. nothing here was compared at all.
+        assert!(matches!(failure.key, CodeKey::LedgerInvalid));
     }
 
     #[test]

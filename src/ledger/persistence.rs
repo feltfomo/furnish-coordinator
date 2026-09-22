@@ -761,4 +761,102 @@ mod tests {
         assert_eq!(String::from_utf8(bytes).expect("utf8 ledger"), expected);
         fs::remove_dir_all(directory).expect("remove persistence test directory");
     }
+
+    #[test]
+    fn a_v2_ledger_names_every_witness_and_keeps_the_original_bytes_for_rollback() {
+        // the nested witnesses matter more than the top-level pair. a record
+        // caught mid-transition carries digests in three places, and any one
+        // left untagged would later be read as blake3 and compared against a
+        // sha256 value it can never equal.
+        let directory = state_directory("v2-migration");
+        let path = directory.join(LEDGER_FILE_NAME);
+        let hex = |seed: char| seed.to_string().repeat(64);
+        let named = |seed: char| format!("sha256:{}", hex(seed));
+        let planted = serde_json::json!({
+            "schemaVersion": 2,
+            "records": {
+                "test:/managed/owned": {
+                    "destination": "/managed/owned",
+                    "appliedArtifactTarget": "/nix/store/owned",
+                    "managedRoot": "/managed",
+                    "appliedBy": "new",
+                    "appliedGeneration": null,
+                    "lastSuccessfulReload": {"invocationId": null, "monotonicSeconds": 0.0},
+                    "reloadActionIdentity": null,
+                    "bootId": null,
+                    "state": "owned",
+                    "representation": "writable",
+                    "baselineHash": hex('a'),
+                    "intendedWitnessHash": hex('b'),
+                    "appliedOperationGeneration": 0,
+                    "stageName": null,
+                    "unresolvedRetirement": {
+                        "reason": "divergent",
+                        "observedHash": hex('c'),
+                        "baselineHash": hex('d')
+                    }
+                },
+                "test:/managed/pending": {
+                    "destination": "/managed/pending",
+                    "appliedArtifactTarget": "/nix/store/pending",
+                    "managedRoot": "/managed",
+                    "appliedBy": "new",
+                    "appliedGeneration": null,
+                    "lastSuccessfulReload": {"invocationId": null, "monotonicSeconds": 0.0},
+                    "reloadActionIdentity": null,
+                    "bootId": null,
+                    "state": "pending",
+                    "representation": "writable",
+                    "baselineHash": null,
+                    "intendedWitnessHash": null,
+                    "appliedOperationGeneration": 1,
+                    "stageName": "pending.stage",
+                    "priorOwned": {
+                        "destination": "/managed/pending",
+                        "appliedArtifactTarget": "/nix/store/prior",
+                        "managedRoot": "/managed",
+                        "appliedBy": "new",
+                        "appliedGeneration": null,
+                        "lastSuccessfulReload": {"invocationId": null, "monotonicSeconds": 0.0},
+                        "reloadActionIdentity": null,
+                        "bootId": null,
+                        "representation": "writable",
+                        "baselineHash": hex('e'),
+                        "intendedWitnessHash": hex('f'),
+                        "appliedOperationGeneration": 0,
+                        "unresolvedRetirement": {
+                            "reason": "divergent",
+                            "observedHash": hex('0'),
+                            "baselineHash": hex('1')
+                        }
+                    }
+                }
+            }
+        })
+        .to_string();
+        fs::write(&path, &planted).expect("plant v2 ledger");
+
+        let state = LedgerState::load(&directory).expect("load and migrate v2 ledger");
+
+        assert_eq!(
+            fs::read(directory.join("applied-state.v2.json")).expect("read rollback copy"),
+            planted.as_bytes()
+        );
+        let rewritten: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read migrated ledger"))
+                .expect("decode migrated ledger");
+        assert_eq!(rewritten["schemaVersion"], 3);
+        let owned = &rewritten["records"]["test:/managed/owned"];
+        assert_eq!(owned["baselineHash"], named('a'));
+        assert_eq!(owned["intendedWitnessHash"], named('b'));
+        assert_eq!(owned["unresolvedRetirement"]["observedHash"], named('c'));
+        assert_eq!(owned["unresolvedRetirement"]["baselineHash"], named('d'));
+        let prior = &rewritten["records"]["test:/managed/pending"]["priorOwned"];
+        assert_eq!(prior["baselineHash"], named('e'));
+        assert_eq!(prior["intendedWitnessHash"], named('f'));
+        assert_eq!(prior["unresolvedRetirement"]["observedHash"], named('0'));
+        assert_eq!(prior["unresolvedRetirement"]["baselineHash"], named('1'));
+        assert!(state.record("test:/managed/pending").is_some());
+        fs::remove_dir_all(directory).expect("remove persistence test directory");
+    }
 }
