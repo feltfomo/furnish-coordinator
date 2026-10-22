@@ -45,7 +45,7 @@ pub(super) fn transition_representation(
                 "refusing to transfer a destination that is not the link recorded as furnish-owned",
             ));
         }
-        let intended = hash_source(&entry.retained_artifact_target, destination)?;
+        let intended = hash_source(entry.target.path(), destination)?;
         return Publication {
             entry,
             identity,
@@ -99,8 +99,8 @@ pub(super) fn transition_representation(
             "refusing to transfer a writable destination that no longer matches its baseline",
         ));
     }
-    let expected = OsStr::new(&entry.retained_artifact_target);
-    let intended = witness(entry.retained_artifact_target.as_bytes());
+    let expected = OsStr::new(entry.target.path());
+    let intended = witness(entry.target.path().as_bytes());
     Publication {
         entry,
         identity,

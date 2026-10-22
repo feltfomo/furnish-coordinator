@@ -52,7 +52,7 @@ pub(super) fn stage_writable(
         setpriv,
         parent,
         stage,
-        &entry.retained_artifact_target,
+        entry.target.path(),
         &entry.authority,
         profile,
     )?;
@@ -253,7 +253,7 @@ pub(super) fn reconcile_writable_entry(
     let destination = open.destination();
     let parent = &open.parent;
     let name = open.name.as_os_str();
-    let source_bytes = read_source(&entry.retained_artifact_target, destination)?;
+    let source_bytes = read_source(entry.target.path(), destination)?;
     let intended = witness(&source_bytes);
     let record = ledger.record(canonical).cloned();
     let observed = observe_kind(parent, name, destination)?;

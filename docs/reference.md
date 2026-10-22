@@ -114,7 +114,8 @@ Worker grammar is strict. Unknown, repeated, malformed, or incomplete pairs fail
 
 | Contract | Value |
 | --- | --- |
-| Manifest schema | `2` |
+| Manifest schema written | `3` |
+| Manifest schemas accepted | `2`, `3` |
 | Diagnostic schema | `1` |
 | Ledger schema | `3` |
 | Ledger file | `applied-state.json` |
@@ -144,7 +145,8 @@ authority.identity
 managedRoot
 onConflict
 representation
-retainedArtifactTarget
+target.kind
+target.path
 executor.identity
 executor.protocolVersion
 cleanupStrategy
@@ -160,6 +162,11 @@ Canonical identity must be exactly:
 ```
 
 Authority scope is `user` or `system`. Conflict policy is `error`, `source-wins`, or `runtime-wins`.
+
+Schema 3 targets are `{ "kind": "retained" | "external", "path": "..." }`.
+External targets require `symlink` and a normalized absolute path distinct from the destination. The target may be absent and is never opened for reconciliation. Schema 2 manifests retain their `retainedArtifactTarget` field and decode as retained sources. Mixed target fields or entry/manifest schema versions are refused. The ledger stays at schema 3 because it records the published link text and representation independently of source retention.
+
+Host verbs accept `--diagnostic-format plain|json`. JSON is the default. Plain output includes severity, diagnostic code, destination, message and any cause or provenance, with the same exit status. Lexicon selects plain output for activation and its service.
 
 ## Ledger record fields
 

@@ -37,7 +37,7 @@ impl RunIdentity {
     pub(crate) fn record(&self, entry: &Entry, status: RecordStatus) -> LedgerRecord {
         LedgerRecord {
             destination: entry.filesystem_identity.destination.clone(),
-            applied_artifact_target: entry.retained_artifact_target.clone(),
+            applied_artifact_target: entry.target.path().to_owned(),
             managed_root: entry.managed_root.clone(),
             representation: entry.representation,
             baseline_hash: None,
@@ -68,7 +68,7 @@ mod tests {
     fn run_identity_links_every_record_to_the_current_system_generation() {
         let identity = RunIdentity::observe();
         let entry = Entry {
-            schema_version: 2,
+            schema_version: crate::manifest::MANIFEST_SCHEMA_VERSION,
             filesystem_identity: FilesystemIdentity {
                 namespace: "test".to_owned(),
                 destination: "/managed/value".to_owned(),
@@ -81,7 +81,7 @@ mod tests {
             managed_root: "/managed".to_owned(),
             on_conflict: ConflictPolicy::Error,
             representation: Representation::Symlink,
-            retained_artifact_target: "/desired/target".to_owned(),
+            target: crate::target::Target::Retained("/desired/target".to_owned()),
             executor: Executor {
                 identity: NATIVE_EXECUTOR_IDENTITY.to_owned(),
                 protocol_version: NATIVE_EXECUTOR_PROTOCOL,

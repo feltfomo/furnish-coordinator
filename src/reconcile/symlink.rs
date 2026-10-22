@@ -103,7 +103,7 @@ pub(super) fn stage_symlink(
         setpriv,
         parent,
         stage,
-        &entry.retained_artifact_target,
+        entry.target.path(),
         &entry.authority,
         profile,
     )?;

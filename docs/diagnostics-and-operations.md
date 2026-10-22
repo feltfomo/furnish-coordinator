@@ -1,6 +1,6 @@
 # Diagnostics and operations
 
-The coordinator writes one-line JSON diagnostics to stderr. Successful runs are normally silent, except that an unresolved retirement is a warning and still exits successfully.
+The coordinator writes one-line JSON diagnostics to stderr by default. Host verbs accept `--diagnostic-format plain` for terminal and journal output. Lexicon selects that format during activation and service reconciliation. Both formats use the same diagnostic data and exit classes; plain output also renders cause, provenance and conflict hashes when present. Successful runs are normally silent, except that an unresolved retirement is a warning and still exits successfully.
 
 ## Bootstrap diagnostics
 

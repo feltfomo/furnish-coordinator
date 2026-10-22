@@ -33,7 +33,11 @@ The operation is classified as:
 - `update` when the recorded target still resolves;
 - `repair` when the recorded target was reaped.
 
-The desired target must resolve before republishing. This avoids manufacturing a broken link while attempting repair.
+For a retained source, the desired target must resolve before republishing. This avoids manufacturing a broken link while attempting repair.
+
+External targets are literal link text. They may name files, directories or paths that do not exist yet. Furnish never reads their contents or tests their availability. Exchanging an owned external link is an `update`; repairing an absent destination is still a `repair`. Edits, creation or disappearance at the external target do not trigger publication.
+
+Both source kinds share staging, exact link verification, pending transactions and retirement. Retirement unlinks only a destination still matching its ownership record. It never traverses or removes the target. A matching pre-existing link remains unowned, including when it points to an external checkout.
 
 ## Writable lifecycle
 

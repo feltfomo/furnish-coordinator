@@ -1,11 +1,12 @@
 use crate::diagnostic::{CodeKey, DIAGNOSTIC_SCHEMA_VERSION, Failure, Result};
 use crate::executor::WorkerProgram;
 use crate::ledger::{AuthorityScope, Representation};
+use crate::target::Target;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::{Component, Path};
 
-pub(crate) const MANIFEST_SCHEMA_VERSION: u64 = 2;
+pub(crate) const MANIFEST_SCHEMA_VERSION: u64 = 3;
 pub(crate) const NATIVE_EXECUTOR_IDENTITY: &str = "furnish/native-symlink";
 pub(crate) const NATIVE_EXECUTOR_PROTOCOL: u64 = 1;
 pub(crate) const NATIVE_REPRESENTATION: Representation = Representation::Symlink;
@@ -134,7 +135,7 @@ pub(crate) struct Entry {
     pub(crate) managed_root: String,
     pub(crate) on_conflict: ConflictPolicy,
     pub(crate) representation: Representation,
-    pub(crate) retained_artifact_target: String,
+    pub(crate) target: Target,
     pub(crate) executor: Executor,
     pub(crate) cleanup_strategy: String,
     pub(crate) self_heal_strategy: String,
@@ -199,7 +200,8 @@ struct RawEntry {
     managed_root: String,
     on_conflict: ConflictPolicy,
     representation: String,
-    retained_artifact_target: String,
+    retained_artifact_target: Option<String>,
+    target: Option<Target>,
     executor: RawExecutor,
     cleanup_strategy: String,
     self_heal_strategy: String,
@@ -232,12 +234,12 @@ pub(crate) fn decode_manifest(bytes: &[u8]) -> serde_json::Result<DecodedManifes
 
 pub(crate) fn validate_manifest(decoded: DecodedManifest) -> Result<Manifest> {
     let raw = decoded.0;
-    if raw.schema_version != MANIFEST_SCHEMA_VERSION {
+    if !matches!(raw.schema_version, 2 | MANIFEST_SCHEMA_VERSION) {
         return Err(Failure::new(
             CodeKey::InvalidManifest,
             "manifest",
             format!(
-                "manifest schema {} is unsupported; expected {}",
+                "manifest schema {} is unsupported; expected 2 or {}",
                 raw.schema_version, MANIFEST_SCHEMA_VERSION
             ),
         ));
@@ -256,7 +258,7 @@ pub(crate) fn validate_manifest(decoded: DecodedManifest) -> Result<Manifest> {
     let mut canonicals = BTreeSet::new();
     let mut destinations = BTreeSet::new();
     for entry in raw.entries {
-        if entry.schema_version != MANIFEST_SCHEMA_VERSION {
+        if entry.schema_version != raw.schema_version {
             return Err(Failure::new(
                 CodeKey::InvalidManifest,
                 &entry.filesystem_identity.canonical,
@@ -346,6 +348,25 @@ pub(crate) fn validate_manifest(decoded: DecodedManifest) -> Result<Manifest> {
                 "physical destination is declared more than once",
             ));
         }
+        let target = match (
+            raw.schema_version,
+            entry.retained_artifact_target,
+            entry.target,
+        ) {
+            (2, Some(path), None) => Target::Retained(path),
+            (MANIFEST_SCHEMA_VERSION, None, Some(target)) => target,
+            _ => {
+                return Err(Failure::new(
+                    CodeKey::InvalidManifest,
+                    &entry.filesystem_identity.canonical,
+                    "target fields do not match the manifest schema",
+                ));
+            }
+        };
+        target.validate(
+            profile.representation,
+            &entry.filesystem_identity.destination,
+        )?;
         entries.push(Entry {
             schema_version: entry.schema_version,
             filesystem_identity: FilesystemIdentity {
@@ -360,7 +381,7 @@ pub(crate) fn validate_manifest(decoded: DecodedManifest) -> Result<Manifest> {
             managed_root: entry.managed_root,
             on_conflict: entry.on_conflict,
             representation: profile.representation,
-            retained_artifact_target: entry.retained_artifact_target,
+            target,
             executor: Executor {
                 identity: entry.executor.identity,
                 protocol_version: entry.executor.protocol_version,
@@ -467,7 +488,7 @@ mod tests {
             "managedRoot": managed_root,
             "onConflict": "error",
             "representation": "symlink",
-            "retainedArtifactTarget": "/nix/store/target",
+            "target": { "kind": "retained", "path": "/nix/store/target" },
             "executor": {
                 "identity": NATIVE_EXECUTOR_IDENTITY,
                 "protocolVersion": NATIVE_EXECUTOR_PROTOCOL

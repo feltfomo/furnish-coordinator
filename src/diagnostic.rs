@@ -15,7 +15,18 @@ struct BootstrapDiagnostic<'a> {
     primary: Primary<'a>,
 }
 
-pub(crate) fn emit_bootstrap(message: &str, label: &str) {
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) enum DiagnosticFormat {
+    #[default]
+    Json,
+    Plain,
+}
+
+pub(crate) fn emit_bootstrap(message: &str, label: &str, format: DiagnosticFormat) {
+    if matches!(format, DiagnosticFormat::Plain) {
+        eprintln!("furnish: error [furnish/runtime-bootstrap] {label}: {message}");
+        return;
+    }
     let envelope = BootstrapDiagnostic {
         schema_version: DIAGNOSTIC_SCHEMA_VERSION,
         severity: "error",
@@ -238,6 +249,7 @@ pub(crate) fn code(codes: &DiagnosticCodes, key: CodeKey) -> &str {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn serialize_failure(
     codes: &DiagnosticCodes,
     failure: &Failure,
@@ -277,13 +289,11 @@ pub(crate) fn emit_failure(
     codes: &DiagnosticCodes,
     failure: &Failure,
     provenance: Option<&Provenance>,
+    format: DiagnosticFormat,
 ) {
-    match serialize_failure(codes, failure, provenance) {
-        Ok(line) => eprintln!("{line}"),
-        Err(_) => eprintln!("furnish: failed to serialize runtime diagnostic"),
-    }
+    emit_diagnostic(codes, failure, provenance, "error", format);
     if let Some(cleanup) = failure.cleanup_warning.as_deref() {
-        emit_warning(codes, cleanup, provenance);
+        emit_warning(codes, cleanup, provenance, format);
     }
 }
 
@@ -294,8 +304,47 @@ pub(crate) fn emit_warning(
     codes: &DiagnosticCodes,
     failure: &Failure,
     provenance: Option<&Provenance>,
+    format: DiagnosticFormat,
 ) {
-    match serialize_diagnostic(codes, failure, provenance, "warning") {
+    emit_diagnostic(codes, failure, provenance, "warning", format);
+}
+
+fn emit_diagnostic(
+    codes: &DiagnosticCodes,
+    failure: &Failure,
+    provenance: Option<&Provenance>,
+    severity: &str,
+    format: DiagnosticFormat,
+) {
+    if matches!(format, DiagnosticFormat::Plain) {
+        eprintln!(
+            "furnish: {severity} [{}] {}: {}",
+            code(codes, failure.key),
+            failure.label,
+            failure.message
+        );
+        if let Some(cause) = &failure.cause {
+            eprintln!(
+                "    cause: {}: {}",
+                cause.operation,
+                io::Error::from_raw_os_error(cause.errno)
+            );
+        }
+        if let Some(provenance) = provenance {
+            eprintln!(
+                "    source: {} ({})",
+                provenance.source, provenance.declaration
+            );
+        }
+        if let Some((baseline, source, destination)) = failure.observed.as_deref() {
+            eprintln!(
+                "    hashes: baseline={}, source={source}, destination={destination}",
+                baseline.as_deref().unwrap_or("unrecorded")
+            );
+        }
+        return;
+    }
+    match serialize_diagnostic(codes, failure, provenance, severity) {
         Ok(line) => eprintln!("{line}"),
         Err(_) => eprintln!("furnish: failed to serialize runtime diagnostic"),
     }

@@ -178,7 +178,7 @@ fn an_unsupported_manifest_schema_is_refused_with_the_manifest_label() {
     assert_eq!(diagnostic["code"], "runtime/invalid-manifest");
     assert_eq!(
         diagnostic["message"],
-        "manifest schema 99 is unsupported; expected 2"
+        "manifest schema 99 is unsupported; expected 2 or 3"
     );
     assert_eq!(diagnostic["primary"]["label"], "manifest");
     assert!(diagnostic.get("provenance").is_some());

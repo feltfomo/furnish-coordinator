@@ -2,7 +2,7 @@
 
 ## Runtime position
 
-The Nix compiler emits a deterministic manifest and retains every referenced artifact in the system closure. The NixOS integration invokes the coordinator with the manifest, state directory, lock name, and `setpriv` path. The coordinator converts that declarative input into guarded filesystem transactions and durable ownership evidence.
+The Nix compiler emits a deterministic manifest and retains declared source artifacts in the system closure while preserving external link targets as literal paths. The NixOS integration invokes the coordinator with the manifest, state directory, lock name, and `setpriv` path. The coordinator converts that declarative input into guarded filesystem transactions and durable ownership evidence.
 
 ```text
 Program declarations
@@ -21,6 +21,8 @@ The coordinator does not discover declarations, choose executors dynamically, or
 ## Entry points
 
 `main.rs` removes `argv[0]` and delegates to `furnish_coordinator::run`. `lib.rs` exposes only that process entry and keeps implementation modules private.
+
+`target.rs` owns source retention semantics and validation. External targets never require filesystem access; retained sources keep their replacement availability checks.
 
 `cli.rs` selects one of seven effective command paths:
 

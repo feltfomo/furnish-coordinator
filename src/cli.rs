@@ -1,4 +1,4 @@
-use crate::diagnostic::EXIT_USAGE;
+use crate::diagnostic::{DiagnosticFormat, EXIT_USAGE};
 use crate::executor::{self, WorkerCommand, WorkerKind, WorkerProgram};
 use crate::filesystem::WRITABLE_FILE_MODE;
 use crate::lock::DEFAULT_LOCK_DIR;
@@ -23,6 +23,7 @@ pub(crate) enum Command {
         setpriv: PathBuf,
         state_dir: PathBuf,
         lock_dir: PathBuf,
+        diagnostic_format: DiagnosticFormat,
         dry_run: bool,
     },
     // read-only. it takes the same host lock so the report cannot be a torn
@@ -32,6 +33,7 @@ pub(crate) enum Command {
         lock_name: OsString,
         state_dir: PathBuf,
         lock_dir: PathBuf,
+        diagnostic_format: DiagnosticFormat,
     },
     Resolve {
         resolution: Resolution,
@@ -40,6 +42,7 @@ pub(crate) enum Command {
         lock_name: OsString,
         state_dir: PathBuf,
         lock_dir: PathBuf,
+        diagnostic_format: DiagnosticFormat,
     },
     Worker(WorkerCommand),
 }
@@ -66,6 +69,7 @@ impl Command {
             lock_name: option(args, "--lock-name")?.into_os_string(),
             state_dir: option(args, "--state-dir")?,
             lock_dir: option(args, "--lock-dir").unwrap_or_else(|| PathBuf::from(DEFAULT_LOCK_DIR)),
+            diagnostic_format: diagnostic_format(args)?,
         })
     }
 
@@ -77,6 +81,7 @@ impl Command {
             lock_name: option(args, "--lock-name")?.into_os_string(),
             state_dir: option(args, "--state-dir")?,
             lock_dir: option(args, "--lock-dir").unwrap_or_else(|| PathBuf::from(DEFAULT_LOCK_DIR)),
+            diagnostic_format: diagnostic_format(args)?,
         })
     }
 
@@ -89,6 +94,7 @@ impl Command {
             setpriv: option(args, "--setpriv")?,
             state_dir: option(args, "--state-dir")?,
             lock_dir: option(args, "--lock-dir").unwrap_or_else(|| PathBuf::from(DEFAULT_LOCK_DIR)),
+            diagnostic_format: diagnostic_format(args)?,
             // a value-less flag, so it is scanned rather than paired. the
             // permissive pairing above would otherwise read the next argument
             // as its value and lose it.
@@ -135,6 +141,20 @@ fn option(args: &[OsString], flag: &str) -> Option<PathBuf> {
         .map(|pair| PathBuf::from(&pair[1]))
 }
 
+fn diagnostic_format(args: &[OsString]) -> Option<DiagnosticFormat> {
+    match args
+        .iter()
+        .position(|argument| argument == "--diagnostic-format")
+    {
+        None => Some(DiagnosticFormat::Json),
+        Some(index) => match args.get(index + 1)?.to_str()? {
+            "plain" => Some(DiagnosticFormat::Plain),
+            "json" => Some(DiagnosticFormat::Json),
+            _ => None,
+        },
+    }
+}
+
 pub(crate) fn run(args: &[OsString]) -> ExitCode {
     match Command::parse(args) {
         Some(Command::Reconcile {
@@ -143,16 +163,30 @@ pub(crate) fn run(args: &[OsString]) -> ExitCode {
             setpriv,
             state_dir,
             lock_dir,
+            diagnostic_format,
             dry_run,
         }) => reconcile(
-            &manifest, &lock_name, &setpriv, &state_dir, &lock_dir, dry_run,
+            &manifest,
+            &lock_name,
+            &setpriv,
+            &state_dir,
+            &lock_dir,
+            dry_run,
+            diagnostic_format,
         ),
         Some(Command::Status {
             manifest,
             lock_name,
             state_dir,
             lock_dir,
-        }) => status(&manifest, &lock_name, &state_dir, &lock_dir),
+            diagnostic_format,
+        }) => status(
+            &manifest,
+            &lock_name,
+            &state_dir,
+            &lock_dir,
+            diagnostic_format,
+        ),
         Some(Command::Resolve {
             resolution,
             destination,
@@ -160,6 +194,7 @@ pub(crate) fn run(args: &[OsString]) -> ExitCode {
             lock_name,
             state_dir,
             lock_dir,
+            diagnostic_format,
         }) => resolve_retirement(
             resolution,
             &destination.to_string_lossy(),
@@ -167,6 +202,7 @@ pub(crate) fn run(args: &[OsString]) -> ExitCode {
             &lock_name,
             &state_dir,
             &lock_dir,
+            diagnostic_format,
         ),
         Some(Command::Worker(command)) => run_worker(command),
         // an argument list this cannot parse is the caller's mistake, not a

@@ -41,13 +41,14 @@ pub(crate) fn resolve_retirement(
     lock_name: &OsStr,
     state_dir: &Path,
     lock_dir: &Path,
+    format: super::DiagnosticFormat,
 ) -> ExitCode {
     // the diagnostic contract is manifest-supplied, so these verbs take the
     // manifest for its registry even though the destination they act on is by
     // definition not declared in it. they take the same host lock the apply
     // path takes, so this cannot drop a record while a run is deciding
     // ownership against it.
-    let session = match open_session(manifest_path, lock_name, state_dir, lock_dir) {
+    let session = match open_session(manifest_path, lock_name, state_dir, lock_dir, format) {
         Ok(session) => session,
         Err(status) => return status,
     };
@@ -61,7 +62,7 @@ pub(crate) fn resolve_retirement(
         .and_then(|()| ledger.flush())
     {
         Ok(()) => ExitCode::SUCCESS,
-        Err(failure) => refused(&manifest.diagnostic_contract.codes, &failure),
+        Err(failure) => refused(&manifest.diagnostic_contract.codes, &failure, format),
     }
 }
 

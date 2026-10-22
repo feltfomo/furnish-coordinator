@@ -46,7 +46,7 @@
             361678c56c4f03b7df1ce7586fedeb93  tests/characterization.rs
             06f3f89ae4df4a3d42a1883f96a7243e  tests/cli.rs
             1c2f108bf92dc8dbd8ea29838ad70edb  tests/crash_recovery.rs
-            018efe64349b62ac39ec6d390930ead4  tests/diagnostics.rs
+            287c396c20ad7fa6ecbd06844fb310cc  tests/diagnostics.rs
             ad5155b598753467f35b1b720a72dc3c  tests/lifecycle.rs
           '';
         in

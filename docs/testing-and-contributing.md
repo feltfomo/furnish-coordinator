@@ -47,6 +47,10 @@ Drives the binary end to end through:
 
 Runs only with `fault-injection`. It causes real process aborts at transaction boundaries and verifies subsequent ordinary-binary recovery, including pending commits, landed exchanges, edited displaced bytes, policy-authorized discard, symlink updates, and legacy pending records.
 
+### `tests/external_links.rs`
+
+Exercises schema 3 external links through the binary: absent checkouts, live edits, repair, retargeting, retained/external source changes, no-adoption, conflicting destinations, retirement and publication crashes. It also checks plain and JSON diagnostic output against the same refusal and warning outcomes. The original integration suites continue exercising schema 2 compatibility unchanged.
+
 ## Unit-test coverage
 
 Module-local tests cover:
@@ -94,14 +98,14 @@ cargo test
 cargo test --features fault-injection
 ```
 
-The repository-level gate should still run afterward from `/etc/skadi`:
+Run the repository gate afterward from the coordinator checkout:
 
 ```fish
 nix fmt
 nix flake check -L
 ```
 
-The Rust commands verify the crate directly; the Nix gate verifies packaging, integration, and repository formatting.
+The Rust commands verify the crate directly; the Nix gate verifies packaging, fault boundaries, frozen contract suites and repository formatting. Lexicon and its consuming configuration have separate integration gates.
 
 ## Change checklist
 

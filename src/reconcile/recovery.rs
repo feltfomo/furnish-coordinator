@@ -39,7 +39,7 @@ pub(super) fn recover_pending(
     let (parent, name) = open_parent(destination, &record.managed_root)?;
     let stage = record.stage_name().map(OsString::from);
     let observed = observe_kind(&parent, &name, destination)?;
-    let artifact_matches = record.applied_artifact_target == entry.retained_artifact_target;
+    let artifact_matches = record.applied_artifact_target == entry.target.path();
 
     if let Some(PendingIntent::Transition(pair)) = record.pending_intent() {
         let open = OpenDestination {
@@ -543,7 +543,7 @@ pub(super) fn recover_transition(
         entry,
         AppliedOperation::Update,
         prior.owned(),
-        &witness(entry.retained_artifact_target.as_bytes()),
+        &witness(entry.target.path().as_bytes()),
     );
     ledger.commit(canonical, owned)?;
     Ok(())

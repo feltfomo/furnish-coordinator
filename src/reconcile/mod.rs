@@ -22,8 +22,8 @@ use writable::{
 };
 
 use crate::diagnostic::{
-    CodeKey, Context, EXIT_CONFLICT, EXIT_USAGE, Failure, Result, emit_bootstrap, emit_failure,
-    emit_warning,
+    CodeKey, Context, DiagnosticFormat, EXIT_CONFLICT, EXIT_USAGE, Failure, Result, emit_bootstrap,
+    emit_failure, emit_warning,
 };
 use crate::fault::fault_point;
 use crate::filesystem::{
@@ -47,8 +47,6 @@ use crate::manifest::{
     Manifest, NATIVE_REPRESENTATION, WRITABLE_REPRESENTATION, decode_manifest, profile_for,
     validate_manifest,
 };
-use rustix::fs::{AtFlags, statat};
-use rustix::io::Errno;
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs;
@@ -95,7 +93,7 @@ pub(super) fn reconcile_entry(
         return reconcile_writable_entry(entry, setpriv, index, ledger, identity, &open);
     }
 
-    let expected = OsStr::new(&entry.retained_artifact_target);
+    let expected = OsStr::new(entry.target.path());
 
     let observed = symlink_target(&open.parent, name).at(
         CodeKey::ConflictingDestination,
@@ -108,7 +106,7 @@ pub(super) fn reconcile_entry(
     match (symlink_action(&observed, expected, record.as_ref()), record) {
         (SymlinkAction::Publish { repair }, prior) => {
             let stage = stage_name(index);
-            let intended = witness(entry.retained_artifact_target.as_bytes());
+            let intended = witness(entry.target.path().as_bytes());
             let applied_by = if repair {
                 AppliedOperation::Repair
             } else {
@@ -144,44 +142,12 @@ pub(super) fn reconcile_entry(
         (SymlinkAction::Exchange, Some(record)) => {
             let recorded = OsStr::new(&record.applied_artifact_target);
 
-            // the destination is recorded as furnish-owned and the link on disk
-            // still points at the recorded target, so what remains is only which
-            // owned branch this is. both publish to desired through the same
-            // exchange; they differ in what they mean. a resolving recorded target
-            // says the declaration moved, which is a fact about the config. a
-            // reaped one says the store object furnish published is gone, which is
-            // a fact about the world.
-            //
-            // resolution is only ever tested against a target furnish published
-            // itself, which is always a store path on an already-mounted
-            // filesystem. applied to a foreign target this test would be a race,
-            // since a link into a late-mounting filesystem reads unresolvable at
-            // boot and resolvable at switch, and the coordinator runs at both.
-            let applied_by = match statat(&open.parent, name, AtFlags::empty()) {
-                // what furnish published was reaped.
-                Err(Errno::NOENT) => AppliedOperation::Repair,
-                // anything else that stats is still live; anything that fails to
-                // stat for another reason is not a verdict about the target.
-                other => {
-                    other.at(
-                        CodeKey::ConflictingDestination,
-                        destination,
-                        "fstatat-recorded-target",
-                    )?;
-                    AppliedOperation::Update
-                }
-            };
-
-            // republishing toward a target that is not there would manufacture
-            // the exact breakage being repaired.
-            fs::metadata(&entry.retained_artifact_target).at(
-                CodeKey::UnresolvableDesiredTarget,
-                destination,
-                "stat-desired-target",
-            )?;
+            let applied_by = entry
+                .target
+                .replacement_operation(&open.parent, name, destination)?;
 
             let stage = stage_name(index);
-            let intended = witness(entry.retained_artifact_target.as_bytes());
+            let intended = witness(entry.target.path().as_bytes());
             Publication {
                 entry,
                 identity,
@@ -208,8 +174,12 @@ pub(super) fn reconcile_entry(
 
 // emitting the diagnostic and choosing the status for a refusal are the same
 // decision, so every verb makes it in one place.
-pub(super) fn refused(codes: &DiagnosticCodes, failure: &Failure) -> ExitCode {
-    emit_failure(codes, failure, None);
+pub(super) fn refused(
+    codes: &DiagnosticCodes,
+    failure: &Failure,
+    format: DiagnosticFormat,
+) -> ExitCode {
+    emit_failure(codes, failure, None, format);
     ExitCode::from(failure.key.exit_code())
 }
 
@@ -227,9 +197,10 @@ fn open_session(
     lock_name: &OsStr,
     state_dir: &Path,
     lock_dir: &Path,
+    format: DiagnosticFormat,
 ) -> std::result::Result<Session, ExitCode> {
     let bootstrap = |message: String| {
-        emit_bootstrap(&message, &manifest_path.to_string_lossy());
+        emit_bootstrap(&message, &manifest_path.to_string_lossy(), format);
         // the manifest is what the caller handed us, so an unreadable or
         // undecodable one is a usage problem rather than a refusal about
         // anything on this host.
@@ -241,7 +212,7 @@ fn open_session(
         .map_err(|error| bootstrap(format!("cannot decode manifest: {error}")))?;
     let declared_codes = decoded.diagnostic_codes().clone();
     let manifest =
-        validate_manifest(decoded).map_err(|failure| refused(&declared_codes, &failure))?;
+        validate_manifest(decoded).map_err(|failure| refused(&declared_codes, &failure, format))?;
     let codes = &manifest.diagnostic_contract.codes;
     let _ = (
         manifest.schema_version,
@@ -249,13 +220,13 @@ fn open_session(
     );
     let lock = match open_host_lock(lock_name, lock_dir) {
         Ok(lock) => lock,
-        Err(failure) => return Err(refused(codes, &failure)),
+        Err(failure) => return Err(refused(codes, &failure, format)),
     };
     // applied state is read under the host lock, so no other run can be
     // deciding ownership against a copy of it.
     let ledger = match LedgerState::load(state_dir) {
         Ok(ledger) => ledger,
-        Err(failure) => return Err(refused(codes, &failure)),
+        Err(failure) => return Err(refused(codes, &failure, format)),
     };
     Ok(Session {
         manifest,
@@ -271,9 +242,10 @@ pub(crate) fn status(
     lock_name: &OsStr,
     state_dir: &Path,
     lock_dir: &Path,
+    format: DiagnosticFormat,
 ) -> ExitCode {
-    match open_session(manifest_path, lock_name, state_dir, lock_dir) {
-        Ok(session) => report(&session.manifest, &session.ledger),
+    match open_session(manifest_path, lock_name, state_dir, lock_dir, format) {
+        Ok(session) => report(&session.manifest, &session.ledger, format),
         Err(status) => status,
     }
 }
@@ -285,8 +257,9 @@ pub(crate) fn reconcile(
     state_dir: &Path,
     lock_dir: &Path,
     dry_run: bool,
+    format: DiagnosticFormat,
 ) -> ExitCode {
-    let session = match open_session(manifest_path, lock_name, state_dir, lock_dir) {
+    let session = match open_session(manifest_path, lock_name, state_dir, lock_dir, format) {
         Ok(session) => session,
         Err(status) => return status,
     };
@@ -299,17 +272,17 @@ pub(crate) fn reconcile(
     // a dry run stops here, before anything has been noted, so the flush
     // below is never reached and nothing it would have written exists.
     if dry_run {
-        return report(&manifest, &ledger);
+        return report(&manifest, &ledger, format);
     }
 
     let identity = RunIdentity::observe();
-    let outcome = apply_desired(&manifest, setpriv, &mut ledger, &identity);
+    let outcome = apply_desired(&manifest, setpriv, &mut ledger, &identity, format);
     // the deferred changes become durable on the way out whichever way the run
     // ends, so a refused run leaves exactly the applied state an eager run
     // would have left. only a crash can lose them, and only observations are
     // ever deferred.
     if let Err(failure) = ledger.flush() {
-        return refused(&manifest.diagnostic_contract.codes, &failure);
+        return refused(&manifest.diagnostic_contract.codes, &failure, format);
     }
     outcome
 }
@@ -319,6 +292,7 @@ fn apply_desired(
     setpriv: &Path,
     ledger: &mut LedgerState,
     identity: &RunIdentity,
+    format: DiagnosticFormat,
 ) -> ExitCode {
     let codes = &manifest.diagnostic_contract.codes;
     for (index, entry) in manifest.entries.iter().enumerate() {
@@ -329,7 +303,7 @@ fn apply_desired(
             entry.filesystem_identity.namespace.as_str(),
         );
         if let Err(failure) = reconcile_entry(entry, setpriv, index, ledger, identity) {
-            emit_failure(codes, &failure, Some(&entry.provenance));
+            emit_failure(codes, &failure, Some(&entry.provenance), format);
             return ExitCode::from(failure.key.exit_code());
         }
     }
@@ -359,12 +333,12 @@ fn apply_desired(
                         unresolved.reason
                     ),
                 );
-                emit_warning(codes, &failure, None);
+                emit_warning(codes, &failure, None, format);
                 let mut kept = record.clone();
                 kept.set_unresolved_retirement(Some(unresolved));
                 ledger.note(&canonical, kept);
             }
-            Err(failure) => return refused(codes, &failure),
+            Err(failure) => return refused(codes, &failure, format),
         }
     }
     ExitCode::SUCCESS

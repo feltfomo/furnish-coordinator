@@ -1,6 +1,6 @@
 use super::{
-    CodeKey, Context, EXIT_CONFLICT, Entry, Failure, LedgerRecord, LedgerState, Manifest,
-    NO_BASELINE, NOT_RECORDED, NOT_REGULAR, REGULAR_MODE, Result, SymlinkAction,
+    CodeKey, Context, DiagnosticFormat, EXIT_CONFLICT, Entry, Failure, LedgerRecord, LedgerState,
+    Manifest, NO_BASELINE, NOT_RECORDED, NOT_REGULAR, REGULAR_MODE, Result, SymlinkAction,
     WRITABLE_REPRESENTATION, WritableAction, algorithm_of, emit_warning, hash_matches,
     observe_kind, open_parent, read_regular, read_source, symlink_action, symlink_refusal,
     symlink_target, unreadable_baseline, witness, writable_action,
@@ -44,7 +44,11 @@ fn missing_parent(failure: &Failure) -> bool {
             .is_some_and(|cause| cause.errno == Errno::NOENT.raw_os_error())
 }
 
-pub(super) fn report(manifest: &Manifest, ledger: &LedgerState) -> ExitCode {
+pub(super) fn report(
+    manifest: &Manifest,
+    ledger: &LedgerState,
+    format: DiagnosticFormat,
+) -> ExitCode {
     let codes = &manifest.diagnostic_contract.codes;
     let mut drifted = false;
     let mut refusal = None;
@@ -61,7 +65,7 @@ pub(super) fn report(manifest: &Manifest, ledger: &LedgerState) -> ExitCode {
                 // diagnostics are warnings for the same reason: nothing here
                 // failed, the run that would follow is what would fail.
                 println!("refused\t{destination}");
-                emit_warning(codes, &failure, Some(&entry.provenance));
+                emit_warning(codes, &failure, Some(&entry.provenance), format);
                 refusal = refusal.or(Some(failure.key));
             }
         }
@@ -137,12 +141,15 @@ fn plan_entry(entry: &Entry, ledger: &LedgerState) -> Result<Verdict> {
         destination,
         "fstatat-destination",
     )?;
-    let expected = OsStr::new(&entry.retained_artifact_target);
+    let expected = OsStr::new(entry.target.path());
     match symlink_action(&observed, expected, record) {
         SymlinkAction::Publish { repair: false } => Ok(Verdict::Change("publish")),
         SymlinkAction::Publish { repair: true } => Ok(Verdict::Change("repair")),
         SymlinkAction::Settle => Ok(Verdict::Settled),
-        SymlinkAction::Exchange => Ok(Verdict::Change("republish")),
+        SymlinkAction::Exchange => {
+            entry.target.check_replacement(destination)?;
+            Ok(Verdict::Change("republish"))
+        }
         SymlinkAction::RefuseForeign | SymlinkAction::RefuseNotRecorded => {
             Err(symlink_refusal(destination, &observed, record))
         }
@@ -156,7 +163,7 @@ fn plan_writable(
     name: &OsStr,
 ) -> Result<Verdict> {
     let destination = &entry.filesystem_identity.destination;
-    let source_bytes = read_source(&entry.retained_artifact_target, destination)?;
+    let source_bytes = read_source(entry.target.path(), destination)?;
     let observed = observe_kind(parent, name, destination)?;
     let (Some(kind), Some(record)) = (observed, record) else {
         return match (observed, record) {

@@ -9,6 +9,7 @@ use crate::manifest::{
     NATIVE_EXECUTOR_PROTOCOL, NATIVE_WRITABLE_IDENTITY, NATIVE_WRITABLE_PROTOCOL, Provenance,
 };
 use crate::scratch::scratch_directory;
+use rustix::io::Errno;
 // only the fault-injection tests reach for the environment.
 #[cfg(feature = "fault-injection")]
 use std::env;
@@ -105,7 +106,7 @@ fn sample_entry(managed_root: &str, destination: &str, target: &str) -> Entry {
         managed_root: managed_root.to_owned(),
         on_conflict: ConflictPolicy::Error,
         representation: NATIVE_REPRESENTATION,
-        retained_artifact_target: target.to_owned(),
+        target: crate::target::Target::Retained(target.to_owned()),
         executor: Executor {
             identity: NATIVE_EXECUTOR_IDENTITY.to_owned(),
             protocol_version: NATIVE_EXECUTOR_PROTOCOL,
@@ -2065,7 +2066,7 @@ mod characterization_pins {
                 },
                 "authority": { "scope": "system", "identity": "test/system" },
                 "managedRoot": "/managed", "onConflict": "error", "representation": "symlink",
-                "retainedArtifactTarget": "/desired/target",
+                "target": { "kind": "retained", "path": "/desired/target" },
                 "executor": { "identity": NATIVE_EXECUTOR_IDENTITY, "protocolVersion": NATIVE_EXECUTOR_PROTOCOL },
                 "cleanupStrategy": "exact-symlink-target", "selfHealStrategy": "exact-symlink-target",
                 "provenance": { "declaration": "unit-test", "source": "coordinator/src/main.rs" }

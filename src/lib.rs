@@ -11,6 +11,7 @@ mod manifest;
 mod reconcile;
 #[cfg(test)]
 mod scratch;
+mod target;
 
 use std::ffi::OsString;
 use std::process::ExitCode;
